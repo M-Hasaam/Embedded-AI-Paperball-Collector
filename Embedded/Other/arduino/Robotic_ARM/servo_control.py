@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import serial
 import serial.tools.list_ports
+import math
 import time
 import threading
 
@@ -9,7 +10,7 @@ class ServoControllerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Robotic Arm 4-Axis Controller")
-        self.root.geometry("680x900")
+        self.root.geometry("760x900")
         self.root.configure(bg="#f4f5f7")
 
         self.arduino = None
@@ -32,6 +33,8 @@ class ServoControllerApp:
         self.commanded = [False] * 4                     # has this servo been sent a command yet?
         self.est_angle = [float(c["angle"]) for c in self.servo_config]  # where each servo is believed to be
         self.speed_vars = []
+        self.speed_pos_vars = []                         # slider positions (log scale), see speed_to_pos
+        self.target = [float(c["angle"]) for c in self.servo_config]   # last angle sent to each servo
         self.speed_labels = []
 
         self.sliders = []
@@ -81,7 +84,7 @@ class ServoControllerApp:
             btn_minus.grid(row=0, column=1, padx=2)
 
             # Slider
-            slider = ttk.Scale(row_frame, from_=cfg["min"], to=cfg["max"], orient="horizontal", variable=var,
+            slider = ttk.Scale(row_frame, from_=0, to=180, orient="horizontal", variable=var,
                                command=lambda val, idx=i: self.on_slider_move(idx, val))
             slider.grid(row=0, column=2, sticky="ew", padx=5)
             row_frame.columnconfigure(2, weight=1)
@@ -101,7 +104,9 @@ class ServoControllerApp:
             speed_var = tk.IntVar(value=self.SPEED_DEFAULT)
             self.speed_vars.append(speed_var)
             ttk.Label(row_frame, text="speed", foreground="#666").grid(row=1, column=0, sticky="e")
-            sp_scale = ttk.Scale(row_frame, from_=1, to=self.SPEED_MAX, orient="horizontal", variable=speed_var,
+            pos_var = tk.DoubleVar(value=self.speed_to_pos(self.SPEED_DEFAULT))
+            self.speed_pos_vars.append(pos_var)
+            sp_scale = ttk.Scale(row_frame, from_=1, to=self.SPEED_MAX, orient="horizontal", variable=pos_var,
                                  command=lambda val, idx=i: self.on_servo_speed(idx, val))
             sp_scale.grid(row=1, column=2, sticky="ew", padx=5)
             sp_label = ttk.Label(row_frame, text=f"{self.SPEED_DEFAULT}°/s", width=8, foreground="#666")
@@ -111,7 +116,7 @@ class ServoControllerApp:
         # --- Speed presets (apply to all servos; each servo's slider can still be tuned) ---
         speed_frame = ttk.LabelFrame(self.root, text=" Motion Speed (all servos) ", padding=10)
         speed_frame.pack(fill="x", padx=15, pady=6)
-        for text, spd in (("🐢 Slow 30°/s", 30), ("🚶 Default 60°/s", 60), ("⚡ Fast 180°/s", 180), ("🚀 Max 600°/s", 600)):
+        for text, spd in (("Slow 30°/s", 30), ("Default 60°/s", 60), ("Fast 180°/s", 180), ("Max 600°/s", 600)):
             ttk.Button(speed_frame, text=text, command=lambda v=spd: self.set_all_speeds(v)).pack(side="left", expand=True, fill="x", padx=3)
 
         # --- Global Presets Panel ---
@@ -162,12 +167,23 @@ class ServoControllerApp:
                 self.arduino = serial.Serial(port, 9600, timeout=1)
                 time.sleep(2)
                 self.btn_connect.config(text="Disconnect")
+                threading.Thread(target=self.read_replies, args=(self.arduino,), daemon=True).start()
                 self.lbl_status.config(text=f"Connected ({port})", foreground="green")
             except Exception as e:
                 messagebox.showerror(
                     "Connection Error",
                     f"Could not open {port}:\n{e}\n\nTip: If Arduino IDE's Serial Monitor is open, CLOSE IT so Python can access the port."
                 )
+
+    def read_replies(self, port):
+        """Show the Arduino's 'OK <servo> <target> <speed>' echo, so you can see the speed it is really using."""
+        while port.is_open and self.arduino is port:
+            try:
+                line = port.readline().decode("utf-8", "ignore").strip()
+            except Exception:
+                return
+            if line.startswith("OK"):
+                self.root.after(0, lambda s=line: self.lbl_status.config(text=f"Arduino: {s}", foreground="green"))
 
     def clamp(self, idx, angle):
         cfg = self.servo_config[idx]
@@ -180,6 +196,7 @@ class ServoControllerApp:
             speed = max(1, min(self.SPEED_MAX, int(self.speed_vars[idx].get())))
             try:
                 self.arduino.write(f"{idx} {angle} {speed}\n".encode('utf-8'))
+                self.target[idx] = float(angle)
                 self.arduino.flush()
                 if not self.commanded[idx]:
                     self.commanded[idx] = True
@@ -191,13 +208,31 @@ class ServoControllerApp:
             self.lbl_status.config(text="Not Connected! Select port & click Connect", foreground="orange")
 
     # --- Speed Handling ---
+    def speed_to_pos(self, speed):
+        return float(speed)                               # the speed slider is linear: position = deg/s
+
+    def pos_to_speed(self, pos):
+        return max(1, min(self.SPEED_MAX, int(round(float(pos)))))
+
     def on_servo_speed(self, idx, val):
-        self.speed_labels[idx].config(text=f"{int(float(val))}°/s")
+        speed = self.pos_to_speed(val)
+        if speed != self.speed_vars[idx].get():
+            self.speed_vars[idx].set(speed)
+            self.speed_labels[idx].config(text=f"{speed}°/s")
+            self.apply_speed(idx)
+
+    def apply_speed(self, idx):
+        """Make the Arduino use the new speed now (it only learns the speed with an angle command), without changing the
+        target. Skipped while a recorded move is running: that move re-sends the speed with its own commands."""
+        if self.commanded[idx] and not (self.is_moving or self.is_playing):
+            self.send_command(idx, int(round(self.target[idx])))
 
     def set_all_speeds(self, value):
-        for var, label in zip(self.speed_vars, self.speed_labels):
+        for idx, (var, label, pos) in enumerate(zip(self.speed_vars, self.speed_labels, self.speed_pos_vars)):
             var.set(value)
+            pos.set(self.speed_to_pos(value))
             label.config(text=f"{value}°/s")
+            self.apply_speed(idx)
 
     def default_pose(self):
         return [c["angle"] for c in self.servo_config]

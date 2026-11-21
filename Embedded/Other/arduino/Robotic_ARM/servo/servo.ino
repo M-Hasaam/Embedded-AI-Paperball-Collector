@@ -83,6 +83,9 @@ void loop() {
         int fields = sscanf(inputBuffer.c_str(), "%d %d %d", &servoIndex, &angle, &speed);
         if (fields >= 2 && servoIndex >= 0 && servoIndex < NUM_SERVOS && angle >= 0 && angle <= 180) {
           commandServo(servoIndex, angle, fields == 3 ? speed : 0);
+          // echo what is now in force, so the controller can show it: OK <servo> <target> <speed in force>
+          Serial.print("OK "); Serial.print(servoIndex); Serial.print(' '); Serial.print(targetAngle[servoIndex]);
+          Serial.print(' '); Serial.println(speedDegPerSec[servoIndex]);
         }
       }
       inputBuffer = "";
