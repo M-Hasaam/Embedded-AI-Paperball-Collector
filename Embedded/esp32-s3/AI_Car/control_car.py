@@ -24,6 +24,8 @@ ROLL_SIGN = 1    # +1: positive = leaning right
 SERVO_SPEED = 60
 SERVO_SEND_INTERVAL = 0.06  # seconds between live commands while dragging a slider
 SERVO_NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
+SERVO_MIN_ANGLES = [0, 0, 0, 0]
+SERVO_MAX_ANGLES = [120, 180, 180, 180]  # gripper only opens to 120 (SERVO_ANGLE_MAX in AI_Car.ino)
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]  # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 
 class AICarController:
@@ -161,8 +163,8 @@ class AICarController:
 
             scale = tk.Scale(
                 row,
-                from_=0,
-                to=180,
+                from_=SERVO_MIN_ANGLES[i],
+                to=SERVO_MAX_ANGLES[i],
                 orient="horizontal",
                 resolution=1,
                 showvalue=False,

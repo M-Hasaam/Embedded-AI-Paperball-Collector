@@ -47,6 +47,8 @@ SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233"   # "armV,grippe
 RAIL_DISPLAY_SCALE = (1.0, 0.951)
 
 SERVO_NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
+SERVO_MIN_ANGLES = [0, 0, 0, 0]
+SERVO_MAX_ANGLES = [120, 180, 180, 180]   # gripper only opens to 120
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 SERVO_SPEED = 60                  # default deg/s
 CAR_SPEED_DEFAULT = 100           # wheel speed in percent (one slider for all wheels)
@@ -951,7 +953,7 @@ class Dashboard:
             val = tk.StringVar(value=f"{SERVO_DEFAULT_ANGLES[i]}°")
             self.servo_values.append(val)
             tk.Label(top, textvariable=val, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold")).pack(side="right")
-            scale = self._scale(col, 0, 180, SERVO_DEFAULT_ANGLES[i], lambda v, idx=i: self._slider_changed(idx, v))
+            scale = self._scale(col, SERVO_MIN_ANGLES[i], SERVO_MAX_ANGLES[i], SERVO_DEFAULT_ANGLES[i], lambda v, idx=i: self._slider_changed(idx, v))
             scale.pack(fill="x")
             scale.bind("<ButtonPress-1>", lambda e, idx=i: self.dragging.add(idx))
             scale.bind("<ButtonRelease-1>", lambda e, idx=i: self._servo_released(idx))

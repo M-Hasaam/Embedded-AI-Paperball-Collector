@@ -164,6 +164,8 @@ int servoSpeeds[NUM_SERVOS] = {60, 60, 60, 60};  // degrees per second
 unsigned long lastServoUpdate[NUM_SERVOS] = {0, 0, 0, 0};
 int servoLastDir[NUM_SERVOS] = {0, 0, 0, 0};       // direction of each servo's last step: +1 up, -1 down, 0 none yet
 float servoAccum[NUM_SERVOS] = {0, 0, 0, 0};       // degrees still owed from the elapsed time (see updateServos)
+const int SERVO_ANGLE_MIN[NUM_SERVOS] = {0, 0, 0, 0};          // lowest angle per servo
+const int SERVO_ANGLE_MAX[NUM_SERVOS] = {120, 180, 180, 180};  // highest angle per servo (the gripper only opens to 120)
 const int SERVO_SPEED_MAX = 600;                   // highest speed (deg/s) a command may ask for; the servo itself may be slower
 const int SERVO_BACKOFF_DEG = 5;                   // when the overload guard stops a servo, it steps this far back from the load
 
@@ -302,6 +304,8 @@ void handleCommand(String message) {
       if (servoIndex >= 0 && servoIndex < NUM_SERVOS &&
           angle >= 0 && angle <= 180 &&
           speed >= 1 && speed <= SERVO_SPEED_MAX) {
+        if (angle < SERVO_ANGLE_MIN[servoIndex]) angle = SERVO_ANGLE_MIN[servoIndex];
+        if (angle > SERVO_ANGLE_MAX[servoIndex]) angle = SERVO_ANGLE_MAX[servoIndex];
         attachServo(servoIndex, angle);   // first command for this servo: start its signal at that angle
         targetAngles[servoIndex] = angle;
         servoSpeeds[servoIndex] = speed;
@@ -651,8 +655,8 @@ void updateServoGuard() {
         int hold = currentAngles[i];
         if (servoAttached[i] && servoLastDir[i] != 0) {  // step back from the load to relieve the pushing force
           hold -= servoLastDir[i] * SERVO_BACKOFF_DEG;
-          if (hold < 0) hold = 0;
-          if (hold > 180) hold = 180;
+          if (hold < SERVO_ANGLE_MIN[i]) hold = SERVO_ANGLE_MIN[i];
+          if (hold > SERVO_ANGLE_MAX[i]) hold = SERVO_ANGLE_MAX[i];
           currentAngles[i] = hold;
           writeServo(i, hold);
         }
@@ -946,7 +950,7 @@ void setup() {
 
   Serial.println("AI_Car BLE Ready");
   Serial.println("Motor commands: U, D, L, R, S");
-  Serial.println("Servo commands: V<0-3> <angle 0-180> <speed 1-600 deg/sec>, e.g. V0 90 60");
+  Serial.println("Servo commands: V<0-3> <angle 0-180 (servo 0: 0-120)> <speed 1-600 deg/sec>, e.g. V0 90 60");
 }
 
 // Status light: steady green = a client is connected, slow green blink = advertising (waiting),
