@@ -182,7 +182,7 @@ class AICarController:
             speed_scale = tk.Scale(
                 speed_row,
                 from_=1,
-                to=180,
+                to=600,
                 orient="horizontal",
                 resolution=1,
                 showvalue=False,

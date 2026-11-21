@@ -94,6 +94,8 @@ const unsigned long ENCODER_NOTIFY_INTERVAL_MS = 200;
 const char* ENCODER_CHAR_UUID = "33445566-7788-99AA-BBCC-DDEEFF001122";
 
 BLECharacteristic* pEncoderCharacteristic = nullptr;
+BLECharacteristic* pServoStatusCharacteristic = nullptr;
+const char* SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233";
 volatile long encoderLeftTicks = 0, encoderRightTicks = 0;     // signed: + forward, - reverse
 volatile int encoderLeftDir = 1, encoderRightDir = 1;          // direction of the last motor command
 volatile unsigned long encoderLeftLastUs = 0, encoderRightLastUs = 0;
@@ -126,14 +128,13 @@ const int SERVO_PWM_BITS = 14;
 const int SERVO_MIN_US = 500;
 const int SERVO_MAX_US = 2400;
 
-// The servo PWM pins stay silent at boot and are only started ~1 s after Bluetooth is advertising (initServosLate).
-// Driving the servo signal wires while the radio starts adds current at the worst moment, and it back-feeds
-// servos whose own supply is off (that made the board brown out right as Bluetooth started).
-bool servosReady = false;
-unsigned long servoInitAt = 0;
+// The servos do NOT move at power-up: their signal pins stay silent until a servo is commanded for the first time
+// (see attachServo). That keeps the arm still when the board restarts, avoids a sudden jump to a default angle, and
+// keeps the servo signal wires quiet while the radio starts (that made the board brown out right at power-on).
+bool servoAttached[4] = {false, false, false, false};   // one flag per servo (NUM_SERVOS is declared above)
 
 void writeServo(int index, int angle) {
-  if (!servosReady) return;
+  if (!servoAttached[index]) return;
   uint32_t us = SERVO_MIN_US + (uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US) / 180;
   uint32_t duty = (uint64_t)us * ((1UL << SERVO_PWM_BITS) - 1) / (1000000UL / SERVO_FREQ_HZ);
   ledcWrite(SERVO_PINS[index], duty);
@@ -161,6 +162,48 @@ int currentAngles[NUM_SERVOS] = SERVO_DEFAULTS;
 int targetAngles[NUM_SERVOS] = SERVO_DEFAULTS;
 int servoSpeeds[NUM_SERVOS] = {60, 60, 60, 60};  // degrees per second
 unsigned long lastServoUpdate[NUM_SERVOS] = {0, 0, 0, 0};
+int servoLastDir[NUM_SERVOS] = {0, 0, 0, 0};       // direction of each servo's last step: +1 up, -1 down, 0 none yet
+float servoAccum[NUM_SERVOS] = {0, 0, 0, 0};       // degrees still owed from the elapsed time (see updateServos)
+const int SERVO_SPEED_MAX = 600;                   // highest speed (deg/s) a command may ask for; the servo itself may be slower
+const int SERVO_BACKOFF_DEG = 5;                   // when the overload guard stops a servo, it steps this far back from the load
+
+// ---- Servo overload guard (state) ----
+// A servo that strains or stalls pulls a lot of current, and its supply voltage dips. Each servo supply goes through a
+// 3:1 resistor divider to an ADC pin; updateServoGuard() watches how far the voltage sags below its normal level and
+// slows or stops the servos on that supply. Rail 0 = the two MG996R (elbow + shoulder), rail 1 = the SG90 (gripper).
+// If nothing is wired to a pin, that rail is simply not guarded.
+const int RAIL_PINS[2] = {9, 10};                  // ADC1 pins
+const float RAIL_DIVIDER = 3.0f;                   // top = two 9.76k in series, bottom = one 9.76k: the pin sees a third of the rail
+                                                   // (about 1.7 V, the middle of the ADC's accurate range; 2:1 read too high)
+const int servoRail[NUM_SERVOS] = {1, 0, 0, 0};    // which rail feeds each servo: gripper, elbow, shoulder, servo 4
+float sagSlowMv = 250.0f;                          // rail this far below its normal level: move at half speed (command T<slow> <stop>)
+float sagStopMv = 400.0f;                          // this far below: stop moving until it recovers
+bool servoGuardOn = true;                          // command O1 = guard on, O0 = off (the voltages are still reported)
+float railSagMax[2] = {0, 0};                      // largest sag since the last report, so short dips are not missed
+unsigned long railStopSince[2] = {0, 0};
+const unsigned long SAG_HOLD_MS = 2000;            // stay stopped at least this long
+float railV[2] = {0, 0}, railBase[2] = {0, 0};     // smoothed voltage and its normal level, in mV
+float railNoise[2] = {0, 0};                       // largest spread (highest - lowest of 9 readings) since the last report, at the rail
+bool railPresent[2] = {false, false};
+int railState[2] = {0, 0};                         // 0 = ok, 1 = slowed, 2 = stopped
+float railSpeedScale[2] = {1.0f, 1.0f};
+unsigned long railSagSince[2] = {0, 0}, railStoppedAt[2] = {0, 0};
+
+// Starts the 50 Hz signal for one servo the first time it is commanded. The servo goes straight to that first angle
+// (it has no earlier position to move from), and later commands move it gradually at the set speed.
+void attachServo(int i, int firstAngle) {
+  if (servoAttached[i]) return;
+  if (!ledcAttach(SERVO_PINS[i], SERVO_FREQ_HZ, SERVO_PWM_BITS)) {
+    Serial.printf("ERROR: could not attach servo %d on pin %d\n", i, SERVO_PINS[i]);
+    return;
+  }
+  servoAttached[i] = true;
+  currentAngles[i] = firstAngle;
+  targetAngles[i] = firstAngle;
+  writeServo(i, firstAngle);
+  markStage(9);
+  Serial.printf("Servo %d started at %d degrees\n", i, firstAngle);
+}
 
 void motors(int lu, int ld, int ru, int rd) {
   motorState[0] = lu;
@@ -217,6 +260,24 @@ void handleCommand(String message) {
     return;
   }
 
+  // Servo overload guard: O1 = on, O0 = off; T<slow> <stop> = sag thresholds in mV (slow down / stop the servos).
+  if (message.charAt(0) == 'O' && message.length() == 2 && (message.charAt(1) == '0' || message.charAt(1) == '1')) {
+    servoGuardOn = (message.charAt(1) == '1');
+    Serial.printf("Servo overload guard: %s\n", servoGuardOn ? "on" : "off");
+    return;
+  }
+  if (message.charAt(0) == 'T') {
+    int slow = -1, stop = -1;
+    if (sscanf(message.c_str(), "T%d %d", &slow, &stop) == 2 && slow >= 20 && stop > slow && stop <= 3000) {
+      sagSlowMv = (float)slow;
+      sagStopMv = (float)stop;
+      Serial.printf("Servo guard thresholds: slow at %d mV, stop at %d mV\n", slow, stop);
+    } else {
+      Serial.println("Invalid threshold command. Use: T250 500");
+    }
+    return;
+  }
+
   // Wheel speed: P<0-100> (percent, same for all wheels). Also applies to wheels that are running right now.
   if (message.charAt(0) == 'P') {
     int pct = -1;
@@ -240,7 +301,8 @@ void handleCommand(String message) {
     if (sscanf(message.c_str(), "V%d %d %d", &servoIndex, &angle, &speed) == 3) {
       if (servoIndex >= 0 && servoIndex < NUM_SERVOS &&
           angle >= 0 && angle <= 180 &&
-          speed >= 1 && speed <= 180) {
+          speed >= 1 && speed <= SERVO_SPEED_MAX) {
+        attachServo(servoIndex, angle);   // first command for this servo: start its signal at that angle
         targetAngles[servoIndex] = angle;
         servoSpeeds[servoIndex] = speed;
         Serial.printf("Servo %d | Target: %d | Speed: %d deg/sec\n",
@@ -254,22 +316,33 @@ void handleCommand(String message) {
   }
 }
 
-// Moves each servo 1 degree at a time toward its target at its set speed.
+// Moves each servo toward its target at its set speed (degrees per second, up to SERVO_SPEED_MAX). The distance to
+// move is accumulated from the elapsed time, so speeds above what one-degree-per-loop steps allow (about 200 deg/s)
+// work too: the servo then moves several degrees per step.
 void updateServos() {
-  if (!servosReady) return;
   unsigned long now = millis();
 
   for (int i = 0; i < NUM_SERVOS; i++) {
-    if (currentAngles[i] == targetAngles[i]) continue;
+    if (!servoAttached[i]) continue;  // not started yet: its signal pin stays silent
+    if (currentAngles[i] == targetAngles[i]) { lastServoUpdate[i] = now; servoAccum[i] = 0; continue; }
 
-    unsigned long interval = 1000UL / servoSpeeds[i];
+    int rail = servoRail[i];
+    if (railState[rail] == 2) { lastServoUpdate[i] = now; servoAccum[i] = 0; continue; }  // overload: hold still
+    float speed = servoSpeeds[i] * railSpeedScale[rail];
+    if (speed < 1.0f) speed = 1.0f;
 
-    if (now - lastServoUpdate[i] >= interval) {
-      lastServoUpdate[i] = now;
-
-      if (currentAngles[i] < targetAngles[i]) currentAngles[i]++;
-      else currentAngles[i]--;
-
+    unsigned long dtMs = now - lastServoUpdate[i];
+    if (dtMs > 100) dtMs = 100;  // a long pause (e.g. the loop was busy) must not turn into a jump
+    lastServoUpdate[i] = now;
+    servoAccum[i] += speed * dtMs / 1000.0f;
+    int steps = (int)servoAccum[i];
+    if (steps >= 1) {
+      servoAccum[i] -= steps;
+      int remaining = abs(targetAngles[i] - currentAngles[i]);
+      if (steps > remaining) steps = remaining;
+      int dir = (currentAngles[i] < targetAngles[i]) ? 1 : -1;
+      currentAngles[i] += dir * steps;
+      servoLastDir[i] = dir;
       writeServo(i, currentAngles[i]);
     }
   }
@@ -521,6 +594,100 @@ void updateEncoders() {
   }
 }
 
+// ---- Servo overload guard -----------------------------------------------------------------------------------
+// Watches each servo supply and reacts to a voltage sag: at sagSlowMv the servos on that supply move at half
+// speed, at sagStopMv they stop where they are (targets are set to the current angles) until the voltage recovers.
+void updateServoGuard() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 20) return;
+  last = now;
+  for (int r = 0; r < 2; r++) {
+    uint32_t samples[9];                                    // median of 9 readings: a noise spike cannot move it
+    for (int k = 0; k < 9; k++) samples[k] = analogReadMilliVolts(RAIL_PINS[r]);
+    for (int a = 1; a < 9; a++) {                           // insertion sort
+      uint32_t key = samples[a];
+      int b = a - 1;
+      while (b >= 0 && samples[b] > key) { samples[b + 1] = samples[b]; b--; }
+      samples[b + 1] = key;
+    }
+    float pinMv = (float)samples[4];
+    float spread = (float)(samples[8] - samples[0]) * RAIL_DIVIDER;   // how noisy the pin is right now, expressed at the rail
+    if (spread > railNoise[r]) railNoise[r] = spread;
+    railPresent[r] = (pinMv > 800.0f && pinMv < 3150.0f);  // something sensible is wired to this pin
+    if (!railPresent[r]) {
+      railState[r] = 0; railSpeedScale[r] = 1.0f; railBase[r] = 0; railV[r] = 0; railSagSince[r] = 0;
+      continue;
+    }
+    float v = pinMv * RAIL_DIVIDER;                                         // rail voltage in mV
+    railV[r] = (railV[r] == 0) ? v : railV[r] + 0.25f * (v - railV[r]);     // light smoothing
+    if (railBase[r] == 0) railBase[r] = railV[r];
+    // The normal level follows the voltage slowly in both directions (battery drift), and is frozen while the guard is
+    // slowing or stopping the servos. A short rise (a servo pushes energy back into the supply) can therefore not
+    // raise it and later look like a sag.
+    if (railState[r] == 0 && (railBase[r] - railV[r]) < sagSlowMv) railBase[r] += 0.002f * (railV[r] - railBase[r]);
+    float sag = railBase[r] - railV[r];                                      // negative = above the normal level
+    if (sag > railSagMax[r]) railSagMax[r] = sag;
+
+    if (!servoGuardOn) {      // guard switched off from the dashboard: only report, never slow or stop
+      railState[r] = 0; railSpeedScale[r] = 1.0f; railSagSince[r] = 0; railStopSince[r] = 0;
+      continue;
+    }
+    if (railState[r] == 2) {  // stopped: resume once the voltage is back and the hold time has passed
+      if (sag < sagSlowMv && now - railStoppedAt[r] >= SAG_HOLD_MS) { railState[r] = 0; railSpeedScale[r] = 1.0f; }
+      continue;
+    }
+    if (sag >= sagStopMv) {   // a real overload has to last 100 ms, so a single noisy reading cannot stop the servos
+      if (railStopSince[r] == 0) railStopSince[r] = now;
+    } else {
+      railStopSince[r] = 0;
+    }
+    if (railStopSince[r] != 0 && now - railStopSince[r] >= 100) {
+      railState[r] = 2;
+      railStoppedAt[r] = now;
+      railSpeedScale[r] = 0.0f;
+      for (int i = 0; i < NUM_SERVOS; i++) {
+        if (servoRail[i] != r) continue;
+        int hold = currentAngles[i];
+        if (servoAttached[i] && servoLastDir[i] != 0) {  // step back from the load to relieve the pushing force
+          hold -= servoLastDir[i] * SERVO_BACKOFF_DEG;
+          if (hold < 0) hold = 0;
+          if (hold > 180) hold = 180;
+          currentAngles[i] = hold;
+          writeServo(i, hold);
+        }
+        targetAngles[i] = hold;                          // and hold there until the supply has recovered
+      }
+      Serial.printf("Servo overload on supply %d: sag %.0f mV, servos stopped\n", r, sag);
+    } else if (sag >= sagSlowMv) {
+      if (railSagSince[r] == 0) railSagSince[r] = now;
+      if (now - railSagSince[r] >= 100) { railState[r] = 1; railSpeedScale[r] = 0.5f; }
+    } else {
+      railSagSince[r] = 0; railState[r] = 0; railSpeedScale[r] = 1.0f;
+    }
+  }
+}
+
+// Sends "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState" (V = -1: no divider wired; state 0 ok, 1 slowed, 2 stopped).
+void notifyServoStatus() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 200) return;
+  last = now;
+  char buf[80];
+  snprintf(buf, sizeof(buf), "%.2f,%.2f,%.0f,%.0f,%d,%d,%.0f,%.0f,%.2f,%.2f",
+           railPresent[0] ? railV[0] / 1000.0f : -1.0f, railPresent[1] ? railV[1] / 1000.0f : -1.0f,
+           railPresent[0] ? railSagMax[0] : 0.0f, railPresent[1] ? railSagMax[1] : 0.0f,
+           railState[0], railState[1], railNoise[0], railNoise[1],
+           railPresent[0] ? railBase[0] / 1000.0f : -1.0f, railPresent[1] ? railBase[1] / 1000.0f : -1.0f);
+  railNoise[0] = railNoise[1] = 0;  // start a fresh window
+  railSagMax[0] = railSagMax[1] = 0;
+  if (deviceConnected && pServoStatusCharacteristic) {
+    pServoStatusCharacteristic->setValue((uint8_t*)buf, strlen(buf));
+    pServoStatusCharacteristic->notify();
+  }
+}
+
 // ---- Straight-drive assist --------------------------------------------------------------------------------
 // While the car drives straight forward or backward, a PI controller lowers the power of the side that is ahead so
 // the heading stays where it was when the drive started. The heading error comes from the GYRO when the MPU is
@@ -707,12 +874,15 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_PIN), encoderRightIsr, RISING);
   markStage(3);
 
+  analogSetPinAttenuation(RAIL_PINS[0], ADC_11db);  // servo supply dividers: read up to about 3.1 V
+  analogSetPinAttenuation(RAIL_PINS[1], ADC_11db);
+
   mpuOk = mpuInit();
   markStage(4);
   lastMpuMicros = micros();
   Serial.println(mpuOk ? "MPU-6050 ready (keep the car still while it calibrates)" : "ERROR: MPU-6050 not found (check SDA/SCL/power)");
 
-  // Servo PWM is set up later, once Bluetooth is running (see initServosLate in loop).
+  // Servo signals are not started here: each servo starts when it is first commanded (see attachServo).
 
   BLEDevice::init("AI_Car");
   markStage(5);
@@ -758,6 +928,14 @@ void setup() {
   );
   pEncoderCharacteristic->addDescriptor(new BLE2902());
 
+  // Servo supply voltages and overload state, ASCII "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState".
+  pServoStatusCharacteristic = pService->createCharacteristic(
+    SERVO_STATUS_CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pServoStatusCharacteristic->addDescriptor(new BLE2902());
+
   pService->start();
   markStage(6);
 
@@ -765,11 +943,10 @@ void setup() {
   pAdvertising->addServiceUUID("12345678-1234-1234-1234-1234567890AB");
   pAdvertising->start();
   markStage(7);
-  servoInitAt = millis() + 1000;   // servos start 1 s after advertising has begun
 
   Serial.println("AI_Car BLE Ready");
   Serial.println("Motor commands: U, D, L, R, S");
-  Serial.println("Servo commands: V<0-3> <angle 0-180> <speed 1-180 deg/sec>, e.g. V0 90 60");
+  Serial.println("Servo commands: V<0-3> <angle 0-180> <speed 1-600 deg/sec>, e.g. V0 90 60");
 }
 
 // Status light: steady green = a client is connected, slow green blink = advertising (waiting),
@@ -800,23 +977,9 @@ void ensureAdvertising() {
   }
 }
 
-// Starts the servo PWM (50 Hz) once Bluetooth is up and moves every servo to its default angle. Servos need their own 5V supply.
-void initServosLate() {
-  if (servosReady || millis() < servoInitAt) return;
-  for (int i = 0; i < NUM_SERVOS; i++) {
-    if (!ledcAttach(SERVO_PINS[i], SERVO_FREQ_HZ, SERVO_PWM_BITS)) {
-      Serial.printf("ERROR: could not attach servo %d on pin %d\n", i, SERVO_PINS[i]);
-    }
-  }
-  servosReady = true;
-  for (int i = 0; i < NUM_SERVOS; i++) writeServo(i, SERVO_DEFAULT_ANGLES[i]);
-  markStage(9);
-}
-
 void loop() {
   static bool loopMarked = false;
   if (!loopMarked) { markStage(8); loopMarked = true; }
-  initServosLate();
   ensureAdvertising();
   updateStatusLed();
   updateServos();
@@ -826,5 +989,7 @@ void loop() {
   notifyMpu();
   updateEncoders();
   updateStraightAssist();
+  updateServoGuard();
+  notifyServoStatus();
   delay(2);
 }

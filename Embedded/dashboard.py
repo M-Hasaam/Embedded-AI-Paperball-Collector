@@ -41,6 +41,10 @@ CHAR_UUID = "87654321-4321-4321-4321-BA0987654321"           # commands (write)
 DISTANCE_CHAR_UUID = "11223344-5566-7788-99AA-BBCCDDEEFF00"  # distance cm, "-1" = no echo
 MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011"       # "yaw,pitch,roll,gx,gy,gz,ax,ay,az"
 ENCODER_CHAR_UUID = "33445566-7788-99AA-BBCC-DDEEFF001122"   # "leftTicks,rightTicks,leftCm,rightCm,leftCm/s,rightCm/s"
+SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233"   # "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState"
+# The S3's ADC reads a few percent high, so the displayed servo-supply voltage is multiplied by these (arm, gripper).
+# To set one: meter voltage / voltage the dashboard shows now (gripper: 5.175 / 5.44 = 0.951).
+RAIL_DISPLAY_SCALE = (1.0, 0.951)
 
 SERVO_NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
@@ -740,6 +744,10 @@ class Dashboard:
         self.pitch_var = tk.StringVar(value="Front-back tilt: --")
         self.roll_var = tk.StringVar(value="Side tilt: --")
         self._enc_ignore_until = 0.0   # after "Reset to 0": drop encoder readings older than this
+        self.rail_text = tk.StringVar(value="Servo supply: waiting for data")
+        self.rail_alert = tk.StringVar(value="")
+        self.guard_on_var = tk.BooleanVar(value=True)      # servo overload guard on by default
+        self.sag_peak = [0.0, 0.0]                         # largest sag seen since "Reset max" (arm, gripper), mV
         self.gyro_assist_var = tk.BooleanVar(value=True)    # straight-drive assist: gyro heading on by default
         self.enc_assist_var = tk.BooleanVar(value=False)    # ... and encoder matching off (tick it to try it)
         self.enc_dist_var = tk.StringVar(value="--")
@@ -953,7 +961,7 @@ class Dashboard:
             sp_var = tk.StringVar(value=f"{SERVO_SPEED}°/s")
             tk.Label(sp, text="speed", bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="left")
             tk.Label(sp, textvariable=sp_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
-            speed = self._scale(sp, 1, 180, SERVO_SPEED, lambda v, var=sp_var: var.set(f"{int(float(v))}°/s"), thin=True)
+            speed = self._scale(sp, 1, 600, SERVO_SPEED, lambda v, var=sp_var: var.set(f"{int(float(v))}°/s"), thin=True)
             speed.pack(side="left", fill="x", expand=True, padx=6)
             self.speed_scales.append(speed)
         presets = tk.Frame(s, bg=CARD)
@@ -961,6 +969,40 @@ class Dashboard:
         self._button(presets, "All default", self._set_default_servos).pack(side="left")
         self._button(presets, "All 0°", lambda: self._set_all_servos(0)).pack(side="left", padx=6)
         self._button(presets, "All 180°", lambda: self._set_all_servos(180)).pack(side="left")
+        tk.Label(presets, text="Servos stay idle after power-up until you first move a slider or press All default.",
+                 bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=14)
+        # servo supply voltages: a strained or stalled servo makes its supply sag; the car slows or stops the servos on it
+        rail_row = tk.Frame(s, bg=CARD)
+        rail_row.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(8, 0))
+        tk.Label(rail_row, textvariable=self.rail_text, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        self.rail_alert_label = tk.Label(rail_row, textvariable=self.rail_alert, bg=CARD, fg=WARN, font=(FONT, 10, "bold"))
+        self.rail_alert_label.pack(side="right")
+        # overload guard controls: switch, and the sag (in mV) at which the car slows down / stops the servos
+        guard_row = tk.Frame(s, bg=CARD)
+        guard_row.grid(row=3, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(6, 0))
+        tk.Checkbutton(
+            guard_row, text="Overload guard", variable=self.guard_on_var, command=self._send_guard, bg=CARD, fg=TEXT,
+            selectcolor=CARD_HI, activebackground=CARD, activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0,
+            anchor="w", font=(FONT, 9), cursor="hand2",
+        ).pack(side="left")
+        self.sag_slow_var = tk.StringVar(value="250 mV")
+        self.sag_stop_var = tk.StringVar(value="400 mV")
+        self.guard_levels_var = tk.StringVar(value="")   # the voltage levels the two thresholds mean right now
+        tk.Label(guard_row, text="slow down at", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(18, 4))
+        self.sag_slow = self._scale(guard_row, 50, 800, 250, lambda v: self.sag_slow_var.set(f"{int(float(v))} mV"), thin=True)
+        self.sag_slow.configure(length=140)
+        self.sag_slow.pack(side="left")
+        tk.Label(guard_row, textvariable=self.sag_slow_var, bg=CARD, fg=ACCENT, font=(FONT, 9, "bold"), width=7).pack(side="left")
+        tk.Label(guard_row, text="stop at", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(12, 4))
+        self.sag_stop = self._scale(guard_row, 100, 1500, 400, lambda v: self.sag_stop_var.set(f"{int(float(v))} mV"), thin=True)
+        self.sag_stop.configure(length=140)
+        self.sag_stop.pack(side="left")
+        tk.Label(guard_row, textvariable=self.sag_stop_var, bg=CARD, fg=ACCENT, font=(FONT, 9, "bold"), width=7).pack(side="left")
+        for sc in (self.sag_slow, self.sag_stop):
+            sc.bind("<ButtonRelease-1>", lambda e: self._send_guard())
+        self._button(guard_row, "Reset max", self._reset_sag_peak).pack(side="right")
+        tk.Label(s, textvariable=self.guard_levels_var, bg=CARD, fg=MUTED, font=(FONT, 9)).grid(
+            row=4, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(2, 0))
 
         style = ttk.Style()
         try:
@@ -1108,6 +1150,55 @@ class Dashboard:
         stamp = time.monotonic()
         self._post(lambda: self._show_encoder(lcm, rcm, lv, rv, stamp))
 
+    def _on_servo_status(self, _sender, data):
+        try:
+            vals = [float(v) for v in bytes(data).decode("ascii").split(",")]
+        except ValueError:
+            return
+        if len(vals) < 6:
+            return
+        arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state = vals[:6]
+        arm_noise, grip_noise = (vals[6], vals[7]) if len(vals) >= 8 else (0.0, 0.0)
+        arm_base, grip_base = (vals[8], vals[9]) if len(vals) >= 10 else (-1.0, -1.0)
+        self._post(lambda: self._show_servo_status(arm_v, grip_v, arm_sag, grip_sag, int(arm_state), int(grip_state),
+                                                   arm_noise, grip_noise, arm_base, grip_base))
+
+    def _show_servo_status(self, arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state, arm_noise=0.0, grip_noise=0.0,
+                           arm_base=-1.0, grip_base=-1.0):
+        # correct the S3's ADC reading (voltages, sags, noise and the normal level all scale together)
+        ka, kg = RAIL_DISPLAY_SCALE
+        if arm_v > 0:
+            arm_v, arm_sag, arm_noise = arm_v * ka, arm_sag * ka, arm_noise * ka
+            arm_base = arm_base * ka if arm_base > 0 else arm_base
+        if grip_v > 0:
+            grip_v, grip_sag, grip_noise = grip_v * kg, grip_sag * kg, grip_noise * kg
+            grip_base = grip_base * kg if grip_base > 0 else grip_base
+        # the two thresholds, written as voltages: normal level minus the sag
+        slow, stop = int(self.sag_slow.get()), int(self.sag_stop.get())
+        levels = []
+        for name, base in (("arm", arm_base), ("gripper", grip_base)):
+            if base > 0:
+                k = ka if name == "arm" else kg
+                levels.append(f"{name}: slows below {base - slow * k / 1000.0:.2f} V, stops below {base - stop * k / 1000.0:.2f} V")
+        self.guard_levels_var.set("   ·   ".join(levels))
+        self.sag_peak[0] = max(self.sag_peak[0], arm_sag)
+        self.sag_peak[1] = max(self.sag_peak[1], grip_sag)
+
+        def part(name, v, sag, peak, noise):
+            if v < 0:
+                return f"{name}: no sensor"
+            return f"{name}: {v:.2f} V   sag {max(sag, 0):.0f} mV (max {peak:.0f})   noise {noise:.0f} mV"
+        self.rail_text.set("Servo supply   " + part("arm", arm_v, arm_sag, self.sag_peak[0], arm_noise) + "   ·   "
+                           + part("gripper", grip_v, grip_sag, self.sag_peak[1], grip_noise))
+        alerts = []
+        for name, state in (("ARM (elbow + shoulder)", arm_state), ("GRIPPER", grip_state)):
+            if state == 2:
+                alerts.append(f"{name} OVERLOAD - stopped")
+            elif state == 1:
+                alerts.append(f"{name} heavy load - slowed")
+        self.rail_alert.set("   ".join(alerts))
+        self.rail_alert_label.configure(fg=BAD if "stopped" in self.rail_alert.get() else WARN)
+
     def _reset_encoders(self):
         """Zero both wheel counters on the car ('E'). The car's counters jump to 0, so forget the old baseline and
         ignore readings already in flight (they still carry the old distance) for a moment."""
@@ -1162,6 +1253,8 @@ class Dashboard:
         self.enc_dist_var.set("--")
         self.enc_speed_var.set("waiting for encoders")
         self.enc_wheels_var.set("L -- · R --")
+        self.rail_text.set("Servo supply: waiting for data")
+        self.rail_alert.set("")
         self.tracker.enc_last = None   # the car may have rebooted: its encoder counters start from 0 again
         self._yaw_resync = True        # the car may have rebooted: its yaw starts from 0 again
         self._draw_dial()
@@ -1206,7 +1299,8 @@ class Dashboard:
                     continue
                 self.write_response = "write" in self.characteristic.properties
                 for uuid, handler in ((DISTANCE_CHAR_UUID, self._on_distance), (MPU_CHAR_UUID, self._on_mpu),
-                                      (ENCODER_CHAR_UUID, self._on_encoder)):
+                                      (ENCODER_CHAR_UUID, self._on_encoder),
+                                      (SERVO_STATUS_CHAR_UUID, self._on_servo_status)):
                     try:
                         await client.start_notify(uuid, handler)
                     except Exception:
@@ -1214,6 +1308,7 @@ class Dashboard:
                 self.connected.set()
                 self._post(self._send_speed)   # make the car match the slider after (re)connecting
                 self._post(self._send_straight)   # and the straight-drive checkbox
+                self._post(self._send_guard)      # and the overload guard settings
                 self._post(lambda: self.car_text.set("Connected to AI_Car"))
                 while not self.stop_event.is_set() and client.is_connected:
                     await asyncio.sleep(0.1)
@@ -1368,6 +1463,16 @@ class Dashboard:
 
     def _send_speed(self):
         self._send(f"P{int(self.car_speed.get())}")
+
+    def _send_guard(self):
+        """Send the overload guard switch and its two thresholds (the stop level is kept above the slow-down level)."""
+        slow = int(self.sag_slow.get())
+        stop = max(int(self.sag_stop.get()), slow + 50)
+        self._send("O1" if self.guard_on_var.get() else "O0")
+        self._send(f"T{slow} {stop}")
+
+    def _reset_sag_peak(self):
+        self.sag_peak = [0.0, 0.0]
 
     def _send_straight(self):
         mode = (1 if self.gyro_assist_var.get() else 0) | (2 if self.enc_assist_var.get() else 0)
