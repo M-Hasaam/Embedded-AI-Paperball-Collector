@@ -9,7 +9,7 @@ class ServoControllerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Robotic Arm 4-Axis Controller")
-        self.root.geometry("640x820")
+        self.root.geometry("680x900")
         self.root.configure(bg="#f4f5f7")
 
         self.arduino = None
@@ -17,14 +17,22 @@ class ServoControllerApp:
         self.is_playing = False
         self.is_moving = False
         self._last_send_time = [0.0] * 4  # Rate limit per servo
+        self.move_id = 0
 
-        # Servo definitions: Pin, Default Name, Default Angle
+        # Servo definitions: pin, name, default angle, angle limits.
+        # Keep the pins and limits in sync with servo.ino. Servos get no signal until first commanded.
         self.servo_config = [
-            {"pin": 6,  "name": "Base Rotation", "angle": 90},
-            {"pin": 9,  "name": "Shoulder",      "angle": 90},
-            {"pin": 10, "name": "Elbow",         "angle": 90},
-            {"pin": 11, "name": "Claw / Gripper","angle": 90}
+            {"pin": 6,  "name": "Gripper",  "angle": 90,  "min": 0, "max": 120},
+            {"pin": 9,  "name": "Elbow",    "angle": 120, "min": 0, "max": 180},
+            {"pin": 10, "name": "Shoulder", "angle": 90,  "min": 0, "max": 180},
+            {"pin": 11, "name": "Servo 4",  "angle": 90,  "min": 0, "max": 180},
         ]
+        self.SPEED_DEFAULT = 60
+        self.SPEED_MAX = 600
+        self.commanded = [False] * 4                     # has this servo been sent a command yet?
+        self.est_angle = [float(c["angle"]) for c in self.servo_config]  # where each servo is believed to be
+        self.speed_vars = []
+        self.speed_labels = []
 
         self.sliders = []
         self.entries = []
@@ -73,7 +81,7 @@ class ServoControllerApp:
             btn_minus.grid(row=0, column=1, padx=2)
 
             # Slider
-            slider = ttk.Scale(row_frame, from_=0, to=180, orient="horizontal", variable=var,
+            slider = ttk.Scale(row_frame, from_=cfg["min"], to=cfg["max"], orient="horizontal", variable=var,
                                command=lambda val, idx=i: self.on_slider_move(idx, val))
             slider.grid(row=0, column=2, sticky="ew", padx=5)
             row_frame.columnconfigure(2, weight=1)
@@ -89,60 +97,33 @@ class ServoControllerApp:
             entry.bind("<Return>", lambda event, idx=i: self.on_entry_submit(idx))
             self.entries.append(entry)
 
-        # --- Motion Speed Panel ---
-        speed_frame = ttk.LabelFrame(self.root, text=" Motion Speed Control ", padding=10)
+            # Speed row (degrees per second, handled by the Arduino)
+            speed_var = tk.IntVar(value=self.SPEED_DEFAULT)
+            self.speed_vars.append(speed_var)
+            ttk.Label(row_frame, text="speed", foreground="#666").grid(row=1, column=0, sticky="e")
+            sp_scale = ttk.Scale(row_frame, from_=1, to=self.SPEED_MAX, orient="horizontal", variable=speed_var,
+                                 command=lambda val, idx=i: self.on_servo_speed(idx, val))
+            sp_scale.grid(row=1, column=2, sticky="ew", padx=5)
+            sp_label = ttk.Label(row_frame, text=f"{self.SPEED_DEFAULT}°/s", width=8, foreground="#666")
+            sp_label.grid(row=1, column=4)
+            self.speed_labels.append(sp_label)
+
+        # --- Speed presets (apply to all servos; each servo's slider can still be tuned) ---
+        speed_frame = ttk.LabelFrame(self.root, text=" Motion Speed (all servos) ", padding=10)
         speed_frame.pack(fill="x", padx=15, pady=6)
-
-        profile_row = ttk.Frame(speed_frame)
-        profile_row.pack(fill="x", pady=2)
-
-        ttk.Label(profile_row, text="Speed Profile:", font=("Helvetica", 9, "bold")).pack(side="left", padx=(0, 8))
-
-        self.speed_mode_var = tk.StringVar(value="Medium")
-
-        speed_presets = [
-            ("🐢 Slow", "Slow", 2),
-            ("🚶 Medium", "Medium", 5),
-            ("⚡ Fast", "Fast", 8),
-            ("🚀 Instant", "Instant", 0)
-        ]
-
-        for text, mode, spd in speed_presets:
-            r = ttk.Radiobutton(
-                profile_row,
-                text=text,
-                value=mode,
-                variable=self.speed_mode_var,
-                command=lambda s=spd, m=mode: self.set_speed_preset(m, s)
-            )
-            r.pack(side="left", padx=5)
-
-        slider_row = ttk.Frame(speed_frame)
-        slider_row.pack(fill="x", pady=(6, 2))
-
-        ttk.Label(slider_row, text="Fine Tune (1-10):", width=14).pack(side="left", padx=(0, 5))
-        self.speed_var = tk.IntVar(value=5)
-        self.speed_slider = ttk.Scale(
-            slider_row,
-            from_=1,
-            to=10,
-            orient="horizontal",
-            variable=self.speed_var,
-            command=self.on_speed_slider_change
-        )
-        self.speed_slider.pack(side="left", fill="x", expand=True, padx=5)
-
-        self.lbl_speed_val = ttk.Label(slider_row, text="Level 5", width=9)
-        self.lbl_speed_val.pack(side="left", padx=5)
+        for text, spd in (("🐢 Slow 30°/s", 30), ("🚶 Default 60°/s", 60), ("⚡ Fast 180°/s", 180), ("🚀 Max 600°/s", 600)):
+            ttk.Button(speed_frame, text=text, command=lambda v=spd: self.set_all_speeds(v)).pack(side="left", expand=True, fill="x", padx=3)
 
         # --- Global Presets Panel ---
         preset_frame = ttk.LabelFrame(self.root, text=" Quick Presets ", padding=10)
         preset_frame.pack(fill="x", padx=15, pady=6)
 
-        ttk.Button(preset_frame, text="ALL 90° (Neutral)", command=lambda: self.set_all_angles_smooth(90)).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(preset_frame, text="ALL 0° (Home)", command=lambda: self.set_all_angles_smooth(0)).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(preset_frame, text="ALL 180° (Max)", command=lambda: self.set_all_angles_smooth(180)).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(preset_frame, text="Toggle Claw (0°/90°)", command=self.toggle_claw_smooth).pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Button(preset_frame, text="All default", command=lambda: self.move_to_pose_thread(self.default_pose())).pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Button(preset_frame, text="All 0°", command=lambda: self.set_all_angles_smooth(0)).pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Button(preset_frame, text="All 180°", command=lambda: self.set_all_angles_smooth(180)).pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Button(preset_frame, text="Toggle Gripper", command=self.toggle_claw_smooth).pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Label(self.root, text="Servos stay idle after power-up until you first move a slider or press All default.",
+                  foreground="#666").pack(padx=15, anchor="w")
 
         # --- Pose Recorder & Sequence Panel ---
         seq_frame = ttk.LabelFrame(self.root, text=" Pose Sequence Recorder ", padding=10)
@@ -188,12 +169,21 @@ class ServoControllerApp:
                     f"Could not open {port}:\n{e}\n\nTip: If Arduino IDE's Serial Monitor is open, CLOSE IT so Python can access the port."
                 )
 
+    def clamp(self, idx, angle):
+        cfg = self.servo_config[idx]
+        return max(cfg["min"], min(cfg["max"], int(round(angle))))
+
     def send_command(self, idx, angle):
+        """Send '<servo> <angle> <speed>'; the Arduino moves the servo there at that speed."""
         if self.arduino and self.arduino.is_open:
-            cmd = f"{idx} {angle}\n"
+            angle = self.clamp(idx, angle)
+            speed = max(1, min(self.SPEED_MAX, int(self.speed_vars[idx].get())))
             try:
-                self.arduino.write(cmd.encode('utf-8'))
+                self.arduino.write(f"{idx} {angle} {speed}\n".encode('utf-8'))
                 self.arduino.flush()
+                if not self.commanded[idx]:
+                    self.commanded[idx] = True
+                    self.est_angle[idx] = float(angle)   # first command: the servo starts right there
             except Exception as e:
                 print(f"Write error: {e}")
                 self.lbl_status.config(text=f"Write Error: {e}", foreground="red")
@@ -201,72 +191,60 @@ class ServoControllerApp:
             self.lbl_status.config(text="Not Connected! Select port & click Connect", foreground="orange")
 
     # --- Speed Handling ---
-    def set_speed_preset(self, mode, val):
-        self.speed_mode_var.set(mode)
-        if val > 0:
-            self.speed_var.set(val)
-            self.lbl_speed_val.config(text=f"Level {val}")
-        else:
-            self.lbl_speed_val.config(text="Instant")
+    def on_servo_speed(self, idx, val):
+        self.speed_labels[idx].config(text=f"{int(float(val))}°/s")
 
-    def on_speed_slider_change(self, val):
-        v = int(float(val))
-        self.speed_var.set(v)
-        self.lbl_speed_val.config(text=f"Level {v}")
-        if self.speed_mode_var.get() == "Instant":
-            self.speed_mode_var.set("Medium")
+    def set_all_speeds(self, value):
+        for var, label in zip(self.speed_vars, self.speed_labels):
+            var.set(value)
+            label.config(text=f"{value}°/s")
 
-    def get_step_delay(self):
-        if self.speed_mode_var.get() == "Instant":
-            return 0.0
-        lvl = max(1, min(10, self.speed_var.get()))
-        # Speed 1: 0.040s (slow, ~25 deg/s)
-        # Speed 5: 0.016s (~62 deg/s)
-        # Speed 10: 0.004s (fast, ~250 deg/s)
-        return 0.044 - (lvl * 0.004)
+    def default_pose(self):
+        return [c["angle"] for c in self.servo_config]
 
     def stop_motion(self):
         self.is_moving = False
         self.is_playing = False
+        self.move_id += 1
+        # hold each servo where it has got to
+        for i in range(len(self.servo_config)):
+            if self.commanded[i]:
+                self.send_command(i, int(round(self.est_angle[i])))
 
     def move_to_pose(self, target_pose):
+        """Send every servo to its target (each at its own speed) and follow the estimated positions until done."""
         self.is_moving = True
-        start_pose = [var.get() for var in self.angle_vars]
-        delay = self.get_step_delay()
-
-        if delay <= 0:
-            for idx, angle in enumerate(target_pose):
-                self.angle_vars[idx].set(angle)
-                self.send_command(idx, angle)
-                time.sleep(0.01)
-            self.is_moving = False
-            return
-
-        diffs = [abs(target_pose[i] - start_pose[i]) for i in range(len(target_pose))]
-        max_diff = max(diffs)
-        if max_diff == 0:
-            self.is_moving = False
-            return
-
-        last_sent = list(start_pose)
-        for step in range(1, max_diff + 1):
-            if not self.is_moving:
-                break
-            frac = step / float(max_diff)
-            for i in range(len(target_pose)):
-                cur = int(round(start_pose[i] + (target_pose[i] - start_pose[i]) * frac))
-                if cur != last_sent[i]:
-                    self.angle_vars[i].set(cur)
-                    self.send_command(i, cur)
-                    last_sent[i] = cur
-            time.sleep(delay)
-
-        # Finalize target angles
+        self.move_id += 1
+        my_id = self.move_id
+        target_pose = [self.clamp(i, a) for i, a in enumerate(target_pose)]
+        start = list(self.est_angle)
+        was_commanded = list(self.commanded)
+        for idx, angle in enumerate(target_pose):
+            self.send_command(idx, angle)
+            time.sleep(0.01)
+        # a servo that was idle snaps to its target at once; the others travel at their set speed
+        total = 0.0
         for i, target in enumerate(target_pose):
-            self.angle_vars[i].set(target)
-            self.send_command(i, target)
-
-        self.is_moving = False
+            spd = max(1, int(self.speed_vars[i].get()))
+            if was_commanded[i]:
+                total = max(total, abs(target - start[i]) / spd)
+        t0 = time.time()
+        while self.is_moving and my_id == self.move_id:
+            elapsed = time.time() - t0
+            for i, target in enumerate(target_pose):
+                spd = max(1, int(self.speed_vars[i].get()))
+                if not was_commanded[i]:
+                    pos = float(target)
+                else:
+                    moved = min(abs(target - start[i]), spd * elapsed)
+                    pos = start[i] + (moved if target >= start[i] else -moved)
+                self.est_angle[i] = pos
+                self.angle_vars[i].set(int(round(pos)))
+            if elapsed >= total:
+                break
+            time.sleep(0.03)
+        if my_id == self.move_id:
+            self.is_moving = False
 
     def move_to_pose_thread(self, target_pose):
         if self.is_moving or self.is_playing:
@@ -276,8 +254,9 @@ class ServoControllerApp:
 
     # --- Motion Handling ---
     def on_slider_move(self, idx, val):
-        angle = int(float(val))
+        angle = self.clamp(idx, float(val))
         self.angle_vars[idx].set(angle)
+        self.est_angle[idx] = float(angle)
         now = time.time()
         # Rate limit slider events to max 30Hz (every 30ms) to avoid buffer overflow
         if (now - self._last_send_time[idx]) >= 0.03:
@@ -285,36 +264,24 @@ class ServoControllerApp:
             self.send_command(idx, angle)
 
     def on_entry_submit(self, idx):
-        angle = self.angle_vars[idx].get()
-        angle = max(0, min(180, angle))
-        delay = self.get_step_delay()
-        if delay > 0:
-            target_pose = [var.get() for var in self.angle_vars]
-            target_pose[idx] = angle
-            self.move_to_pose_thread(target_pose)
-        else:
-            self.angle_vars[idx].set(angle)
-            self.send_command(idx, angle)
+        angle = self.clamp(idx, self.angle_vars[idx].get())
+        self.angle_vars[idx].set(angle)
+        self.send_command(idx, angle)
+        self.est_angle[idx] = float(angle)
 
     def adjust_angle(self, idx, delta):
-        curr = self.angle_vars[idx].get()
-        new_angle = max(0, min(180, curr + delta))
-        delay = self.get_step_delay()
-        if delay > 0:
-            target_pose = [var.get() for var in self.angle_vars]
-            target_pose[idx] = new_angle
-            self.move_to_pose_thread(target_pose)
-        else:
-            self.angle_vars[idx].set(new_angle)
-            self.send_command(idx, new_angle)
+        new_angle = self.clamp(idx, self.angle_vars[idx].get() + delta)
+        self.angle_vars[idx].set(new_angle)
+        self.send_command(idx, new_angle)
+        self.est_angle[idx] = float(new_angle)
 
     def set_all_angles_smooth(self, angle):
         self.move_to_pose_thread([angle] * len(self.servo_config))
 
     def toggle_claw_smooth(self):
-        claw_idx = 3  # Index 3 is Claw
+        claw_idx = 0  # Index 0 is the Gripper
         curr = self.angle_vars[claw_idx].get()
-        target = 0 if curr > 45 else 90
+        target = self.servo_config[claw_idx]["min"] if curr > 45 else 90
         target_pose = [var.get() for var in self.angle_vars]
         target_pose[claw_idx] = target
         self.move_to_pose_thread(target_pose)
@@ -323,7 +290,8 @@ class ServoControllerApp:
     def record_pose(self):
         pose = [var.get() for var in self.angle_vars]
         self.recorded_poses.append(pose)
-        pose_str = f"Pose {len(self.recorded_poses)}: Base={pose[0]}°, Shldr={pose[1]}°, Elbw={pose[2]}°, Claw={pose[3]}°"
+        pose_str = (f"Pose {len(self.recorded_poses)}: Gripper={pose[0]}°, Elbow={pose[1]}°, "
+                    f"Shoulder={pose[2]}°, Servo 4={pose[3]}°")
         self.pose_listbox.insert(tk.END, pose_str)
 
     def clear_poses(self):
