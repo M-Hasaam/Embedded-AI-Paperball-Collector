@@ -47,8 +47,10 @@ SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233"   # "armV,grippe
 RAIL_DISPLAY_SCALE = (1.0, 0.951)
 
 SERVO_NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
-SERVO_MIN_ANGLES = [0, 0, 0, 0]
-SERVO_MAX_ANGLES = [120, 180, 180, 180]   # gripper only opens to 120
+SERVO_MIN_ANGLES = [0, 80, 40, 0]         # hard limits: keep in sync with SERVO_ANGLE_MIN / SERVO_ANGLE_MAX in AI_Car.ino (it clamps too)
+SERVO_MAX_ANGLES = [120, 170, 170, 180]
+SERVO_RANGE_DEFAULT = [(0, 100), (80, 170), (40, 170), (0, 180)]   # each servo slider's range at start-up; adjustable in the UI
+SERVO_RANGE_GAP = 5                       # the two ends of the range slider stay at least this far apart
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 SERVO_SPEED = 60                  # default deg/s
 CAR_SPEED_DEFAULT = 100           # wheel speed in percent (one slider for all wheels)
@@ -712,6 +714,54 @@ class PathWindow:
 
 
 # ---------------------------------------------------------------- dashboard
+class RangeSlider(tk.Canvas):
+    """A slider with two handles: drag either end to set the lowest and highest value (whole numbers)."""
+
+    def __init__(self, parent, lo_limit, hi_limit, lo, hi, command):
+        super().__init__(parent, height=18, bg=CARD, highlightthickness=0, bd=0, takefocus=0, cursor="hand2")
+        self.lo_limit, self.hi_limit, self.lo, self.hi, self.command = lo_limit, hi_limit, lo, hi, command
+        self.grab = None
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", lambda e: setattr(self, "grab", None))
+
+    def _x(self, value):
+        w = max(self.winfo_width(), 40) - 16
+        return 8 + w * (value - self.lo_limit) / (self.hi_limit - self.lo_limit)
+
+    def _value(self, x):
+        w = max(self.winfo_width(), 40) - 16
+        return int(round(self.lo_limit + (x - 8) / w * (self.hi_limit - self.lo_limit)))
+
+    def _draw(self):
+        self.delete("all")
+        mid = 9
+        self.create_rectangle(8, mid - 3, self.winfo_width() - 8, mid + 3, fill=CARD_HI, outline="")
+        self.create_rectangle(self._x(self.lo), mid - 3, self._x(self.hi), mid + 3, fill="#1f4f99", outline="")
+        for v in (self.lo, self.hi):
+            self.create_rectangle(self._x(v) - 5, 1, self._x(v) + 5, 17, fill=ACCENT, outline="")
+
+    def _press(self, event):
+        v = self._value(event.x)
+        # grab the nearer handle (the one on the side of the click if both are equally near)
+        self.grab = "lo" if abs(v - self.lo) < abs(v - self.hi) or (abs(v - self.lo) == abs(v - self.hi) and v < self.lo) else "hi"
+        self._drag(event)
+
+    def _drag(self, event):
+        if self.grab is None:
+            return
+        v = min(max(self._value(event.x), self.lo_limit), self.hi_limit)
+        old = (self.lo, self.hi)
+        if self.grab == "lo":
+            self.lo = min(v, self.hi - SERVO_RANGE_GAP)
+        else:
+            self.hi = max(v, self.lo + SERVO_RANGE_GAP)
+        if (self.lo, self.hi) != old:
+            self._draw()
+            self.command(self.lo, self.hi)
+
+
 class Dashboard:
     def __init__(self, root):
         self.root = root
@@ -953,7 +1003,7 @@ class Dashboard:
             val = tk.StringVar(value=f"{SERVO_DEFAULT_ANGLES[i]}°")
             self.servo_values.append(val)
             tk.Label(top, textvariable=val, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold")).pack(side="right")
-            scale = self._scale(col, SERVO_MIN_ANGLES[i], SERVO_MAX_ANGLES[i], SERVO_DEFAULT_ANGLES[i], lambda v, idx=i: self._slider_changed(idx, v))
+            scale = self._scale(col, SERVO_RANGE_DEFAULT[i][0], SERVO_RANGE_DEFAULT[i][1], SERVO_DEFAULT_ANGLES[i], lambda v, idx=i: self._slider_changed(idx, v))
             scale.pack(fill="x")
             scale.bind("<ButtonPress-1>", lambda e, idx=i: self.dragging.add(idx))
             scale.bind("<ButtonRelease-1>", lambda e, idx=i: self._servo_released(idx))
@@ -966,6 +1016,14 @@ class Dashboard:
             speed = self._scale(sp, 1, 600, SERVO_SPEED, lambda v, var=sp_var: var.set(f"{int(float(v))}°/s"), thin=True)
             speed.pack(side="left", fill="x", expand=True, padx=6)
             self.speed_scales.append(speed)
+            # adjustable range: drag either end; the angle slider above then only moves between the two ends
+            rg = tk.Frame(col, bg=CARD)
+            rg.pack(fill="x")
+            rng_var = tk.StringVar(value="%d°–%d°" % SERVO_RANGE_DEFAULT[i])
+            tk.Label(rg, text="range", bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="left")
+            tk.Label(rg, textvariable=rng_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
+            RangeSlider(rg, SERVO_MIN_ANGLES[i], SERVO_MAX_ANGLES[i], *SERVO_RANGE_DEFAULT[i],
+                        lambda lo, hi, idx=i, var=rng_var: self._range_changed(idx, lo, hi, var)).pack(side="left", fill="x", expand=True, padx=6)
         presets = tk.Frame(s, bg=CARD)
         presets.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(8, 0))
         self._button(presets, "All default", self._set_default_servos).pack(side="left")
@@ -1507,6 +1565,15 @@ class Dashboard:
         self.servo_values[index].set(f"{int(float(value))}°")
         if index in self.dragging:
             self._send_servo_throttled(index)
+
+    def _range_changed(self, index, lo, hi, var):
+        var.set(f"{lo}°–{hi}°")
+        scale = self.servo_scales[index]
+        scale.configure(from_=lo, to=hi)
+        value = int(scale.get())
+        if value < lo or value > hi:          # the servo was outside the new range: bring it to the nearest end
+            scale.set(min(max(value, lo), hi))
+            self._send_servo(index)
 
     def _send_servo_throttled(self, index):
         if index in self.pending_servo_send:

@@ -133,8 +133,14 @@ const int SERVO_MAX_US = 2400;
 // keeps the servo signal wires quiet while the radio starts (that made the board brown out right at power-on).
 bool servoAttached[4] = {false, false, false, false};   // one flag per servo (NUM_SERVOS is declared above)
 
+const int SERVO_ANGLE_MIN[NUM_SERVOS] = {0, 80, 40, 0};         // lowest angle per servo (elbow 80, shoulder 40)
+const int SERVO_ANGLE_MAX[NUM_SERVOS] = {120, 170, 170, 180};  // highest angle per servo (gripper 120, elbow 170, shoulder 170)
+// These are compiled into the firmware, so they hold after every restart and re-flash. writeServo() clamps to them too.
+
 void writeServo(int index, int angle) {
   if (!servoAttached[index]) return;
+  if (angle < SERVO_ANGLE_MIN[index]) angle = SERVO_ANGLE_MIN[index];   // last line of defence: no path can drive a servo outside its limits
+  if (angle > SERVO_ANGLE_MAX[index]) angle = SERVO_ANGLE_MAX[index];
   uint32_t us = SERVO_MIN_US + (uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US) / 180;
   uint32_t duty = (uint64_t)us * ((1UL << SERVO_PWM_BITS) - 1) / (1000000UL / SERVO_FREQ_HZ);
   ledcWrite(SERVO_PINS[index], duty);
@@ -164,8 +170,6 @@ int servoSpeeds[NUM_SERVOS] = {60, 60, 60, 60};  // degrees per second
 unsigned long lastServoUpdate[NUM_SERVOS] = {0, 0, 0, 0};
 int servoLastDir[NUM_SERVOS] = {0, 0, 0, 0};       // direction of each servo's last step: +1 up, -1 down, 0 none yet
 float servoAccum[NUM_SERVOS] = {0, 0, 0, 0};       // degrees still owed from the elapsed time (see updateServos)
-const int SERVO_ANGLE_MIN[NUM_SERVOS] = {0, 0, 0, 0};          // lowest angle per servo
-const int SERVO_ANGLE_MAX[NUM_SERVOS] = {120, 180, 180, 180};  // highest angle per servo (the gripper only opens to 120)
 const int SERVO_SPEED_MAX = 600;                   // highest speed (deg/s) a command may ask for; the servo itself may be slower
 const int SERVO_BACKOFF_DEG = 5;                   // when the overload guard stops a servo, it steps this far back from the load
 
