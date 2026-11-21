@@ -48,8 +48,8 @@ RAIL_DISPLAY_SCALE = (1.0, 0.951)
 
 SERVO_NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
 SERVO_MIN_ANGLES = [0, 80, 40, 0]         # hard limits: keep in sync with SERVO_ANGLE_MIN / SERVO_ANGLE_MAX in AI_Car.ino (it clamps too)
-SERVO_MAX_ANGLES = [120, 170, 170, 180]
-SERVO_RANGE_DEFAULT = [(0, 100), (80, 170), (40, 170), (0, 180)]   # each servo slider's range at start-up; adjustable in the UI
+SERVO_MAX_ANGLES = [120, 180, 170, 180]
+SERVO_RANGE_DEFAULT = [(0, 100), (80, 180), (40, 170), (0, 180)]   # each servo slider's range at start-up; adjustable in the UI
 SERVO_RANGE_GAP = 5                       # the two ends of the range slider stay at least this far apart
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 SERVO_SPEED = 60                  # default deg/s

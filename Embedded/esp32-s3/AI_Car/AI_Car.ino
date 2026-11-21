@@ -134,7 +134,7 @@ const int SERVO_MAX_US = 2400;
 bool servoAttached[4] = {false, false, false, false};   // one flag per servo (NUM_SERVOS is declared above)
 
 const int SERVO_ANGLE_MIN[NUM_SERVOS] = {0, 80, 40, 0};         // lowest angle per servo (elbow 80, shoulder 40)
-const int SERVO_ANGLE_MAX[NUM_SERVOS] = {120, 170, 170, 180};  // highest angle per servo (gripper 120, elbow 170, shoulder 170)
+const int SERVO_ANGLE_MAX[NUM_SERVOS] = {120, 180, 170, 180};  // highest angle per servo (gripper 120, shoulder 170)
 // These are compiled into the firmware, so they hold after every restart and re-flash. writeServo() clamps to them too.
 
 void writeServo(int index, int angle) {

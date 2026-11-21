@@ -25,7 +25,7 @@ SERVO_SPEED = 60
 SERVO_SEND_INTERVAL = 0.06  # seconds between live commands while dragging a slider
 SERVO_NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
 SERVO_MIN_ANGLES = [0, 80, 40, 0]         # keep in sync with SERVO_ANGLE_MIN / SERVO_ANGLE_MAX in AI_Car.ino
-SERVO_MAX_ANGLES = [120, 170, 170, 180]
+SERVO_MAX_ANGLES = [120, 180, 170, 180]
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]  # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 
 class AICarController:
