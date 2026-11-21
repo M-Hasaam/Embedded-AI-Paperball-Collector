@@ -198,8 +198,6 @@ class AICarController:
         preset_row = ttk.Frame(servos_frame)
         preset_row.pack(fill="x", pady=(8, 0))
         ttk.Button(preset_row, text="All default", command=self._set_default_servos).pack(side="left")
-        ttk.Button(preset_row, text="All 0°", command=lambda: self._set_all_servos(0)).pack(side="left", padx=6)
-        ttk.Button(preset_row, text="All 180°", command=lambda: self._set_all_servos(180)).pack(side="left")
 
         footer = ttk.Label(
             main,
@@ -436,11 +434,6 @@ class AICarController:
         angle = int(self.servo_scales[index].get())
         speed = int(self.speed_scales[index].get())
         self._send(f"V{index} {angle} {speed}")
-
-    def _set_all_servos(self, angle):
-        for index, scale in enumerate(self.servo_scales):
-            scale.set(angle)
-            self._send_servo(index)
 
     def _set_default_servos(self):
         for index, scale in enumerate(self.servo_scales):

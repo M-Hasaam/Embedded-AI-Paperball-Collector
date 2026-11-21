@@ -124,8 +124,6 @@ class ServoControllerApp:
         preset_frame.pack(fill="x", padx=15, pady=6)
 
         ttk.Button(preset_frame, text="All default", command=lambda: self.move_to_pose_thread(self.default_pose())).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(preset_frame, text="All 0°", command=lambda: self.set_all_angles_smooth(0)).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(preset_frame, text="All 180°", command=lambda: self.set_all_angles_smooth(180)).pack(side="left", expand=True, fill="x", padx=3)
         ttk.Button(preset_frame, text="Toggle Gripper", command=self.toggle_claw_smooth).pack(side="left", expand=True, fill="x", padx=3)
         ttk.Label(self.root, text="Servos stay idle after power-up until you first move a slider or press All default.",
                   foreground="#666").pack(padx=15, anchor="w")
@@ -309,9 +307,6 @@ class ServoControllerApp:
         self.angle_vars[idx].set(new_angle)
         self.send_command(idx, new_angle)
         self.est_angle[idx] = float(new_angle)
-
-    def set_all_angles_smooth(self, angle):
-        self.move_to_pose_thread([angle] * len(self.servo_config))
 
     def toggle_claw_smooth(self):
         claw_idx = 0  # Index 0 is the Gripper

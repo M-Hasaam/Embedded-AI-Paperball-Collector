@@ -10,6 +10,7 @@ Run:      py dashboard.py
 Keys:     Arrow keys / W A S D drive (release to stop), Esc quits. One speed slider sets all wheels.
 """
 import asyncio
+import json
 import math
 import queue
 import socket
@@ -53,6 +54,7 @@ SERVO_RANGE_DEFAULT = [(0, 100), (80, 180), (40, 170), (0, 180)]   # each servo 
 SERVO_RANGE_GAP = 5                       # the two ends of the range slider stay at least this far apart
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 SERVO_SPEED = 60                  # default deg/s
+SERVO_MEMORY_FILE = Path(__file__).with_name("servo_last_angles.json")   # where each servo was left (so a restart starts from there)
 CAR_SPEED_DEFAULT = 100           # wheel speed in percent (one slider for all wheels)
 CAR_SPEED_MIN = 20                # below this the wheels usually stall
 
@@ -993,6 +995,9 @@ class Dashboard:
         servo_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(10, 14))
         self.servo_scales, self.speed_scales, self.servo_values = [], [], []
         self.dragging, self.last_servo_send, self.pending_servo_send = set(), {}, {}
+        self.servo_commanded = set()      # servos that have been sent a command (an idle one must not be woken by a speed change)
+        self.last_angles = self._load_servo_memory()
+        self.memory_save_job = None
         for i, name in enumerate(SERVO_NAMES):
             s.columnconfigure(i, weight=1, uniform="servo")
             col = tk.Frame(s, bg=CARD)
@@ -1013,7 +1018,7 @@ class Dashboard:
             sp_var = tk.StringVar(value=f"{SERVO_SPEED}°/s")
             tk.Label(sp, text="speed", bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="left")
             tk.Label(sp, textvariable=sp_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
-            speed = self._scale(sp, 1, 600, SERVO_SPEED, lambda v, var=sp_var: var.set(f"{int(float(v))}°/s"), thin=True)
+            speed = self._scale(sp, 1, 600, SERVO_SPEED, lambda v, idx=i, var=sp_var: self._speed_changed(idx, v, var), thin=True)
             speed.pack(side="left", fill="x", expand=True, padx=6)
             self.speed_scales.append(speed)
             # adjustable range: drag either end; the angle slider above then only moves between the two ends
@@ -1027,8 +1032,6 @@ class Dashboard:
         presets = tk.Frame(s, bg=CARD)
         presets.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(8, 0))
         self._button(presets, "All default", self._set_default_servos).pack(side="left")
-        self._button(presets, "All 0°", lambda: self._set_all_servos(0)).pack(side="left", padx=6)
-        self._button(presets, "All 180°", lambda: self._set_all_servos(180)).pack(side="left")
         tk.Label(presets, text="Servos stay idle after power-up until you first move a slider or press All default.",
                  bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=14)
         # servo supply voltages: a strained or stalled servo makes its supply sag; the car slows or stops the servos on it
@@ -1366,6 +1369,7 @@ class Dashboard:
                     except Exception:
                         pass
                 self.connected.set()
+                self._post(self.servo_commanded.clear)   # the car may have restarted: its servos are idle again
                 self._post(self._send_speed)   # make the car match the slider after (re)connecting
                 self._post(self._send_straight)   # and the straight-drive checkbox
                 self._post(self._send_guard)      # and the overload guard settings
@@ -1597,13 +1601,43 @@ class Dashboard:
             self.root.after_cancel(pending)
         self._send_servo(index)
 
-    def _send_servo(self, index):
-        self._send(f"V{index} {int(self.servo_scales[index].get())} {int(self.speed_scales[index].get())}")
+    def _speed_changed(self, index, value, var):
+        var.set(f"{int(float(value))}°/s")
+        # the car only learns a servo's speed together with an angle command, so send the current target again with the new
+        # speed: a servo that is on its way changes speed at once instead of keeping the old one until the next move
+        if index in self.servo_commanded:
+            self._send_servo_throttled(index)
 
-    def _set_all_servos(self, angle):
-        for index, scale in enumerate(self.servo_scales):
-            scale.set(angle)
-            self._send_servo(index)
+    def _send_servo(self, index):
+        angle = int(self.servo_scales[index].get())
+        if self.connected.is_set() and index not in self.servo_commanded:
+            # first command to this servo since the car (re)started: it is idle, so tell it where the arm was left first,
+            # and it glides from there at the set speed instead of snapping to the target
+            self.servo_commanded.add(index)
+            if str(index) in self.last_angles:
+                self._send(f"H{index} {self.last_angles[str(index)]}")
+        self._send(f"V{index} {angle} {int(self.speed_scales[index].get())}")
+        if self.connected.is_set():
+            self.last_angles[str(index)] = angle
+            self._schedule_servo_memory_save()
+
+    def _load_servo_memory(self):
+        try:
+            data = json.loads(SERVO_MEMORY_FILE.read_text())
+            return {str(k): int(v) for k, v in data.items() if str(k) in "0123"}
+        except Exception:
+            return {}
+
+    def _schedule_servo_memory_save(self):
+        if self.memory_save_job is None:
+            self.memory_save_job = self.root.after(800, self._save_servo_memory)
+
+    def _save_servo_memory(self):
+        self.memory_save_job = None
+        try:
+            SERVO_MEMORY_FILE.write_text(json.dumps(self.last_angles))
+        except Exception:
+            pass
 
     def _set_default_servos(self):
         for index, scale in enumerate(self.servo_scales):
@@ -1632,6 +1666,7 @@ class Dashboard:
             return
         self.closing = True
         self._send("S")
+        self._save_servo_memory()
         self.stop_event.set()
         self.camera.stop_event.set()
         try:

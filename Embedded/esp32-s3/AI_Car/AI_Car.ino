@@ -166,7 +166,8 @@ float leftScale = 1.0f, rightScale = 1.0f;
 const int SERVO_DEFAULT_ANGLES[NUM_SERVOS] = SERVO_DEFAULTS;
 int currentAngles[NUM_SERVOS] = SERVO_DEFAULTS;
 int targetAngles[NUM_SERVOS] = SERVO_DEFAULTS;
-int servoSpeeds[NUM_SERVOS] = {60, 60, 60, 60};  // degrees per second
+const int SERVO_SPEED_DEFAULT = 30;                // deg/s a servo moves at unless a command says otherwise (so nothing is ever instant)
+int servoSpeeds[NUM_SERVOS] = {SERVO_SPEED_DEFAULT, SERVO_SPEED_DEFAULT, SERVO_SPEED_DEFAULT, SERVO_SPEED_DEFAULT};  // degrees per second
 unsigned long lastServoUpdate[NUM_SERVOS] = {0, 0, 0, 0};
 int servoLastDir[NUM_SERVOS] = {0, 0, 0, 0};       // direction of each servo's last step: +1 up, -1 down, 0 none yet
 float servoAccum[NUM_SERVOS] = {0, 0, 0, 0};       // degrees still owed from the elapsed time (see updateServos)
@@ -204,6 +205,7 @@ void attachServo(int i, int firstAngle) {
     return;
   }
   servoAttached[i] = true;
+  servoSpeeds[i] = SERVO_SPEED_DEFAULT;     // a freshly started servo always begins at the default speed
   currentAngles[i] = firstAngle;
   targetAngles[i] = firstAngle;
   writeServo(i, firstAngle);
@@ -297,6 +299,22 @@ void handleCommand(String message) {
     return;
   }
 
+  // H<servo-index> <angle>: "this servo is probably at this angle now" (the dashboard remembers where it left it). A servo
+  // that has not been started yet starts its signal at that angle, so the next V command glides from there at the set
+  // speed instead of snapping to the target. Does nothing for a servo that is already running.
+  if (message.charAt(0) == 'H') {
+    int servoIndex = -1, angle = -1;
+    if (sscanf(message.c_str(), "H%d %d", &servoIndex, &angle) == 2 && servoIndex >= 0 && servoIndex < NUM_SERVOS &&
+        angle >= 0 && angle <= 180) {
+      if (angle < SERVO_ANGLE_MIN[servoIndex]) angle = SERVO_ANGLE_MIN[servoIndex];
+      if (angle > SERVO_ANGLE_MAX[servoIndex]) angle = SERVO_ANGLE_MAX[servoIndex];
+      attachServo(servoIndex, angle);
+    } else {
+      Serial.println("Invalid hold command. Use: H1 120");
+    }
+    return;
+  }
+
   // Servo command format: V<servo-index> <angle> <speed deg/sec>
   // Examples: V0 90 60, V1 120 30, V3 160 120
   if (message.charAt(0) == 'V') {
@@ -304,7 +322,9 @@ void handleCommand(String message) {
     int angle = -1;
     int speed = -1;
 
-    if (sscanf(message.c_str(), "V%d %d %d", &servoIndex, &angle, &speed) == 3) {
+    int fields = sscanf(message.c_str(), "V%d %d %d", &servoIndex, &angle, &speed);
+    if (fields == 2 && servoIndex >= 0 && servoIndex < NUM_SERVOS) speed = servoSpeeds[servoIndex];   // no speed given: keep the servo's speed (30 deg/s at first)
+    if (fields == 2 || fields == 3) {
       if (servoIndex >= 0 && servoIndex < NUM_SERVOS &&
           angle >= 0 && angle <= 180 &&
           speed >= 1 && speed <= SERVO_SPEED_MAX) {
