@@ -1,0 +1,39 @@
+# Publishes only the web demo (Web_Demo) to GitHub Pages, and only when it changes.
+# The site stays at https://m-hasaam.github.io/Embedded-AI-Paperball-Collector/paperball-test/
+name: Deploy web demo
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "Web_Demo/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage the site
+        run: |
+          mkdir -p _site
+          cp -r Web_Demo _site/paperball-test
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -12,7 +12,7 @@ this repository; litter in general is the longer-term goal.
 
 Open it on a phone (Safari or Chrome), tap *Start camera* and point it at a paper ball, then at things that are not paper balls
 (other balls, socks, bags, white walls). The model runs **inside your browser, on your device**; nothing is uploaded. "Pick photo"
-tests a single picture and the slider shows weaker detections. It lets you switch between v2.1 and v2.0. Source: [docs/paperball-test/](docs/paperball-test/).
+tests a single picture and the slider shows weaker detections. It lets you switch between v2.1 and v2.0. Source: [Web_Demo/](Web_Demo/).
 
 ## Paper-ball detector: results
 
@@ -81,7 +81,7 @@ All in `Training/paper_ball_detector/`:
 | Score a model | `python evaluate_on_camera.py --set all` (test1, test2, lowcam_front, agilex_desk) |
 | Put a model in the Android app | `python export_model.py --weights roboflow-paperball.pt --install` |
 | Rebuild data | `fetch_negatives.py`, `fetch_hf_balls.py`, `make_confusion.py`, `import_agilex.py` |
-| Try the model in the browser | replace the `.onnx` in `docs/paperball-test/` with the new export, push |
+| Try the model in the browser | replace the `.onnx` in `Web_Demo/` with the new export, push |
 
 ## Repository layout
 
@@ -94,8 +94,8 @@ Embedded/
   Other/               older Arduino sketches and the ESP32-CAM web server
 Training/
   paper_ball_detector/ dataset, trainer, Colab notebook, evaluation, export, results, trained model
+Web_Demo/              the browser test page (published with GitHub Pages)
 docs/
-  paperball-test/      the browser test page (published with GitHub Pages)
   MeArm-with-MG996R/   robot-arm drawings and datasheets
 ```
 
