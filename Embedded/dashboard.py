@@ -770,7 +770,7 @@ class Dashboard:
         root.title("LitterVision Dashboard")
         # Fit the screen (leave room for the title bar and taskbar).
         w = min(1320, root.winfo_screenwidth() - 40)
-        h = min(880, root.winfo_screenheight() - 110)
+        h = min(900, root.winfo_screenheight() - 85)
         root.geometry(f"{w}x{h}+20+10")
         root.minsize(min(1120, w), min(740, h))
         root.configure(bg=BG)
@@ -865,7 +865,7 @@ class Dashboard:
 
         # header
         header = tk.Frame(root, bg=BG)
-        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(8, 4))
         tk.Label(header, text="LitterVision", bg=BG, fg=TEXT, font=(FONT, 20, "bold")).pack(side="left")
         tk.Label(header, text="  car dashboard", bg=BG, fg=MUTED, font=(FONT, 12)).pack(side="left", pady=(7, 0))
         self.car_badge = self._badge(header, "CAR (BLE)", self.car_text)
@@ -992,7 +992,7 @@ class Dashboard:
 
         # servos (full width)
         servo_card, s = self._card(root, "Robotic arm servos")
-        servo_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(10, 14))
+        servo_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(6, 8))
         self.servo_scales, self.speed_scales, self.servo_values = [], [], []
         self.dragging, self.last_servo_send, self.pending_servo_send = set(), {}, {}
         self.actual_markers = []
@@ -1033,25 +1033,25 @@ class Dashboard:
             tk.Label(rg, textvariable=rng_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
             RangeSlider(rg, SERVO_MIN_ANGLES[i], SERVO_MAX_ANGLES[i], *SERVO_RANGE_DEFAULT[i],
                         lambda lo, hi, idx=i, var=rng_var: self._range_changed(idx, lo, hi, var)).pack(side="left", fill="x", expand=True, padx=6)
-        # a limit message from the car (empty = nothing to report): shown in red under the sliders while it lasts
-        self.limit_alert = tk.StringVar(value="")
-        self.limit_alert_label = tk.Label(s, textvariable=self.limit_alert, bg=CARD, fg=BAD, font=(FONT, 10, "bold"), anchor="w")
-        self.limit_alert_label.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(6, 0))
-        self.limit_alert_label.grid_remove()
         presets = tk.Frame(s, bg=CARD)
-        presets.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(8, 0))
+        presets.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(6, 0))
         self._button(presets, "All default", self._set_default_servos).pack(side="left")
-        tk.Label(presets, text="Servos stay idle after power-up until you first move a slider or press All default.",
-                 bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=14)
+        self.idle_note = tk.Label(presets, text="Servos stay idle after power-up until you first move a slider or press All default.",
+                                  bg=CARD, fg=MUTED, font=(FONT, 9))
+        self.idle_note.pack(side="left", padx=14)
+        # a limit message from the car (empty = nothing to report): shown in red in place of the grey note while it lasts,
+        # so it never makes the card (and the window) taller
+        self.limit_alert = tk.StringVar(value="")
+        self.limit_alert_label = tk.Label(presets, textvariable=self.limit_alert, bg=CARD, fg=BAD, font=(FONT, 10, "bold"))
         # servo supply voltages: a strained or stalled servo makes its supply sag; the car slows or stops the servos on it
         rail_row = tk.Frame(s, bg=CARD)
-        rail_row.grid(row=3, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(8, 0))
+        rail_row.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(4, 0))
         tk.Label(rail_row, textvariable=self.rail_text, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
         self.rail_alert_label = tk.Label(rail_row, textvariable=self.rail_alert, bg=CARD, fg=WARN, font=(FONT, 10, "bold"))
         self.rail_alert_label.pack(side="right")
         # overload guard controls: switch, and the sag (in mV) at which the car slows down / stops the servos
         guard_row = tk.Frame(s, bg=CARD)
-        guard_row.grid(row=4, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(6, 0))
+        guard_row.grid(row=3, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(4, 0))
         tk.Checkbutton(
             guard_row, text="Overload guard", variable=self.guard_on_var, command=self._send_guard, bg=CARD, fg=TEXT,
             selectcolor=CARD_HI, activebackground=CARD, activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0,
@@ -1073,8 +1073,7 @@ class Dashboard:
         for sc in (self.sag_slow, self.sag_stop):
             sc.bind("<ButtonRelease-1>", lambda e: self._send_guard())
         self._button(guard_row, "Reset max", self._reset_sag_peak).pack(side="right")
-        tk.Label(s, textvariable=self.guard_levels_var, bg=CARD, fg=MUTED, font=(FONT, 9)).grid(
-            row=4, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(2, 0))
+        tk.Label(guard_row, textvariable=self.guard_levels_var, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(16, 0))
 
         style = ttk.Style()
         try:
@@ -1254,10 +1253,12 @@ class Dashboard:
     def _show_limit_message(self, message):
         if message:
             self.limit_alert.set("⚠ " + message)
-            self.limit_alert_label.grid()
+            self.idle_note.pack_forget()
+            self.limit_alert_label.pack(side="left", padx=14)
         else:
             self.limit_alert.set("")
-            self.limit_alert_label.grid_remove()
+            self.limit_alert_label.pack_forget()
+            self.idle_note.pack(side="left", padx=14)
 
     def _show_servo_status(self, arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state, arm_noise=0.0, grip_noise=0.0,
                            arm_base=-1.0, grip_base=-1.0):
