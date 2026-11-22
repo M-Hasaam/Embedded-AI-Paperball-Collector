@@ -137,10 +137,13 @@ const int SERVO_ANGLE_MIN[NUM_SERVOS] = {0, 80, 40, 0};         // lowest angle 
 const int SERVO_ANGLE_MAX[NUM_SERVOS] = {120, 180, 170, 180};  // highest angle per servo (gripper 120, shoulder 170)
 // These are compiled into the firmware, so they hold after every restart and re-flash. writeServo() clamps to them too.
 
+int clampElbowForShoulder(int angle);   // defined below, with the elbow limit table
+
 void writeServo(int index, int angle) {
   if (!servoAttached[index]) return;
   if (angle < SERVO_ANGLE_MIN[index]) angle = SERVO_ANGLE_MIN[index];   // last line of defence: no path can drive a servo outside its limits
   if (angle > SERVO_ANGLE_MAX[index]) angle = SERVO_ANGLE_MAX[index];
+  if (index == 1) angle = clampElbowForShoulder(angle);     // the elbow also has a limit that depends on the shoulder angle (below)
   uint32_t us = SERVO_MIN_US + (uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US) / 180;
   uint32_t duty = (uint64_t)us * ((1UL << SERVO_PWM_BITS) - 1) / (1000000UL / SERVO_FREQ_HZ);
   ledcWrite(SERVO_PINS[index], duty);
@@ -174,6 +177,100 @@ float servoAccum[NUM_SERVOS] = {0, 0, 0, 0};       // degrees still owed from th
 const int SERVO_SPEED_MAX = 600;                   // highest speed (deg/s) a command may ask for; the servo itself may be slower
 const int SERVO_BACKOFF_DEG = 5;                   // when the overload guard stops a servo, it steps this far back from the load
 
+// ---- Elbow limit that depends on the shoulder angle ----
+// The elbow can break if it goes outside this window for the shoulder's angle (measured on the arm; plotted in
+// docs/arm-limits). Between two rows the TIGHTER of the two is used, and LIMIT_MARGIN keeps the elbow a little inside
+// every limit that is tighter than the servo's own 80..180 range. See elbowWindow(), updateServos() and the V / H commands.
+const int ELBOW = 1, SHOULDER = 2;
+const int LIMIT_ROWS = 14;
+const int LIMIT_SHOULDER[LIMIT_ROWS]  = {  40,  60,  70,  80,  90, 100, 110, 115, 120, 130, 140, 150, 160, 170};
+const int LIMIT_ELBOW_MIN[LIMIT_ROWS] = { 135, 120, 105, 100, 100, 100, 100, 100,  95,  95,  95,  90, 100, 120};
+const int LIMIT_ELBOW_MAX[LIMIT_ROWS] = { 180, 180, 180, 180, 180, 180, 180, 180, 180, 170, 170, 160, 150, 145};
+const int LIMIT_MARGIN = 3;                        // degrees kept inside the table's limits (servo overshoot and play)
+const int LIMIT_LOOKAHEAD = 5;                     // the elbow moves clear of the next few shoulder degrees ahead of the shoulder
+int elbowDesired = SERVO_DEFAULT_ANGLES[ELBOW];    // where the elbow was last asked to go; it is pulled into the window while it moves
+bool elbowWaiting = false;                         // the elbow was commanded before the shoulder started: it starts right after it
+int elbowWaitStart = -1;                           // its start angle while it waits
+int elbowWaitSpeed = SERVO_SPEED_DEFAULT;          // and the speed it was asked for
+bool shoulderHeld = false;                         // the shoulder is waiting for the elbow to get out of the way
+
+// Allowed elbow range for one shoulder angle.
+void elbowWindowAt(int s, int &lo, int &hi) {
+  lo = SERVO_ANGLE_MIN[ELBOW];
+  hi = SERVO_ANGLE_MAX[ELBOW];
+  if (s < LIMIT_SHOULDER[0]) s = LIMIT_SHOULDER[0];
+  if (s > LIMIT_SHOULDER[LIMIT_ROWS - 1]) s = LIMIT_SHOULDER[LIMIT_ROWS - 1];
+  for (int k = 0; k < LIMIT_ROWS - 1; k++) {
+    if (s < LIMIT_SHOULDER[k] || s > LIMIT_SHOULDER[k + 1]) continue;   // exactly on a row: both neighbouring segments apply
+    int segLo = LIMIT_ELBOW_MIN[k] > LIMIT_ELBOW_MIN[k + 1] ? LIMIT_ELBOW_MIN[k] : LIMIT_ELBOW_MIN[k + 1];
+    int segHi = LIMIT_ELBOW_MAX[k] < LIMIT_ELBOW_MAX[k + 1] ? LIMIT_ELBOW_MAX[k] : LIMIT_ELBOW_MAX[k + 1];
+    if (segLo > lo) lo = segLo;
+    if (segHi < hi) hi = segHi;
+  }
+  if (lo > SERVO_ANGLE_MIN[ELBOW]) lo += LIMIT_MARGIN;
+  if (hi < SERVO_ANGLE_MAX[ELBOW]) hi -= LIMIT_MARGIN;
+  if (lo > hi) lo = hi = (lo + hi) / 2;
+}
+
+// Allowed elbow range for every shoulder angle from sA to sB (inclusive): the part that is allowed all the way.
+void elbowWindow(int sA, int sB, int &lo, int &hi) {
+  if (sA > sB) { int x = sA; sA = sB; sB = x; }
+  elbowWindowAt(sA, lo, hi);
+  for (int s = sA + 1; s <= sB; s++) {
+    int l, h;
+    elbowWindowAt(s, l, h);
+    if (l > lo) lo = l;
+    if (h < hi) hi = h;
+  }
+  if (lo > hi) lo = hi = (lo + hi) / 2;
+}
+
+// The window the elbow has to stay in right now: allowed for the shoulder's current angle and for the next few degrees it is
+// about to move through. Also returns the shoulder angle it was worked out for.
+void elbowWindowNow(int &sNow, int &lo, int &hi) {
+  sNow = servoAttached[SHOULDER] ? currentAngles[SHOULDER] : SERVO_DEFAULT_ANGLES[SHOULDER];
+  int sAhead = sNow;
+  if (servoAttached[SHOULDER] && targetAngles[SHOULDER] != sNow) {
+    int span = abs(targetAngles[SHOULDER] - sNow);
+    if (span > LIMIT_LOOKAHEAD) span = LIMIT_LOOKAHEAD;
+    sAhead = sNow + (targetAngles[SHOULDER] > sNow ? span : -span);
+  }
+  elbowWindow(sNow, sAhead, lo, hi);
+}
+
+// The angle the elbow limit is holding the elbow at, or -1 while no limit is acting (the asked-for angle is inside the window).
+int elbowHeldAngle() {
+  if (elbowWaiting || !servoAttached[ELBOW]) return -1;
+  int sNow, lo, hi;
+  elbowWindowNow(sNow, lo, hi);
+  return (elbowDesired < lo || elbowDesired > hi) ? targetAngles[ELBOW] : -1;
+}
+
+// Text for the dashboard when a limit is acting (empty when everything is fine). It travels after a ';' in the servo status.
+void elbowLimitMessage(char* out, size_t n) {
+  out[0] = 0;
+  if (elbowWaiting) {
+    snprintf(out, n, "ELBOW waits: start the shoulder first (its limit depends on the shoulder angle)");
+    return;
+  }
+  if (!servoAttached[ELBOW]) return;
+  int sNow, lo, hi;
+  elbowWindowNow(sNow, lo, hi);
+  if (shoulderHeld) {
+    snprintf(out, n, "SHOULDER waits: elbow must move out of the way (allowed %d-%d deg at shoulder %d)", lo, hi, sNow);
+  } else if (elbowDesired < lo || elbowDesired > hi) {
+    snprintf(out, n, "ELBOW LIMIT: %d deg asked, held at %d (allowed %d-%d deg at shoulder %d)",
+             elbowDesired, targetAngles[ELBOW], lo, hi, sNow);
+  }
+}
+
+// An elbow angle pulled into the window for the shoulder's current angle (its default angle if the shoulder has not started).
+int clampElbowForShoulder(int angle) {
+  int lo, hi;
+  elbowWindowAt(servoAttached[SHOULDER] ? currentAngles[SHOULDER] : SERVO_DEFAULT_ANGLES[SHOULDER], lo, hi);
+  return angle < lo ? lo : (angle > hi ? hi : angle);
+}
+
 // ---- Servo overload guard (state) ----
 // A servo that strains or stalls pulls a lot of current, and its supply voltage dips. Each servo supply goes through a
 // 3:1 resistor divider to an ADC pin; updateServoGuard() watches how far the voltage sags below its normal level and
@@ -200,6 +297,13 @@ unsigned long railSagSince[2] = {0, 0}, railStoppedAt[2] = {0, 0};
 // (it has no earlier position to move from), and later commands move it gradually at the set speed.
 void attachServo(int i, int firstAngle) {
   if (servoAttached[i]) return;
+  if (i == ELBOW && !servoAttached[SHOULDER]) {   // the elbow's limit depends on the shoulder, so the shoulder has to start first
+    elbowWaiting = true;
+    if (elbowWaitStart < 0) elbowWaitStart = firstAngle;   // the first angle wins (the remembered one, if the dashboard sent it)
+    Serial.println("Elbow waits: it starts as soon as the shoulder has started (its limit depends on the shoulder angle)");
+    return;
+  }
+  if (i == ELBOW) firstAngle = clampElbowForShoulder(firstAngle);
   if (!ledcAttach(SERVO_PINS[i], SERVO_FREQ_HZ, SERVO_PWM_BITS)) {
     Serial.printf("ERROR: could not attach servo %d on pin %d\n", i, SERVO_PINS[i]);
     return;
@@ -211,6 +315,12 @@ void attachServo(int i, int firstAngle) {
   writeServo(i, firstAngle);
   markStage(9);
   Serial.printf("Servo %d started at %d degrees\n", i, firstAngle);
+  if (i == SHOULDER && elbowWaiting) {            // the shoulder is running now: start the elbow that was waiting for it
+    elbowWaiting = false;
+    attachServo(ELBOW, elbowWaitStart < 0 ? elbowDesired : elbowWaitStart);
+    elbowWaitStart = -1;
+    servoSpeeds[ELBOW] = elbowWaitSpeed;
+  }
 }
 
 void motors(int lu, int ld, int ru, int rd) {
@@ -330,9 +440,14 @@ void handleCommand(String message) {
           speed >= 1 && speed <= SERVO_SPEED_MAX) {
         if (angle < SERVO_ANGLE_MIN[servoIndex]) angle = SERVO_ANGLE_MIN[servoIndex];
         if (angle > SERVO_ANGLE_MAX[servoIndex]) angle = SERVO_ANGLE_MAX[servoIndex];
+        if (servoIndex == ELBOW) elbowDesired = angle;   // updateServos() pulls the elbow into the window for the shoulder's angle
         attachServo(servoIndex, angle);   // first command for this servo: start its signal at that angle
-        targetAngles[servoIndex] = angle;
-        servoSpeeds[servoIndex] = speed;
+        if (servoIndex == ELBOW && !servoAttached[ELBOW]) {   // waiting for the shoulder to start
+          elbowWaitSpeed = speed;
+        } else {
+          targetAngles[servoIndex] = angle;
+          servoSpeeds[servoIndex] = speed;
+        }
         Serial.printf("Servo %d | Target: %d | Speed: %d deg/sec\n",
                       servoIndex, angle, speed);
       } else {
@@ -349,6 +464,14 @@ void handleCommand(String message) {
 // work too: the servo then moves several degrees per step.
 void updateServos() {
   unsigned long now = millis();
+
+  // The elbow's target is where it was asked to go, pulled into the window that is allowed for the shoulder's angle now
+  // and for the next few degrees the shoulder is about to move through.
+  if (servoAttached[ELBOW]) {
+    int sNow, lo, hi;
+    elbowWindowNow(sNow, lo, hi);
+    targetAngles[ELBOW] = elbowDesired < lo ? lo : (elbowDesired > hi ? hi : elbowDesired);
+  }
 
   for (int i = 0; i < NUM_SERVOS; i++) {
     if (!servoAttached[i]) continue;  // not started yet: its signal pin stays silent
@@ -369,6 +492,21 @@ void updateServos() {
       int remaining = abs(targetAngles[i] - currentAngles[i]);
       if (steps > remaining) steps = remaining;
       int dir = (currentAngles[i] < targetAngles[i]) ? 1 : -1;
+      if (i == SHOULDER && servoAttached[ELBOW]) {
+        // the shoulder only moves while the elbow is inside the window for every angle it is about to pass
+        while (steps > 0) {
+          int lo, hi;
+          elbowWindow(currentAngles[i], currentAngles[i] + dir * steps, lo, hi);
+          if (currentAngles[ELBOW] >= lo && currentAngles[ELBOW] <= hi) break;
+          steps--;
+        }
+        if (steps == 0) {          // the elbow has to move out of the way first (it is already being pulled there)
+          servoAccum[i] = 0;
+          if (!shoulderHeld) { shoulderHeld = true; Serial.println("Shoulder waits: the elbow has to move out of the way first"); }
+          continue;
+        }
+        shoulderHeld = false;
+      }
       currentAngles[i] += dir * steps;
       servoLastDir[i] = dir;
       writeServo(i, currentAngles[i]);
@@ -681,10 +819,12 @@ void updateServoGuard() {
           hold -= servoLastDir[i] * SERVO_BACKOFF_DEG;
           if (hold < SERVO_ANGLE_MIN[i]) hold = SERVO_ANGLE_MIN[i];
           if (hold > SERVO_ANGLE_MAX[i]) hold = SERVO_ANGLE_MAX[i];
+          if (i == ELBOW) hold = clampElbowForShoulder(hold);
           currentAngles[i] = hold;
           writeServo(i, hold);
         }
         targetAngles[i] = hold;                          // and hold there until the supply has recovered
+        if (i == ELBOW) elbowDesired = hold;             // (the elbow limit follows the elbow's asked-for angle)
       }
       Serial.printf("Servo overload on supply %d: sag %.0f mV, servos stopped\n", r, sag);
     } else if (sag >= sagSlowMv) {
@@ -696,18 +836,24 @@ void updateServoGuard() {
   }
 }
 
-// Sends "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState" (V = -1: no divider wired; state 0 ok, 1 slowed, 2 stopped).
+// Sends "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState,...;limit message" (V = -1: no divider wired; state 0 ok, 1 slowed, 2 stopped).
 void notifyServoStatus() {
   static unsigned long last = 0;
   unsigned long now = millis();
   if (now - last < 200) return;
   last = now;
-  char buf[80];
+  char buf[200];
   snprintf(buf, sizeof(buf), "%.2f,%.2f,%.0f,%.0f,%d,%d,%.0f,%.0f,%.2f,%.2f",
            railPresent[0] ? railV[0] / 1000.0f : -1.0f, railPresent[1] ? railV[1] / 1000.0f : -1.0f,
            railPresent[0] ? railSagMax[0] : 0.0f, railPresent[1] ? railSagMax[1] : 0.0f,
            railState[0], railState[1], railNoise[0], railNoise[1],
            railPresent[0] ? railBase[0] / 1000.0f : -1.0f, railPresent[1] ? railBase[1] / 1000.0f : -1.0f);
+  size_t at = strlen(buf);                                   // the angle the elbow limit is holding the elbow at (-1 = no limit acting)
+  snprintf(buf + at, sizeof(buf) - at, ",%d", elbowHeldAngle());
+  char msg[110];
+  elbowLimitMessage(msg, sizeof(msg));                      // a limit message (or nothing) goes after the ';'
+  size_t used = strlen(buf);
+  snprintf(buf + used, sizeof(buf) - used, ";%s", msg);
   railNoise[0] = railNoise[1] = 0;  // start a fresh window
   railSagMax[0] = railSagMax[1] = 0;
   if (deviceConnected && pServoStatusCharacteristic) {

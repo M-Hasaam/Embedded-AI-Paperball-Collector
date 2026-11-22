@@ -995,6 +995,7 @@ class Dashboard:
         servo_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(10, 14))
         self.servo_scales, self.speed_scales, self.servo_values = [], [], []
         self.dragging, self.last_servo_send, self.pending_servo_send = set(), {}, {}
+        self.actual_markers = []
         self.servo_commanded = set()      # servos that have been sent a command (an idle one must not be woken by a speed change)
         self.last_angles = self._load_servo_memory()
         self.memory_save_job = None
@@ -1010,6 +1011,9 @@ class Dashboard:
             tk.Label(top, textvariable=val, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold")).pack(side="right")
             scale = self._scale(col, SERVO_RANGE_DEFAULT[i][0], SERVO_RANGE_DEFAULT[i][1], SERVO_DEFAULT_ANGLES[i], lambda v, idx=i: self._slider_changed(idx, v))
             scale.pack(fill="x")
+            # red marker (only the elbow's is ever shown): the angle a limit is holding the elbow at, while one is acting
+            marker = tk.Frame(scale, bg=BAD, width=6)
+            self.actual_markers.append(marker)
             scale.bind("<ButtonPress-1>", lambda e, idx=i: self.dragging.add(idx))
             scale.bind("<ButtonRelease-1>", lambda e, idx=i: self._servo_released(idx))
             self.servo_scales.append(scale)
@@ -1018,7 +1022,7 @@ class Dashboard:
             sp_var = tk.StringVar(value=f"{SERVO_SPEED}°/s")
             tk.Label(sp, text="speed", bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="left")
             tk.Label(sp, textvariable=sp_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
-            speed = self._scale(sp, 1, 600, SERVO_SPEED, lambda v, idx=i, var=sp_var: self._speed_changed(idx, v, var), thin=True)
+            speed = self._scale(sp, 1, 600, SERVO_SPEED, lambda v, idx=i, var=sp_var: self._servo_speed_changed(idx, v, var), thin=True)
             speed.pack(side="left", fill="x", expand=True, padx=6)
             self.speed_scales.append(speed)
             # adjustable range: drag either end; the angle slider above then only moves between the two ends
@@ -1029,20 +1033,25 @@ class Dashboard:
             tk.Label(rg, textvariable=rng_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
             RangeSlider(rg, SERVO_MIN_ANGLES[i], SERVO_MAX_ANGLES[i], *SERVO_RANGE_DEFAULT[i],
                         lambda lo, hi, idx=i, var=rng_var: self._range_changed(idx, lo, hi, var)).pack(side="left", fill="x", expand=True, padx=6)
+        # a limit message from the car (empty = nothing to report): shown in red under the sliders while it lasts
+        self.limit_alert = tk.StringVar(value="")
+        self.limit_alert_label = tk.Label(s, textvariable=self.limit_alert, bg=CARD, fg=BAD, font=(FONT, 10, "bold"), anchor="w")
+        self.limit_alert_label.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(6, 0))
+        self.limit_alert_label.grid_remove()
         presets = tk.Frame(s, bg=CARD)
-        presets.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(8, 0))
+        presets.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(8, 0))
         self._button(presets, "All default", self._set_default_servos).pack(side="left")
         tk.Label(presets, text="Servos stay idle after power-up until you first move a slider or press All default.",
                  bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=14)
         # servo supply voltages: a strained or stalled servo makes its supply sag; the car slows or stops the servos on it
         rail_row = tk.Frame(s, bg=CARD)
-        rail_row.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(8, 0))
+        rail_row.grid(row=3, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(8, 0))
         tk.Label(rail_row, textvariable=self.rail_text, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
         self.rail_alert_label = tk.Label(rail_row, textvariable=self.rail_alert, bg=CARD, fg=WARN, font=(FONT, 10, "bold"))
         self.rail_alert_label.pack(side="right")
         # overload guard controls: switch, and the sag (in mV) at which the car slows down / stops the servos
         guard_row = tk.Frame(s, bg=CARD)
-        guard_row.grid(row=3, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(6, 0))
+        guard_row.grid(row=4, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(6, 0))
         tk.Checkbutton(
             guard_row, text="Overload guard", variable=self.guard_on_var, command=self._send_guard, bg=CARD, fg=TEXT,
             selectcolor=CARD_HI, activebackground=CARD, activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0,
@@ -1214,17 +1223,41 @@ class Dashboard:
         self._post(lambda: self._show_encoder(lcm, rcm, lv, rv, stamp))
 
     def _on_servo_status(self, _sender, data):
+        # "numbers,...;limit message": the car sends the text of any limit that is acting (the elbow's limit depends on the shoulder)
+        numbers, _, message = bytes(data).decode("ascii", "ignore").partition(";")
+        self._post(lambda m=message.strip(): self._show_limit_message(m))
         try:
-            vals = [float(v) for v in bytes(data).decode("ascii").split(",")]
+            vals = [float(v) for v in numbers.split(",")]
         except ValueError:
             return
         if len(vals) < 6:
             return
         arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state = vals[:6]
+        if len(vals) >= 11:
+            self._post(lambda a=int(vals[10]): self._show_held_angle(a))
         arm_noise, grip_noise = (vals[6], vals[7]) if len(vals) >= 8 else (0.0, 0.0)
         arm_base, grip_base = (vals[8], vals[9]) if len(vals) >= 10 else (-1.0, -1.0)
         self._post(lambda: self._show_servo_status(arm_v, grip_v, arm_sag, grip_sag, int(arm_state), int(grip_state),
                                                    arm_noise, grip_noise, arm_base, grip_base))
+
+    def _show_held_angle(self, angle):
+        """Red, non-draggable marker on the elbow slider at the angle the car's limit is holding the elbow at (the blue handle
+        stays where you put it). The car sends -1 while no limit is acting, and then the marker is hidden."""
+        scale, marker = self.servo_scales[1], self.actual_markers[1]
+        if angle < 0:
+            marker.place_forget()
+            return
+        lo, hi = float(scale.cget("from")), float(scale.cget("to"))
+        x, _ = scale.coords(min(max(angle, lo), hi))
+        marker.place(x=x - 3, y=0, width=6, relheight=1.0)
+
+    def _show_limit_message(self, message):
+        if message:
+            self.limit_alert.set("⚠ " + message)
+            self.limit_alert_label.grid()
+        else:
+            self.limit_alert.set("")
+            self.limit_alert_label.grid_remove()
 
     def _show_servo_status(self, arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state, arm_noise=0.0, grip_noise=0.0,
                            arm_base=-1.0, grip_base=-1.0):
@@ -1318,6 +1351,9 @@ class Dashboard:
         self.enc_wheels_var.set("L -- · R --")
         self.rail_text.set("Servo supply: waiting for data")
         self.rail_alert.set("")
+        self._show_limit_message("")
+        for marker in self.actual_markers:
+            marker.place_forget()
         self.tracker.enc_last = None   # the car may have rebooted: its encoder counters start from 0 again
         self._yaw_resync = True        # the car may have rebooted: its yaw starts from 0 again
         self._draw_dial()
@@ -1601,7 +1637,7 @@ class Dashboard:
             self.root.after_cancel(pending)
         self._send_servo(index)
 
-    def _speed_changed(self, index, value, var):
+    def _servo_speed_changed(self, index, value, var):
         var.set(f"{int(float(value))}°/s")
         # the car only learns a servo's speed together with an angle command, so send the current target again with the new
         # speed: a servo that is on its way changes speed at once instead of keeping the old one until the next move
