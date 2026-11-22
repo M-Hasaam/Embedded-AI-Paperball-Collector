@@ -65,8 +65,6 @@ CM_PER_S_AT_100 = 30.0            # fallback only (no encoder data): car speed a
 ENCODER_LIVE_S = 1.0              # encoder data older than this is treated as missing
 ENCODER_MAX_JUMP_CM = 1000.0      # sanity limit only: a car reboot disconnects BLE, which already resets the baseline.
                                   # (60 cm used to drop real driving when BLE notifications were delayed for ~1 s)
-REPLAY_TURN_PCT = 70              # wheel speed for the first, fast part of a gyro-controlled turn
-REPLAY_FINE_PCT = 55              # wheel speed for the last ~30 degrees of a turn (slower = more accurate)
                                   # (if the wheels only hum, the dashboard raises these by itself - stall detection)
 BACK_SPEED_RATIO = 1.0            # reverse speed / forward speed (measure it: a 10% gap = ~5% error on the way home)
 TEST_DRIVE_S = 3.0                # length of the calibration drive
@@ -392,39 +390,47 @@ class PathRunner:
     """Drives a list of steps on its own, re-aiming before every leg.
 
     Steps: ["goto", x, y]          turn towards the point (gyro), then drive forward until the estimate reaches it
-           ["turn_to", heading]    closed-loop in-place turn on the gyro
+           ["turn_to", heading]    in-place turn: the car turns itself by the angle (Y command, closed loop on its gyro)
            ["move", cm, tx, ty]    (made from a goto) forward drive; tx/ty let it stop when the estimate arrives
     tick(now, gz) must be called every ~30 ms; send(cmd) sends a drive command to the car.
     """
     TURN_TOL_DEG = 2.0
-    LATENCY_S = 0.20            # BLE + motor lag: release the turn this early (scaled by the turning speed)
     SETTLE_S = 0.45             # wait for the car to stop before judging a turn
-    FINE_ZONE_DEG = 30.0        # inside this error the turn slows down to REPLAY_FINE_PCT
-    MAX_CORRECTIONS = 3
+    MAX_CORRECTIONS = 2         # the car already turns to within about 1.5 degrees; this only catches a missed turn
     TURN_TIMEOUT_S = 15.0
     GOTO_TOL_CM = 3.0
-    STALL_RATE_DPS = 4.0        # turning slower than this while a turn command is active = the wheels are stalled
-    STALL_S = 0.6               # ... for this long (longer than the Bluetooth + motor lag)
-    STALL_STEP_PCT = 10         # raise the turn speed by this much each time
+    TURN_MOVING_DPS = 10.0      # the car counts as turning faster than this ...
+    TURN_QUIET_S = 0.35         # ... and as done once it has been slower than that for this long
 
-    def __init__(self, tracker, send, get_speed, get_dist, on_finish=None, get_turn_speed=None):
+    def __init__(self, tracker, send, get_speed, get_dist, on_finish=None):
         self.tracker, self.send = tracker, send
         self.get_speed, self.get_dist = get_speed, get_dist
-        self.get_turn_speed = get_turn_speed or get_speed     # the turn slider (turns use their own speed)
         self.on_finish = on_finish
         self.active = False
         self.status = "Idle"
         self.label = ""
         self.steps, self.idx, self.state = [], 0, "idle"
         self.legs_done = self.legs_total = 0
-        self._speed_changed = False
         self.last_turn_error = None
-        self.floor_pct = 0              # lowest turn speed at which the wheels were seen to actually turn
-        self.cur_pct = REPLAY_TURN_PCT
-        self.cmd_since = 0.0
+        self.turn_started, self.turn_moved, self.quiet_since = 0.0, False, None
+        self.log_file = Path(__file__).with_name("path_runner_log.txt")   # one line per step, to see where a return goes wrong
+        self.move_from = None
 
-    def _turn_pct(self, fine):
-        return max(REPLAY_FINE_PCT if fine else REPLAY_TURN_PCT, self.floor_pct)
+    def _log(self, now, text):
+        tr = self.tracker
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(f"{now:9.2f}  pos=({tr.x:7.1f},{tr.y:7.1f}) heading={tr.heading_now(now):7.1f}  {text}\n")
+        except OSError:
+            pass
+
+    def _begin_turn(self, now, target):
+        """Ask the car to turn by the remaining angle on its own (it runs the loop on its gyro, no Bluetooth delay)."""
+        err = wrap180(target - self.tracker.heading_now(now))
+        self._log(now, f"TURN start: to {target:.1f}, error {err:.1f} (the car turns by itself: Y{err:.1f})")
+        self.send(f"Y{err:.1f}")
+        self.turn_started, self.turn_moved, self.quiet_since = now, False, None
+        self.state = "fwturn"
 
     def start(self, steps, label, now):
         if not steps:
@@ -436,14 +442,16 @@ class PathRunner:
         self.last_turn_error = None
         self.active = True
         self.status = f"{label}: starting"
+        self._log(now, f"START {label}: " + ", ".join(
+            "goto(%.0f,%.0f)" % (s[1], s[2]) if s[0] == "goto" else "%s(%.0f)" % (s[0], s[1]) for s in steps))
         return True
 
     def abort(self, reason):
         if not self.active:
             return
+        self._log(time.monotonic(), f"ABORT: {reason}")
         self.active, self.state = False, "idle"
         self.send("S")
-        self._restore_speed()
         self.status = f"{self.label} stopped: {reason}"
         if self.on_finish:
             self.on_finish(False)
@@ -451,20 +459,10 @@ class PathRunner:
     def _finish(self):
         self.active, self.state = False, "idle"
         self.send("S")
-        self._restore_speed()
         extra = f" (turn error {self.last_turn_error:+.1f}°)" if self.last_turn_error is not None else ""
         self.status = f"{self.label}: done{extra}"
         if self.on_finish:
             self.on_finish(True)
-
-    def _set_speed(self, pct):
-        self.send(f"Q{pct}")                       # automated turns set the turn speed
-        self._speed_changed = pct != self.get_turn_speed()
-
-    def _restore_speed(self):
-        if self._speed_changed:
-            self._speed_changed = False
-            self.send(f"Q{self.get_turn_speed()}")   # back to what the turn slider says
 
     def tick(self, now, gz):
         if not self.active:
@@ -483,6 +481,7 @@ class PathRunner:
                     self.idx += 1
                     return
                 bearing = math.degrees(math.atan2(-dx, dy))      # 0 = up, + = left
+                self._log(now, f"AIM at corner ({step[1]:.1f},{step[2]:.1f}): distance {dist:.1f} cm, bearing {bearing:.1f}")
                 self.steps[self.idx:self.idx + 1] = [["turn_to", bearing], ["move", dist, step[1], step[2]]]
                 self.status = f"{self.label}: leg {self.legs_done}/{self.legs_total}"
                 return
@@ -491,7 +490,8 @@ class PathRunner:
                 if v <= 0:
                     self.abort("speed is 0")
                     return
-                self._restore_speed()
+                self.move_from = (tr.x, tr.y)
+                self._log(now, f"MOVE start: {step[1]:.1f} cm, time limit {abs(step[1]) / v * (1.0 if len(step) < 4 else 1.6):.1f} s")
                 self.send("U" if step[1] > 0 else "D")
                 self.until = now + abs(step[1]) / v * (1.0 if len(step) < 4 else 1.6)
                 self.state = "moving"
@@ -501,11 +501,8 @@ class PathRunner:
                     self.last_turn_error = err
                     self.idx += 1
                     return
-                self.cur_pct = self._turn_pct(False)
-                self._set_speed(self.cur_pct)
-                self.corrections, self.turn_started, self.fine = 0, now, False
-                self.cmd_since = now
-                self.state = "turning"
+                self.corrections = 0
+                self._begin_turn(now, step[1])
         elif self.state == "moving":
             step = self.steps[self.idx]
             if tr.cmd == "U":
@@ -519,33 +516,23 @@ class PathRunner:
                 if (step[2] - tr.x) * -math.sin(h) + (step[3] - tr.y) * math.cos(h) <= 0.5:
                     arrived = True
             if arrived:
+                why = "time limit" if now >= self.until else "reached the point"
+                went = math.hypot(tr.x - self.move_from[0], tr.y - self.move_from[1]) if self.move_from else 0.0
+                self._log(now, f"MOVE end ({why}): travelled {went:.1f} cm of {abs(step[1]):.1f}")
                 self.send("S")
                 self.state, self.settle_until, self.after_settle = "settle", now + self.SETTLE_S, "advance"
-        elif self.state == "turning":
+        elif self.state == "fwturn":                   # the car is turning itself: wait until it has stopped
             if now - self.turn_started > self.TURN_TIMEOUT_S:
                 self.abort("turn timed out")
                 return
-            err = wrap180(self.steps[self.idx][1] - tr.heading_now(now))
-            if abs(err) < self.FINE_ZONE_DEG and not self.fine:
-                self.fine = True
-                self.cur_pct = self._turn_pct(True)
-                self._set_speed(self.cur_pct)          # slow down for the last part: less overshoot
-                self.cmd_since = now
-            if abs(err) <= max(tol, abs(gz) * self.LATENCY_S):
-                self.send("S")
-                self.state, self.settle_until, self.after_settle = "settle", now + self.SETTLE_S, "check"
-            else:
-                want = "L" if err > 0 else "R"
-                if tr.cmd != want:
-                    self.send(want)
-                    self.cmd_since = now
-                elif abs(gz) < self.STALL_RATE_DPS and now - self.cmd_since > self.STALL_S and self.cur_pct < 100:
-                    # Commanded to turn but not turning: the wheels only hum. Give them more power, and remember it.
-                    self.cur_pct = min(100, self.cur_pct + self.STALL_STEP_PCT)
-                    self.floor_pct = self.cur_pct
-                    self._set_speed(self.cur_pct)
-                    self.cmd_since = now
-                    self.status = f"{self.label}: wheels stalled, turn speed raised to {self.cur_pct}%"
+            if abs(gz) > self.TURN_MOVING_DPS:
+                self.turn_moved, self.quiet_since = True, None
+            elif now - self.turn_started >= 0.4 and (self.turn_moved or now - self.turn_started >= 1.5):
+                if self.quiet_since is None:
+                    self.quiet_since = now
+                elif now - self.quiet_since >= self.TURN_QUIET_S:
+                    self._log(now, "TURN car stopped")
+                    self.state, self.settle_until, self.after_settle = "settle", now + self.SETTLE_S, "check"
         elif self.state == "settle":
             if now < self.settle_until:
                 return
@@ -553,8 +540,10 @@ class PathRunner:
                 err = wrap180(self.steps[self.idx][1] - tr.heading_now(now))
                 if abs(err) > tol * 1.5 and self.corrections < self.MAX_CORRECTIONS:
                     self.corrections += 1
-                    self.state = "turning"
+                    self._log(now, f"TURN check: error {err:.1f} -> correction {self.corrections}")
+                    self._begin_turn(now, self.steps[self.idx][1])
                     return
+                self._log(now, f"TURN done: error {err:.1f}" + ("  (ACCEPTED after the corrections ran out)" if abs(err) > tol * 1.5 else ""))
                 self.last_turn_error = err
             self.idx += 1
             self.state = "next"
@@ -819,8 +808,7 @@ class Dashboard:
         # Path map: dead reckoning from the gyro heading + wheel-encoder distance
         self.tracker = PathTracker()
         self.runner = PathRunner(self.tracker, self._runner_send, lambda: int(self.car_speed.get()),
-                                 lambda: self.dist_cm, self._runner_finished,
-                                 get_turn_speed=lambda: int(self.car_turn.get()))
+                                 lambda: self.dist_cm, self._runner_finished)
         self.path_window = None
         self.dist_cm = None            # latest distance reading, None = nothing in range
         self.gz = 0.0                  # latest turning speed (deg/s)

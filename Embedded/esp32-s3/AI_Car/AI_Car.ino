@@ -161,6 +161,8 @@ const int MOTOR_PWM_BITS = 8;
 const uint32_t MOTOR_PWM_MAX = (1UL << MOTOR_PWM_BITS) - 1;
 int motorSpeedPct = 100;    // wheel speed for driving straight (U, D), percent
 int turnSpeedPct = 70;      // wheel speed for turning on the spot (L, R), percent
+int turnPctNow = -1;        // power override while a closed-loop turn (Y command) is running, -1 = use turnSpeedPct
+bool turnActive = false;    // a closed-loop turn on the gyro is running (see updateTurn)
 int motorState[4] = {0, 0, 0, 0};  // last requested direction (1 = on) for LU, LD, RU, RD
 
 // Straight-drive assist (see updateStraightAssist): power scale of each side, 1.0 = full. The faster side is
@@ -340,7 +342,8 @@ void motors(int lu, int ld, int ru, int rd) {
   if (ru || rd) encoderRightDir = ru ? 1 : -1;
 
   bool turning = (lu && rd) || (ld && ru);   // the two sides run in opposite directions: turning on the spot
-  uint32_t duty = MOTOR_PWM_MAX * (turning ? turnSpeedPct : motorSpeedPct) / 100;
+  int pct = turning ? (turnPctNow >= 0 ? turnPctNow : turnSpeedPct) : motorSpeedPct;
+  uint32_t duty = MOTOR_PWM_MAX * pct / 100;
   for (int i = 0; i < 4; i++) {
     float scale = (i < 2) ? leftScale : rightScale;  // MOTOR_PINS = {LU, LD, RU, RD}: 0,1 = left side, 2,3 = right
     ledcWrite(MOTOR_PINS[i], motorState[i] ? (uint32_t)(duty * scale) : 0);
@@ -357,6 +360,10 @@ void handleCommand(String message) {
     Serial.print("Motor command: ");
     Serial.println(command);
 
+    if (command == 'U' || command == 'D' || command == 'L' || command == 'R' || command == 'S') {
+      turnActive = false;   // any drive command takes over from a closed-loop turn
+      turnPctNow = -1;
+    }
     switch (command) {
       case 'U': motors(1, 0, 1, 0); break;
       case 'D': motors(0, 1, 0, 1); break;
@@ -399,6 +406,18 @@ void handleCommand(String message) {
       Serial.printf("Servo guard thresholds: slow at %d mV, stop at %d mV\n", slow, stop);
     } else {
       Serial.println("Invalid threshold command. Use: T250 500");
+    }
+    return;
+  }
+
+  // Closed-loop turn: Y<degrees> turns on the spot by that angle (+ = left, - = right) using the gyro at 50 Hz, right on the
+  // car, so there is no Bluetooth delay in the loop. Y0 cancels. It slows down towards the target and stops by itself.
+  if (message.charAt(0) == 'Y') {
+    float delta = 0;
+    if (sscanf(message.c_str(), "Y%f", &delta) == 1 && delta > -361.0f && delta < 361.0f) {
+      startTurn(delta);
+    } else {
+      Serial.println("Invalid turn. Use: Y90 or Y-45");
     }
     return;
   }
@@ -551,6 +570,7 @@ float readDistanceCm() {
 void updateDistance() {
   unsigned long now = millis();
   if (now - lastDistanceRead < DISTANCE_INTERVAL_MS) return;
+  if (turnActive) return;            // the sensor read can block for up to 25 ms: keep the turn loop fast
   lastDistanceRead = now;
 
   float raw = readDistanceCm();
@@ -729,6 +749,7 @@ void updateMpu() {
       lastMpuMicros = us;
       if (dt <= 0 || dt > 0.5f) dt = MPU_READ_INTERVAL_MS / 1000.0f;
 
+
       float accRoll = atan2f(mpuAy, mpuAz) * 180.0f / M_PI;
       float accPitch = atan2f(-mpuAx, sqrtf(mpuAy * mpuAy + mpuAz * mpuAz)) * 180.0f / M_PI;
       if (fabsf(mpuGz) > MPU_YAW_DEADBAND_DPS) {
@@ -740,6 +761,101 @@ void updateMpu() {
       mpuPitch = MPU_FILTER_ALPHA * (mpuPitch + mpuGy * dt) + (1 - MPU_FILTER_ALPHA) * accPitch;
     }
   }
+}
+
+// ---- Closed-loop turn on the gyro ------------------------------------------------------------------------------
+// Turning from the dashboard over Bluetooth overshot by 8-10 degrees on every correction (the car keeps turning for about
+// a quarter of a second after the stop command arrives, so each correction pulse was bigger than the error). Here the loop
+// runs on the car itself: full turn speed far away, slower and slower close to the target, power off when the predicted
+// stopping point (heading + rate * TURN_COAST_S) is inside the tolerance, and short pulses to finish.
+const float TURN_TOL_DEG = 1.5f;          // done when the heading is this close and the car has stopped
+const float TURN_GIVE_UP_DEG = 4.0f;      // after two changes of direction it stops hunting and accepts this much
+const float TURN_SETTLE_DPS = 12.0f;      // ... and is turning slower than this
+const float TURN_COAST_S = 0.06f;         // how long the car still turns after the motors are switched off
+const float TURN_RAMP_DEG = 40.0f;        // slow down over the last this many degrees
+const unsigned long TURN_TIMEOUT_MS = 12000;
+int turnFloorPct = 45;                    // lowest power that really turns the car; raised if the wheels only hum, then kept
+float turnTarget = 0;                     // yaw to reach (the gyro's own frame)
+unsigned long turnStartMs = 0, turnSettledSince = 0, turnPushSince = 0, turnLastSample = 0;
+int turnLastDir = 0, turnReversals = 0;      // direction last driven (+1 left, -1 right) and how often it changed
+
+float wrapDeg(float a) {
+  while (a > 180.0f) a -= 360.0f;
+  while (a < -180.0f) a += 360.0f;
+  return a;
+}
+
+void startTurn(float delta) {
+  if (delta == 0 || !mpuOk) {
+    if (turnActive) { motors(0, 0, 0, 0); }
+    turnActive = false;
+    turnPctNow = -1;
+    if (!mpuOk && delta != 0) Serial.println("Turn needs the MPU (not found)");
+    return;
+  }
+  turnTarget = wrapDeg(mpuYaw + delta);
+  turnActive = true;
+  turnStartMs = millis();
+  turnSettledSince = 0;
+  turnPushSince = 0;
+  turnLastSample = 0;
+  turnLastDir = 0;
+  turnReversals = 0;
+  Serial.printf("Turn by %.1f deg (target %.1f)\n", delta, turnTarget);
+}
+
+void stopTurn(const char* why, float err) {
+  motors(0, 0, 0, 0);
+  turnActive = false;
+  turnPctNow = -1;
+  Serial.printf("Turn %s: error %.1f deg\n", why, err);
+}
+
+void updateTurn() {
+  if (!turnActive) return;
+  unsigned long now = millis();
+  if (lastMpuRead == turnLastSample) return;    // act once per new gyro sample
+  turnLastSample = lastMpuRead;
+
+  float err = wrapDeg(turnTarget - mpuYaw);     // + = still to turn left
+  float rate = mpuGz;                           // deg/s, + = turning left
+  float tolerance = turnReversals >= 2 ? TURN_GIVE_UP_DEG : TURN_TOL_DEG;   // no endless swinging: after two reversals it is good enough
+  if (fabsf(err) <= tolerance && fabsf(rate) < TURN_SETTLE_DPS) {
+    motors(0, 0, 0, 0);
+    if (turnSettledSince == 0) turnSettledSince = now;
+    if (now - turnSettledSince >= 100) stopTurn("done", err);
+    return;
+  }
+  turnSettledSince = 0;
+  if (now - turnStartMs > TURN_TIMEOUT_MS) { stopTurn("timed out", err); return; }
+
+  float predicted = err - rate * TURN_COAST_S;  // where the car would stop if the motors went off now
+  if (fabsf(predicted) <= TURN_TOL_DEG) {       // close enough: coast in
+    motors(0, 0, 0, 0);
+    turnPushSince = 0;
+    return;
+  }
+  float a = fabsf(err);
+  int pct = a >= TURN_RAMP_DEG ? turnSpeedPct : turnFloorPct + (int)((turnSpeedPct - turnFloorPct) * a / TURN_RAMP_DEG);
+  if (pct < turnFloorPct) pct = turnFloorPct;
+  if (pct > 100) pct = 100;
+  // wheels only humming (not turning) for a while: more power, and remember it
+  if (fabsf(rate) < 4.0f) {
+    if (turnPushSince == 0) turnPushSince = now;
+    if (now - turnPushSince > 300 && turnFloorPct < 100) {
+      turnFloorPct += 10;
+      turnPushSince = now;
+      Serial.printf("Turn: wheels only hum, minimum power raised to %d%%\n", turnFloorPct);
+    }
+  } else {
+    turnPushSince = 0;
+  }
+  int dir = predicted > 0 ? 1 : -1;
+  if (turnLastDir != 0 && dir != turnLastDir) turnReversals++;
+  turnLastDir = dir;
+  turnPctNow = pct;
+  if (predicted > 0) motors(0, 1, 1, 0);        // left, like the L command
+  else motors(1, 0, 0, 1);                      // right, like the R command
 }
 
 // Sends "yaw,pitch,roll,gx,gy,gz,ax,ay,az" (deg x3, deg/s x3, g x3) over BLE.
@@ -1012,6 +1128,8 @@ class ServerCallbacks: public BLEServerCallbacks {
 
   void onDisconnect(BLEServer* server) override {
     deviceConnected = false;
+    turnActive = false;
+    turnPctNow = -1;
     motors(0, 0, 0, 0);
     Serial.println("BLE Client Disconnected");
     BLEDevice::startAdvertising();
@@ -1194,6 +1312,7 @@ void loop() {
   updateDistance();
   updateBuzzer();
   updateMpu();
+  updateTurn();
   notifyMpu();
   updateEncoders();
   updateStraightAssist();
