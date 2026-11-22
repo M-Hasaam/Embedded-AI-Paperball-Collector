@@ -938,7 +938,9 @@ void updateStraightAssist() {
     float yawErr = mpuYaw - straightStartYaw;       // + = turned left (counter-clockwise), so the right side is ahead
     while (yawErr > 180.0f) yawErr -= 360.0f;
     while (yawErr < -180.0f) yawErr += 360.0f;
-    eGyro = -yawErr / STRAIGHT_DEG_PER_TICK;
+    // Forward: turned left = the right side is ahead. Backward it is the other way round (turned left = the LEFT side is
+    // ahead), so the sign flips with the driving direction; without this the correction made a reverse drive veer more.
+    eGyro = -yawErr / STRAIGHT_DEG_PER_TICK * straightDir;
     haveGyro = true;
   }
   if (wantEnc) {
