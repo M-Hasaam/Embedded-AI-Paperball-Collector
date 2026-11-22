@@ -308,6 +308,7 @@ class PathTracker:
         self.phase = "out"             # "out" while exploring, "back" while returning
         self.cmd = "S"
         self._moving, self._val = False, 0.0
+        self._corner_pending, self._stop_since = False, None   # a straight drive ended; its corner is recorded once the car has stopped
 
     def feed_yaw(self, wrapped, resync=False, gz=0.0, now=None):
         """New gyro heading from the car (wrapped to -180..180). resync = the car's yaw was zeroed or it rebooted."""
@@ -325,16 +326,28 @@ class PathTracker:
         """Call whenever a drive command (U D L R S) is sent to the car."""
         if cmd == self.cmd:
             return
+        if cmd != "S":
+            self.settle_corner()        # a new move starts: whatever was pending ended where the car is now
         self._close_segment()
         self.cmd = cmd
         self._moving, self._val = cmd in ("U", "D"), 0.0
 
     def _close_segment(self):
+        # The stop command is sent before the car has actually stopped: it coasts on for 10-15 cm. Recording the corner
+        # right now put every corner that far short of where the drive really ended (and the return then aimed at points
+        # up to 15 cm off, giving diagonal legs). So it is only marked as pending here; settle_corner() records it.
         if self.recording and self._moving and abs(self._val) >= self.MIN_MOVE_CM:
-            lx, ly = self.corners[-1]
-            if math.hypot(self.x - lx, self.y - ly) >= self.CORNER_MERGE_CM:
-                self.corners.append((self.x, self.y))
+            self._corner_pending, self._stop_since = True, None
         self._moving = False
+
+    def settle_corner(self):
+        """Record where the last straight drive really ended (after the car has stopped rolling)."""
+        if not self._corner_pending:
+            return
+        self._corner_pending, self._stop_since = False, None
+        lx, ly = self.corners[-1]
+        if math.hypot(self.x - lx, self.y - ly) >= self.CORNER_MERGE_CM:
+            self.corners.append((self.x, self.y))
 
     def encoders_live(self, now=None):
         now = time.monotonic() if now is None else now
@@ -348,6 +361,14 @@ class PathTracker:
         if last is None or abs(avg_cm - last) > ENCODER_MAX_JUMP_CM:
             return                     # first reading, or the car rebooted / counters were reset: new baseline
         self._advance(avg_cm - last, now)
+        if self._corner_pending:       # the car has stopped once the wheels stay still for a moment
+            if abs(avg_cm - last) < 0.15:
+                if self._stop_since is None:
+                    self._stop_since = now
+                elif now - self._stop_since >= 0.35:
+                    self.settle_corner()
+            else:
+                self._stop_since = None
 
     def update(self, dt, speed_pct, now=None):
         """Advance the position estimate by dt seconds of whatever the car is currently doing.
@@ -373,8 +394,26 @@ class PathTracker:
                 del self.points[: self.MAX_POINTS // 10]
 
 
+def straighten(corners, min_turn_deg=12.0):
+    """Drop recorded corners where the route hardly changes direction (the drive was only interrupted there), so the
+    return drives straight through instead of stopping and turning by a few degrees."""
+    pts = list(corners)
+    if len(pts) < 3:
+        return pts
+    out = [pts[0]]
+    for i in range(1, len(pts) - 1):
+        a, b, c = out[-1], pts[i], pts[i + 1]
+        h1 = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+        h2 = math.degrees(math.atan2(c[1] - b[1], c[0] - b[0]))
+        if abs(wrap180(h2 - h1)) >= min_turn_deg:
+            out.append(b)
+    out.append(pts[-1])
+    return out
+
+
 def return_steps(corners):
     """Drive back through the recorded corners, newest first, always forward; then face the way we started."""
+    corners = straighten(corners)
     steps = [["goto", x, y] for x, y in reversed(corners[:-1])]
     if steps:
         steps.append(["turn_to", 0.0])
@@ -413,6 +452,8 @@ class PathRunner:
         self.legs_done = self.legs_total = 0
         self.last_turn_error = None
         self.turn_started, self.turn_moved, self.quiet_since = 0.0, False, None
+        self.coast_cm = 10.0            # how far the car rolls on after a stop command; learned from every leg (it was 10-15 cm)
+        self.stop_at = None             # where the stop command for the leg was sent
         self.log_file = Path(__file__).with_name("path_runner_log.txt")   # one line per step, to see where a return goes wrong
         self.move_from = None
 
@@ -511,14 +552,15 @@ class PathRunner:
                     self.abort("obstacle ahead")
                     return
             arrived = now >= self.until
-            if len(step) >= 4 and step[1] > 0:         # stop when the estimate reaches the target point
+            if len(step) >= 4 and step[1] > 0:         # stop when the car will roll to the target point (stop early by the coast)
                 h = math.radians(tr.heading_now(now))
-                if (step[2] - tr.x) * -math.sin(h) + (step[3] - tr.y) * math.cos(h) <= 0.5:
+                if (step[2] - tr.x) * -math.sin(h) + (step[3] - tr.y) * math.cos(h) <= max(0.5, self.coast_cm):
                     arrived = True
             if arrived:
                 why = "time limit" if now >= self.until else "reached the point"
                 went = math.hypot(tr.x - self.move_from[0], tr.y - self.move_from[1]) if self.move_from else 0.0
                 self._log(now, f"MOVE end ({why}): travelled {went:.1f} cm of {abs(step[1]):.1f}")
+                self.stop_at = (tr.x, tr.y)
                 self.send("S")
                 self.state, self.settle_until, self.after_settle = "settle", now + self.SETTLE_S, "advance"
         elif self.state == "fwturn":                   # the car is turning itself: wait until it has stopped
@@ -545,6 +587,17 @@ class PathRunner:
                     return
                 self._log(now, f"TURN done: error {err:.1f}" + ("  (ACCEPTED after the corrections ran out)" if abs(err) > tol * 1.5 else ""))
                 self.last_turn_error = err
+            elif self.stop_at is not None:             # a drive just stopped: how far did it roll on? (smoothed)
+                rolled = math.hypot(tr.x - self.stop_at[0], tr.y - self.stop_at[1])
+                self.coast_cm = min(25.0, max(0.0, 0.5 * self.coast_cm + 0.5 * rolled))
+                self._log(now, f"STOPPED: rolled on {rolled:.1f} cm, coast estimate now {self.coast_cm:.1f} cm")
+                self.stop_at = None
+                done = self.steps[self.idx]
+                if self.label == "Return" and done[0] == "move" and len(done) >= 4 and len(tr.corners) >= 2:
+                    # The car has reached this corner of the way back: it is no longer part of the route still to undo. If the
+                    # return is stopped (an obstacle, the stop button) and started again, it carries on from here instead of
+                    # driving back to corners it has already passed.
+                    tr.corners.pop()
             self.idx += 1
             self.state = "next"
 
@@ -703,7 +756,7 @@ class PathWindow:
         c.create_polygon(*tip, *bl, *br, fill=WARN if self.app.runner.active else "#f0f6fc", outline="")
 
         self.pos_var.set(f"Position  x {tr.x:+.0f} cm   y {tr.y:+.0f} cm      Heading {wrap180(tr.heading):+.0f}°\n"
-                         f"Driven {tr.total_cm:.0f} cm in total      Corners recorded: {len(tr.corners) - 1}")
+                         f"Driven {tr.total_cm:.0f} cm in total      Corners recorded: {len(straighten(tr.corners)) - 1}")
         self.status_var.set(self.app.runner.status)
 
 
@@ -1531,6 +1584,7 @@ class Dashboard:
         if not self._path_ready() or self.runner.active:
             return
         self._send("S")
+        self.tracker.settle_corner()
         steps = return_steps(self.tracker.corners)
         if not steps:
             self.runner.status = "Nothing recorded to return along"
