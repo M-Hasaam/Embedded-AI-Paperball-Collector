@@ -111,21 +111,42 @@ const char* SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233";
 volatile long encoderLeftTicks = 0, encoderRightTicks = 0;     // signed: + forward, - reverse
 volatile int encoderLeftDir = 1, encoderRightDir = 1;          // direction of the last motor command
 volatile unsigned long encoderLeftLastUs = 0, encoderRightLastUs = 0;
+// Diagnostics (serial only): pulses thrown away by the debounce, and the shortest / longest gap between counted pulses.
+// Many rejected pulses on one wheel while driving = electrical noise on that wire. No rejects but a short count = the
+// sensor misses slots (a long gap of about twice the normal one marks a missed slot).
+volatile unsigned long encoderLeftRejected = 0, encoderRightRejected = 0;
+volatile unsigned long encoderLeftMinGapUs = 0xFFFFFFFF, encoderRightMinGapUs = 0xFFFFFFFF;
+volatile unsigned long encoderLeftMaxGapUs = 0, encoderRightMaxGapUs = 0;
+// Pulse stream (serial only): the exact time (micros) of every counted pulse on each wheel. The interrupt writes them into
+// a circular buffer and updatePulseLog sends the new ones every 200 ms; the dashboard's "Pulse chart" draws them live.
+const int PULSE_LOG_SIZE = 256;                    // far more than the ~20 pulses per wheel that arrive in 200 ms
+uint32_t pulseTimeL[PULSE_LOG_SIZE], pulseTimeR[PULSE_LOG_SIZE];
+volatile uint32_t pulseWriteL = 0, pulseWriteR = 0;   // pulses recorded so far; pulse n is stored at n % PULSE_LOG_SIZE
 unsigned long lastEncoderNotify = 0;
 long lastEncoderLeftTicks = 0, lastEncoderRightTicks = 0;
 
 // A single-channel encoder cannot sense direction, so the sign comes from the motor command.
 void IRAM_ATTR encoderLeftIsr() {
   unsigned long now = micros();
-  if (now - encoderLeftLastUs < ENCODER_DEBOUNCE_US) return;
+  unsigned long gap = now - encoderLeftLastUs;
+  if (gap < ENCODER_DEBOUNCE_US) { encoderLeftRejected++; return; }
   encoderLeftLastUs = now;
+  if (gap < encoderLeftMinGapUs) encoderLeftMinGapUs = gap;
+  if (gap < 200000UL && gap > encoderLeftMaxGapUs) encoderLeftMaxGapUs = gap;   // ignore the gap after standing still
+  pulseTimeL[pulseWriteL % PULSE_LOG_SIZE] = now;
+  pulseWriteL++;
   encoderLeftTicks += encoderLeftDir;
 }
 
 void IRAM_ATTR encoderRightIsr() {
   unsigned long now = micros();
-  if (now - encoderRightLastUs < ENCODER_DEBOUNCE_US) return;
+  unsigned long gap = now - encoderRightLastUs;
+  if (gap < ENCODER_DEBOUNCE_US) { encoderRightRejected++; return; }
   encoderRightLastUs = now;
+  if (gap < encoderRightMinGapUs) encoderRightMinGapUs = gap;
+  if (gap < 200000UL && gap > encoderRightMaxGapUs) encoderRightMaxGapUs = gap;
+  pulseTimeR[pulseWriteR % PULSE_LOG_SIZE] = now;
+  pulseWriteR++;
   encoderRightTicks += encoderRightDir;
 }
 
@@ -383,6 +404,9 @@ void handleCommand(String message) {
         noInterrupts();
         encoderLeftTicks = 0;
         encoderRightTicks = 0;
+        encoderLeftRejected = encoderRightRejected = 0;
+        encoderLeftMinGapUs = encoderRightMinGapUs = 0xFFFFFFFF;
+        encoderLeftMaxGapUs = encoderRightMaxGapUs = 0;
         interrupts();
         lastEncoderLeftTicks = 0;
         lastEncoderRightTicks = 0;
@@ -898,6 +922,70 @@ void notifyMpu() {
   }
 }
 
+// Live pulse stream: every 200 ms, whatever is new is printed on the serial port (nothing is sent while nothing happens).
+// All times are micros() of the car.
+//   PBL,<t0>,<d1>,<d2>,...   left-wheel pulses: the time of the first one, then the gap in microseconds to each next one
+//   PBR,...                  the same for the right wheel
+//   PM,<t>,<left %>,<right %>   how much power each side was given (the straight assist lowers one side), 10 per second
+//   PX,<left>,<right>        pulses the debounce threw away so far (only sent when it changed; noise on that wire)
+// The dashboard's "Pulse chart" window reads this and draws it while the car moves.
+const unsigned long PULSE_SEND_INTERVAL_MS = 200;
+const unsigned long MOTOR_SAMPLE_INTERVAL_MS = 100;
+const int MOTOR_SAMPLE_MAX = 8;
+uint32_t pulseSentL = 0, pulseSentR = 0;
+uint32_t motorSampleTime[MOTOR_SAMPLE_MAX];
+uint8_t motorSampleScaleL[MOTOR_SAMPLE_MAX], motorSampleScaleR[MOTOR_SAMPLE_MAX];
+int motorSampleCount = 0;
+
+// Appends "<tag>,<first time>,<gap>,<gap>..." for the pulses not sent yet; returns the new length of buf.
+int appendPulses(char* buf, int n, int cap, const char* tag, const uint32_t* times, uint32_t& sent, uint32_t written) {
+  if (written - sent > (uint32_t)PULSE_LOG_SIZE) sent = written - PULSE_LOG_SIZE;   // the loop stalled: the oldest were overwritten
+  if (written == sent) return n;
+  uint32_t prev = times[sent % PULSE_LOG_SIZE];
+  n += snprintf(buf + n, cap - n, "%s,%lu", tag, (unsigned long)prev);
+  for (sent++; sent != written && n < cap - 20; sent++) {          // whatever does not fit goes out with the next batch
+    uint32_t t = times[sent % PULSE_LOG_SIZE];
+    n += snprintf(buf + n, cap - n, ",%lu", (unsigned long)(t - prev));
+    prev = t;
+  }
+  n += snprintf(buf + n, cap - n, "\n");
+  return n;
+}
+
+void updatePulseLog() {
+  static unsigned long lastSend = 0, lastSample = 0;
+  static unsigned long sentRejL = 0, sentRejR = 0;
+  unsigned long nowMs = millis();
+  bool anyMotor = motorState[0] || motorState[1] || motorState[2] || motorState[3];
+  if (anyMotor && nowMs - lastSample >= MOTOR_SAMPLE_INTERVAL_MS && motorSampleCount < MOTOR_SAMPLE_MAX) {
+    lastSample = nowMs;
+    int i = motorSampleCount++;
+    motorSampleTime[i] = micros();
+    motorSampleScaleL[i] = (uint8_t)(leftScale * 100.0f + 0.5f);
+    motorSampleScaleR[i] = (uint8_t)(rightScale * 100.0f + 0.5f);
+  }
+  if (nowMs - lastSend < PULSE_SEND_INTERVAL_MS) return;
+  lastSend = nowMs;
+
+  static char buf[1200];
+  int n = 0;
+  noInterrupts();
+  uint32_t writtenL = pulseWriteL, writtenR = pulseWriteR;
+  unsigned long rejL = encoderLeftRejected, rejR = encoderRightRejected;
+  interrupts();
+  n = appendPulses(buf, n, sizeof(buf), "PBL", pulseTimeL, pulseSentL, writtenL);
+  n = appendPulses(buf, n, sizeof(buf), "PBR", pulseTimeR, pulseSentR, writtenR);
+  for (int i = 0; i < motorSampleCount && n < (int)sizeof(buf) - 40; i++)
+    n += snprintf(buf + n, sizeof(buf) - n, "PM,%lu,%d,%d\n", (unsigned long)motorSampleTime[i], (int)motorSampleScaleL[i], (int)motorSampleScaleR[i]);
+  motorSampleCount = 0;
+  if (rejL != sentRejL || rejR != sentRejR) {
+    sentRejL = rejL;
+    sentRejR = rejR;
+    n += snprintf(buf + n, sizeof(buf) - n, "PX,%lu,%lu\n", rejL, rejR);
+  }
+  if (n > 0) Serial.write((const uint8_t*)buf, n);
+}
+
 // Sends "leftTicks,rightTicks,leftCm,rightCm,leftCmPerS,rightCmPerS" over BLE (+ = forward).
 void updateEncoders() {
   unsigned long now = millis();
@@ -1334,6 +1422,7 @@ void loop() {
   updateTurn();
   notifyMpu();
   updateEncoders();
+  updatePulseLog();
   updateStraightAssist();
   updateServoGuard();
   notifyServoStatus();

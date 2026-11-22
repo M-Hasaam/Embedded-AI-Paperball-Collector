@@ -14,6 +14,7 @@ import json
 import math
 import queue
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -760,6 +761,443 @@ class PathWindow:
         self.status_var.set(self.app.runner.status)
 
 
+# ---------------------------------------------------------------- encoder pulse chart (diagnostic)
+try:
+    import serial as pyserial          # only the pulse chart needs it (it reads the car's USB cable)
+except ImportError:
+    pyserial = None
+
+PULSE_PORT = "COM14"
+PULSE_MIN_RUN = 20                     # a run with fewer pulses than this on both wheels is thrown away (a wheel nudged by hand)
+PULSE_RUN_GAP_S = 1.5                  # nothing from the car for this long ends a run; the next pulse starts a new one
+PULSE_MISSED_RATIO = 1.6               # a gap this many times its neighbours' median counts as a missed pulse
+LEFT_COLOUR, RIGHT_COLOUR, ALERT = "#58a6ff", "#f0883e", "#f85149"
+
+
+def build_pulse_view(left_us, right_us, samples_us, stamp, rejected=(0, 0)):
+    """The car's micros() times -> seconds from the first event: {'left': [s], 'right': [s], 'samples': [(s, left %, right %)]}."""
+    first = (left_us[:1] or right_us[:1] or [s[0] for s in samples_us[:1]] or [None])[0]
+    if first is None:
+        return None
+
+    def secs(t):                       # micros() wraps every 71 minutes: measure every time from the first one, signed
+        return (((t - first + 2 ** 31) % 2 ** 32) - 2 ** 31) / 1e6
+
+    left, right = [secs(t) for t in left_us], [secs(t) for t in right_us]
+    samples = [(secs(s[0]),) + tuple(s[1:]) for s in samples_us]
+    origin = min(left[:1] + right[:1] + [s[0] for s in samples[:1]])
+    return {"left": [t - origin for t in left], "right": [t - origin for t in right],
+            "samples": [(s[0] - origin,) + s[1:] for s in samples], "stamp": stamp, "rejected": rejected}
+
+
+def pulse_gaps(times):
+    return [(times[i], (times[i] - times[i - 1]) * 1000.0) for i in range(1, len(times))]
+
+
+def missed_slots(times, window=4):
+    """[(time, gap ms, estimated missed pulses)] for gaps much longer than the gaps around them."""
+    gaps = pulse_gaps(times)
+    found = []
+    for i, (t, ms) in enumerate(gaps):
+        near = [gaps[j][1] for j in range(max(0, i - window), min(len(gaps), i + window + 1)) if j != i]
+        if len(near) < 3:
+            continue
+        med = statistics.median(near)
+        if med >= 2.0 and ms >= PULSE_MISSED_RATIO * med:      # (neighbours of ~0 ms are chatter, not a rhythm)
+            found.append((t, ms, max(1, round(ms / med) - 1)))
+    return found
+
+
+def pulse_summary(name, times):
+    if len(times) < 3:
+        return f"{name}: {len(times)} pulses"
+    gaps = [ms for _, ms in pulse_gaps(times)]
+    return (f"{name}: {len(times)} pulses in {times[-1] - times[0]:.2f} s  |  typical gap {statistics.median(gaps):.1f} ms  |  "
+            f"shortest {min(gaps):.1f} ms  |  suspected missed pulses {sum(m[2] for m in missed_slots(times))}")
+
+
+def _percentile(sorted_values, q):
+    return sorted_values[int(q * (len(sorted_values) - 1))]
+
+
+def pulse_report(run, title):
+    """A detailed plain-text report of one run (what 'Copy summary' puts on the clipboard)."""
+    L, R, S = run["left"], run["right"], run["samples"]
+    out = [f"ENCODER PULSE REPORT - {title}", ""]
+    buckets = ((0, 1, "under 1 ms (chatter)"), (1, 5, "1-5 ms"), (5, 10, "5-10 ms"), (10, 20, "10-20 ms"),
+               (20, 40, "20-40 ms"), (40, 80, "40-80 ms"), (80, 1e9, "80 ms and over"))
+    for name, times in (("LEFT", L), ("RIGHT", R)):
+        out.append(f"{name}: {len(times)} pulses")
+        if len(times) < 3:
+            out.append("")
+            continue
+        span = times[-1] - times[0]
+        gaps = sorted(ms for _, ms in pulse_gaps(times))
+        out.append(f"  first pulse at {times[0]:.3f} s, last at {times[-1]:.3f} s (active {span:.2f} s), "
+                   f"average {len(times) / span:.1f} pulses/s")
+        out.append(f"  gap between pulses, ms: min {gaps[0]:.1f} | 5% {_percentile(gaps, 0.05):.1f} | median {statistics.median(gaps):.1f} | "
+                   f"mean {statistics.mean(gaps):.1f} | 95% {_percentile(gaps, 0.95):.1f} | max {gaps[-1]:.1f}")
+        out.append("  gaps by size: " + " | ".join(f"{label}: {sum(1 for g in gaps if lo <= g < hi)}" for lo, hi, label in buckets))
+        found = missed_slots(times)
+        out.append(f"  suspected missed pulses: {sum(m[2] for m in found)} in {len(found)} places "
+                   f"(a gap {PULSE_MISSED_RATIO}x or more its neighbours' median)")
+        for t, ms, n in found[:12]:
+            out.append(f"    at {t:.2f} s: gap {ms:.1f} ms, about {n} missed")
+        if len(found) > 12:
+            out.append(f"    ... and {len(found) - 12} more")
+        out.append("")
+    if L and R:
+        out.append(f"Right made {100.0 * len(R) / len(L):.1f}% of left's pulses (right {len(R)}, left {len(L)}).")
+        out.append("")
+    end = max(L[-1:] + R[-1:] + [0.0])
+    width = 1.0 if end <= 40 else 2.0
+    out.append(f"Pulses per {width:g} s (time from the first event):   from | left | right")
+    t = 0.0
+    while t < end + 1e-9:
+        nl = sum(1 for x in L if t <= x < t + width)
+        nr = sum(1 for x in R if t <= x < t + width)
+        out.append(f"  {t:6.1f} s | {nl:4d} | {nr:4d}")
+        t += width
+    out.append("")
+    if S:
+        out.append(f"Motor power given by the straight assist ({len(S)} samples, 100% = full): "
+                   f"left min {min(s[1] for s in S)} / average {statistics.mean(s[1] for s in S):.0f} / max {max(s[1] for s in S)}, "
+                   f"right min {min(s[2] for s in S)} / average {statistics.mean(s[2] for s in S):.0f} / max {max(s[2] for s in S)}")
+    else:
+        out.append("Motors: off during this run (wheels turned by hand).")
+    rl, rr = run.get("rejected", (0, 0))
+    out.append(f"Pulses thrown away by the car's 300 us debounce since it started (noise): left {rl}, right {rr}")
+    return "\n".join(out)
+
+
+class PulseListener(threading.Thread):
+    """Reads the car's USB serial port and hands every complete PULSELOG dump to the window through a queue."""
+
+    def __init__(self, port, out):
+        super().__init__(daemon=True)
+        self.port, self.out = port, out
+        self.stop_event = threading.Event()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            s = pyserial.Serial()
+            s.port, s.baudrate, s.timeout = self.port, 115200, 0.5
+            s.dtr = False                  # opening the port must not reset the car
+            s.rts = False
+            try:
+                s.open()
+            except Exception as e:
+                self.out.put(("status", f"{self.port} not available ({type(e).__name__}): USB cable in the COM port? "
+                                        f"(it is also busy while flashing). Trying again ..."))
+                self.stop_event.wait(2.0)
+                continue
+            self.out.put(("status", f"Listening on {self.port}. The chart draws live while the wheels turn."))
+            try:
+                while not self.stop_event.is_set():
+                    raw = s.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if line.startswith(("PBL,", "PBR,", "PM,", "PX,")):
+                        self.out.put(("line", line))
+            except Exception as e:
+                self.out.put(("status", f"Lost {self.port} ({type(e).__name__}). Trying again ..."))
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+
+def _nice_step(span, target=8):
+    raw = span / target
+    for step in (0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 50):
+        if step >= raw:
+            return step
+    return 100
+
+
+class PulseWindow:
+    """Both wheels' encoder pulses against time, drawn like the path map so a screenshot of it can be shared.
+    Runs are kept in memory only (nothing is saved to disk); the arrows step through them."""
+
+    def __init__(self, app):
+        self.app = app
+        self.runs, self.index = [], -1
+        self.live = None                    # the run that is happening now (times in micros), None while the car is still
+        self.live_dirty = False
+        self.rejected_last = (0, 0)         # the car only reports its debounce counters when they change: keep the last ones
+        self.out = queue.Queue()
+        self.listener = None
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Encoder pulses - left against right")
+        win.configure(bg=BG)
+        h = min(820, win.winfo_screenheight() - 110)
+        win.geometry(f"980x{h}+120+20")
+        win.minsize(760, 560)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=12, pady=(10, 4))
+        app._button(bar, "<", lambda: self.step(-1)).pack(side="left")
+        app._button(bar, ">", lambda: self.step(1)).pack(side="left", padx=(4, 10))
+        self.run_var = tk.StringVar(value="No run yet")
+        tk.Label(bar, textvariable=self.run_var, bg=BG, fg=TEXT, font=(FONT, 10, "bold")).pack(side="left")
+        app._button(bar, "Clear all", self.clear).pack(side="right")
+        app._button(bar, "Copy summary", self.copy_summary).pack(side="right", padx=6)
+
+        self.canvas = tk.Canvas(win, bg="#0a0e14", highlightbackground=LINE, highlightthickness=1)
+        self.canvas.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self.canvas.bind("<Configure>", lambda e: self.draw())
+
+        info = tk.Frame(win, bg=BG)
+        info.pack(fill="x", padx=12, pady=(0, 10))
+        self.left_var, self.right_var, self.status_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.noise_var = tk.StringVar()
+        for var, colour in ((self.left_var, LEFT_COLOUR), (self.right_var, RIGHT_COLOUR), (self.noise_var, MUTED),
+                            (self.status_var, MUTED)):
+            tk.Label(info, textvariable=var, bg=BG, fg=colour, font=(FONT, 9), anchor="w", justify="left",
+                     wraplength=940).pack(anchor="w")
+
+        if pyserial is None:
+            self.status_var.set("pyserial is not installed, so the car's USB log cannot be read: "
+                                "run  python -m pip install pyserial  in the dashboard's environment.")
+        else:
+            self.listener = PulseListener(PULSE_PORT, self.out)
+            self.listener.start()
+        win.after(200, self._poll)
+
+    def close(self):
+        if self.listener is not None:
+            self.listener.stop_event.set()
+            self.listener.join(timeout=1.5)         # lets go of the COM port (flashing needs it free)
+        self.app.pulse_window = None
+        win, self.win = self.win, None
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    def _poll(self):
+        if self.win is None:
+            return
+        try:
+            while True:
+                kind, value = self.out.get_nowait()
+                if kind == "status":
+                    self.status_var.set(value)
+                elif kind == "line":
+                    self._on_line(value)
+        except queue.Empty:
+            pass
+        if self.live is not None and time.monotonic() - self.live["last_rx"] > PULSE_RUN_GAP_S:
+            self._finish_live()                    # the car has been quiet: the run is over
+        elif self.live_dirty:
+            self.live_dirty = False
+            self.draw()
+        self.win.after(150, self._poll)
+
+    def _on_line(self, line):
+        p = line.split(",")
+        try:
+            nums = [int(x) for x in p[1:]]
+        except ValueError:
+            return                                  # a line damaged on the way
+        if not nums:
+            return
+        now = time.monotonic()
+        if self.live is None or now - self.live["last_rx"] > PULSE_RUN_GAP_S:
+            self._finish_live()
+            self.live = {"left": [], "right": [], "samples": [], "rejected": self.rejected_last, "stamp": time.strftime("%H:%M:%S"),
+                         "last_rx": now}
+        live = self.live
+        live["last_rx"] = now
+        if p[0] in ("PBL", "PBR"):
+            t, times = nums[0], []
+            times.append(t)
+            for gap in nums[1:]:
+                t += gap
+                times.append(t)
+            live["left" if p[0] == "PBL" else "right"].extend(times)
+        elif p[0] == "PM" and len(nums) >= 3:
+            live["samples"].append((nums[0], nums[1], nums[2]))
+        elif p[0] == "PX" and len(nums) >= 2:
+            live["rejected"] = self.rejected_last = (nums[0], nums[1])
+        self.live_dirty = True
+
+    def _live_view(self, live=None):
+        live = live or self.live
+        return build_pulse_view(live["left"], live["right"], live["samples"], live["stamp"], live["rejected"])
+
+    def _finish_live(self):
+        live, self.live = self.live, None
+        if live is None:
+            return
+        view = self._live_view(live)
+        left, right = len(live["left"]), len(live["right"])
+        if view is None or max(left, right) < PULSE_MIN_RUN:
+            self.status_var.set(f"Ignored a small run ({left} left / {right} right pulses): under {PULSE_MIN_RUN}, "
+                                f"so not a drive. Listening for the next one.")
+        else:
+            self.runs.append(view)
+            del self.runs[:-15]
+            self.index = len(self.runs) - 1
+            self.status_var.set(f"Run finished ({view['stamp']}). Listening for the next one.")
+        self.draw()
+
+    def step(self, delta):
+        if self.runs:
+            self.index = max(0, min(len(self.runs) - 1, self.index + delta))
+            self.draw()
+
+    def clear(self):
+        self.runs, self.index = [], -1
+        self.draw()
+
+    def copy_summary(self):
+        live = self._live_view() if self.live is not None else None
+        run = live if live is not None else (self.runs[self.index] if self.runs else None)
+        if run is None:
+            return
+        text = pulse_report(run, self.run_var.get())
+        self.win.clipboard_clear()
+        self.win.clipboard_append(text)
+        self.status_var.set(f"Copied a detailed report ({text.count(chr(10)) + 1} lines) to the clipboard.")
+
+    def draw(self):
+        if self.win is None:
+            return
+        c = self.canvas
+        c.delete("all")
+        w, h = max(c.winfo_width(), 300), max(c.winfo_height(), 300)
+        live = self._live_view() if self.live is not None else None
+        if live is None and not self.runs:
+            c.create_text(w / 2, h / 2, fill=MUTED, font=(FONT, 11), justify="center",
+                          text="Waiting for the wheels to turn ...\nDrive the car from the dashboard, or turn a wheel by hand "
+                               "(USB cable in the COM port).")
+            self.run_var.set("No run yet")
+            self.left_var.set("")
+            self.right_var.set("")
+            self.noise_var.set("")
+            return
+        run = live if live is not None else self.runs[self.index]
+        L, R, S = run["left"], run["right"], run["samples"]
+        end = max([0.5] + L[-1:] + R[-1:] + [s[0] for s in S][-1:]) * 1.02
+        x0, x1 = 64, w - 14
+
+        def X(t):
+            return x0 + t / end * (x1 - x0)
+
+        # four panels stacked on one time axis
+        titles = ("Every counted pulse (one tick each; a missing tick = a missed slot)", "Pulses counted so far",
+                  "Time between pulses, ms (red circle = gap 1.6x the normal or more: probably a missed slot)",
+                  "Motor power of each side, % (the straight assist slows one side)")
+        weights = (0.16, 0.24, 0.36, 0.24)
+        title_h, top, bottom, pad = 18, 4, 22, 6
+        avail = h - top - bottom - (title_h + pad) * 4
+        panels, y = [], top
+        for wt in weights:
+            y += title_h
+            panels.append((y, y + avail * wt))
+            y += avail * wt + pad
+        step = _nice_step(end)
+        for (ya, yb), title in zip(panels, titles):
+            c.create_rectangle(x0, ya, x1, yb, outline=LINE, fill="#0f141b")
+            c.create_text(x0, ya - 9, text=title, anchor="w", fill=MUTED, font=(FONT, 8, "bold"))
+            gx = 0.0
+            while gx <= end:
+                c.create_line(X(gx), ya, X(gx), yb, fill="#1c2430")
+                gx += step
+        gx = 0.0
+        while gx <= end:
+            c.create_text(X(gx), panels[-1][1] + 4, text=f"{gx:g} s", anchor="n", fill="#4d5b6e", font=(FONT, 7))
+            gx += step
+
+        # 1: every pulse
+        ya, yb = panels[0]
+        for lane, (times, colour, name) in enumerate(((L, LEFT_COLOUR, "left"), (R, RIGHT_COLOUR, "right"))):
+            yc = ya + (yb - ya) * (0.3 + 0.4 * lane)
+            half = (yb - ya) * 0.17
+            c.create_text(x0 - 6, yc, text=name, anchor="e", fill=colour, font=(FONT, 8))
+            for t in times:
+                c.create_line(X(t), yc - half, X(t), yc + half, fill=colour)
+
+        # 2: pulses so far
+        ya, yb = panels[1]
+        top_n = max(len(L), len(R), 1)
+
+        def YN(n):
+            return yb - n / top_n * (yb - ya) * 0.94 - 2
+
+        for lane, (times, colour, name) in enumerate(((L, LEFT_COLOUR, "left"), (R, RIGHT_COLOUR, "right"))):
+            pts = [X(0), YN(0)]
+            for i, t in enumerate(times):
+                pts += [X(t), YN(i), X(t), YN(i + 1)]
+            if len(pts) >= 4:
+                c.create_line(*pts, fill=colour, width=2)
+            c.create_text(x0 + 8 + lane * 110, ya + 11, text=f"{name} {len(times)}", anchor="w", fill=colour,
+                          font=(FONT, 9, "bold"))
+        c.create_text(x0 - 6, YN(0), text="0", anchor="e", fill="#4d5b6e", font=(FONT, 7))
+        c.create_text(x0 - 6, YN(top_n), text=str(top_n), anchor="e", fill="#4d5b6e", font=(FONT, 7))
+
+        # 3: gaps between pulses
+        ya, yb = panels[2]
+        series = [(pulse_gaps(L), LEFT_COLOUR, "L", L), (pulse_gaps(R), RIGHT_COLOUR, "R", R)]
+        vals = sorted(ms for g, *_ in series for _, ms in g)
+        if vals:
+            y_top = max(40.0, min(vals[-1], vals[int(0.95 * (len(vals) - 1))] * 2.2))
+
+            def YG(ms):
+                return yb - min(ms, y_top) / y_top * (yb - ya) * 0.94 - 2
+
+            for frac in (0, 0.5, 1):
+                c.create_text(x0 - 6, YG(y_top * frac), text=f"{y_top * frac:.0f}", anchor="e", fill="#4d5b6e", font=(FONT, 7))
+            for gaps, colour, tag, times in series:
+                if len(gaps) >= 2:
+                    c.create_line(*[v for t, ms in gaps for v in (X(t), YG(ms))], fill=colour, width=1)
+                for t, ms in gaps:
+                    c.create_oval(X(t) - 2, YG(ms) - 2, X(t) + 2, YG(ms) + 2, fill=colour, outline="")
+                    if ms > y_top:                                   # off the scale: a small triangle at the top edge
+                        c.create_polygon(X(t) - 4, ya + 2, X(t) + 4, ya + 2, X(t), ya + 9, fill=colour, outline="")
+                found = missed_slots(times)
+                for t, ms, n in found:
+                    c.create_oval(X(t) - 6, YG(ms) - 6, X(t) + 6, YG(ms) + 6, outline=ALERT, width=2)
+                    if len(found) <= 30:                             # too many labels would only clutter
+                        c.create_text(X(t) + 8, YG(ms) - 8, text=f"{tag}-{n}", anchor="w", fill=ALERT, font=(FONT, 7))
+
+        # 4: motor power
+        ya, yb = panels[3]
+
+        def YP(v):
+            return yb - max(0, min(v, 100)) / 100 * (yb - ya) * 0.94 - 2
+
+        for frac in (0, 50, 100):
+            c.create_text(x0 - 6, YP(frac), text=str(frac), anchor="e", fill="#4d5b6e", font=(FONT, 7))
+        if S:
+            for idx, colour, name in ((1, LEFT_COLOUR, "left"), (2, RIGHT_COLOUR, "right")):
+                pts = []
+                for i, s in enumerate(S):
+                    if i:
+                        pts += [X(s[0]), YP(S[i - 1][idx])]          # step: hold the previous value until this sample
+                    pts += [X(s[0]), YP(s[idx])]
+                if len(pts) >= 4:
+                    c.create_line(*pts, fill=colour, width=2)
+            c.create_text(x0 + 8, ya + 11, text="left", anchor="w", fill=LEFT_COLOUR, font=(FONT, 9, "bold"))
+            c.create_text(x0 + 52, ya + 11, text="right", anchor="w", fill=RIGHT_COLOUR, font=(FONT, 9, "bold"))
+        else:
+            c.create_text((x0 + x1) / 2, (ya + yb) / 2, text="no motor samples (the motors were off: wheels turned by hand)",
+                          fill=MUTED, font=(FONT, 9))
+
+        share = f", right made {100.0 * len(R) / len(L):.0f}% of left's pulses" if L else ""
+        where = "LIVE  -  run in progress" if live is not None else f"Run {self.index + 1} of {len(self.runs)}"
+        self.run_var.set(f"{where}  -  {run['stamp']}{share}")
+        self.left_var.set(pulse_summary("LEFT ", L))
+        self.right_var.set(pulse_summary("RIGHT", R))
+        rl, rr = run.get("rejected", (0, 0))
+        self.noise_var.set(f"Pulses thrown away by the car's 300 us debounce since it started (= noise on that wire): "
+                           f"left {rl}, right {rr}")
+
+
 # ---------------------------------------------------------------- dashboard
 class RangeSlider(tk.Canvas):
     """A slider with two handles: drag either end to set the lowest and highest value (whole numbers)."""
@@ -863,6 +1301,7 @@ class Dashboard:
         self.runner = PathRunner(self.tracker, self._runner_send, lambda: int(self.car_speed.get()),
                                  lambda: self.dist_cm, self._runner_finished)
         self.path_window = None
+        self.pulse_window = None
         self.dist_cm = None            # latest distance reading, None = nothing in range
         self.gz = 0.0                  # latest turning speed (deg/s)
         self._yaw_resync = True        # the car's yaw was zeroed / it rebooted: don't treat the jump as a turn
@@ -919,6 +1358,7 @@ class Dashboard:
         self.cam_badge = self._badge(header, "CAMERA (WiFi)", self.cam_text)
         self.cam_badge.pack(side="right", padx=(0, 8))
         self._button(header, "Path map", self.open_path_window).pack(side="right", padx=(0, 8))
+        self._button(header, "Pulse chart", self.open_pulse_window).pack(side="right", padx=(0, 8))
 
         # camera column
         left = tk.Frame(root, bg=BG)
@@ -1557,6 +1997,12 @@ class Dashboard:
         else:
             self.path_window.win.lift()
 
+    def open_pulse_window(self):
+        if self.pulse_window is None:
+            self.pulse_window = PulseWindow(self)
+        else:
+            self.pulse_window.win.lift()
+
     def _path_ready(self):
         if not self.connected.is_set():
             self.runner.status = "Car not connected"
@@ -1831,6 +2277,8 @@ class Dashboard:
         self.root.withdraw()            # the window disappears at once; the car link is closed properly in the background
         self.stop_event.set()
         self.camera.stop_event.set()
+        if self.pulse_window is not None:
+            self.pulse_window.close()       # lets go of the car's COM port
         # The Bluetooth thread is a daemon thread: if the program exits now it is killed before it can disconnect, and the car
         # goes on believing it is connected (and does not advertise) until the link times out about 10 s later - which is why
         # the next start could not find it. So wait (up to 5 s) for the thread to say goodbye to the car.
