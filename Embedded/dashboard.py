@@ -38,6 +38,7 @@ CAPTURE_DIR = Path(__file__).resolve().parent / "captures"
 
 # Car (ESP32-S3 over BLE)
 CAR_NAME = "AI_Car"
+CAR_ADDRESS_FILE = Path(__file__).with_name("ai_car_address.txt")   # the car's Bluetooth address, saved after the first connection
 CHAR_UUID = "87654321-4321-4321-4321-BA0987654321"           # commands (write)
 DISTANCE_CHAR_UUID = "11223344-5566-7788-99AA-BBCCDDEEFF00"  # distance cm, "-1" = no echo
 MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011"       # "yaw,pitch,roll,gx,gy,gz,ax,ay,az"
@@ -835,7 +836,8 @@ class Dashboard:
         if "--no-ble" in sys.argv:  # test switch: camera only, to see if Bluetooth slows the WiFi
             self.car_text.set("BLE disabled (--no-ble)")
         else:
-            threading.Thread(target=self._ble_thread, daemon=True).start()
+            self.ble_thread = threading.Thread(target=self._ble_thread, daemon=True)
+            self.ble_thread.start()
 
         root.bind_all("<KeyPress>", self._on_key_press)
         root.bind_all("<KeyRelease>", self._on_key_release)
@@ -1395,15 +1397,13 @@ class Dashboard:
 
     async def _ble_main(self):
         while not self.stop_event.is_set():
-            self._post(lambda: self.car_text.set("Searching for AI_Car..."))
+            started = time.monotonic()
             try:
-                device = await BleakScanner.find_device_by_name(CAR_NAME, timeout=8)
-                if device is None:
-                    self._post(lambda: self.car_text.set("AI_Car not found - retrying"))
+                client = await self._open_client()
+                if client is None:
+                    await asyncio.sleep(1.0)           # never spin: a scan can return at once if Bluetooth is off
                     continue
-                self._post(lambda: self.car_text.set("Connecting..."))
-                client = BleakClient(device)
-                await client.connect()
+                self._save_car_address(client.address)
                 self.client = client
                 self.characteristic = None
                 for service in client.services:
@@ -1429,7 +1429,7 @@ class Dashboard:
                 self._post(self._send_turn_speed)
                 self._post(self._send_straight)   # and the straight-drive checkbox
                 self._post(self._send_guard)      # and the overload guard settings
-                self._post(lambda: self.car_text.set("Connected to AI_Car"))
+                self._post(lambda s=time.monotonic() - started: self.car_text.set(f"Connected to AI_Car ({s:.1f} s)"))
                 while not self.stop_event.is_set() and client.is_connected:
                     await asyncio.sleep(0.1)
                 if client.is_connected:
@@ -1443,6 +1443,39 @@ class Dashboard:
                 self._post(self._reset_readouts)
             if not self.stop_event.is_set():
                 await asyncio.sleep(1.5)
+
+    async def _open_client(self):
+        """Connected BleakClient for the car, or None. The scan finds an advertising car in well under a second, and a connect
+        takes about 2 s (both measured). If the scan does not see it (the car is not advertising because something still holds
+        a link to it), the address saved from the last connection is tried directly."""
+        self._post(lambda: self.car_text.set("Searching for AI_Car..."))
+        device = await BleakScanner.find_device_by_name(CAR_NAME, timeout=4)
+        if device is not None:
+            self._post(lambda: self.car_text.set("Connecting..."))
+            client = BleakClient(device, timeout=12)
+            await client.connect()
+            return client
+        saved = self._load_car_address()
+        if not saved:
+            self._post(lambda: self.car_text.set("AI_Car not found - retrying"))
+            return None
+        self._post(lambda: self.car_text.set("AI_Car not advertising - trying its saved connection..."))
+        client = BleakClient(saved, timeout=8)
+        await client.connect()
+        return client
+
+    def _load_car_address(self):
+        try:
+            return CAR_ADDRESS_FILE.read_text().strip() or None
+        except OSError:
+            return None
+
+    def _save_car_address(self, address):
+        try:
+            if address and address != self._load_car_address():
+                CAR_ADDRESS_FILE.write_text(str(address))
+        except OSError:
+            pass
 
     async def _write(self, message):
         client, char = self.client, self.characteristic
@@ -1753,8 +1786,15 @@ class Dashboard:
         self.closing = True
         self._send("S")
         self._save_servo_memory()
+        self.root.withdraw()            # the window disappears at once; the car link is closed properly in the background
         self.stop_event.set()
         self.camera.stop_event.set()
+        # The Bluetooth thread is a daemon thread: if the program exits now it is killed before it can disconnect, and the car
+        # goes on believing it is connected (and does not advertise) until the link times out about 10 s later - which is why
+        # the next start could not find it. So wait (up to 5 s) for the thread to say goodbye to the car.
+        ble = getattr(self, "ble_thread", None)
+        if ble is not None and ble.is_alive():
+            ble.join(timeout=5)
         try:
             self.root.destroy()
         except tk.TclError:
