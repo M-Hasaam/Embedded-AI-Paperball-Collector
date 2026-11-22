@@ -39,6 +39,13 @@ const float MPU_FILTER_ALPHA = 0.98f;             // complementary filter: gyro 
 const float MPU_GYRO_LSB_PER_DPS = 65.5f;         // gyro range +-500 deg/s
 const float MPU_YAW_DEADBAND_DPS = 0.3f;          // ignore tiny gyro noise so heading doesn't creep
 const int MPU_CAL_SAMPLES = 200;                  // gyro offset calibration (keep the car still)
+// The gyro's zero point drifts as the chip warms up, so a heading calibrated at power-on creeps while the car stands still
+// (a few degrees a minute). While the car is certainly still (no motor command, no turn, wheels not turning, gyro quiet) the
+// heading is frozen and the zero point is re-learned slowly. A real rotation (> MPU_STILL_DPS) always counts.
+const float MPU_STILL_DPS = 2.0f;                 // quieter than this (after the zero correction) can be "still"
+const unsigned long MPU_STILL_MS = 400;           // ... for this long, with the wheels not turning
+const float MPU_STILL_BIAS_ALPHA = 0.004f;        // zero-point learning per sample while still (time constant about 5 s)
+const float MPU_STILL_FREEZE_DPS = 1.0f;          // while still, a rate below this is not added to the heading
 const char* MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011";
 
 // Built-in RGB status LED (GPIO 48 on most ESP32-S3 boards; if your board shows no colour, its LED is on another pin).
@@ -749,10 +756,22 @@ void updateMpu() {
       lastMpuMicros = us;
       if (dt <= 0 || dt > 0.5f) dt = MPU_READ_INTERVAL_MS / 1000.0f;
 
+      // Is the car certainly still? Then the gyro is only showing its own zero-point error.
+      static long lastTicksL = 0, lastTicksR = 0;
+      static unsigned long stillSince = 0;
+      long ticksL = encoderLeftTicks, ticksR = encoderRightTicks;
+      bool wheelsMoved = ticksL != lastTicksL || ticksR != lastTicksR;
+      lastTicksL = ticksL;
+      lastTicksR = ticksR;
+      bool driving = motorState[0] || motorState[1] || motorState[2] || motorState[3] || turnActive;
+      if (driving || wheelsMoved || fabsf(mpuGz) > MPU_STILL_DPS) stillSince = 0;
+      else if (stillSince == 0) stillSince = now;
+      bool still = stillSince != 0 && now - stillSince >= MPU_STILL_MS;
+      if (still) gyroBiasZ += MPU_STILL_BIAS_ALPHA * mpuGz;       // re-learn the zero point
 
       float accRoll = atan2f(mpuAy, mpuAz) * 180.0f / M_PI;
       float accPitch = atan2f(-mpuAx, sqrtf(mpuAy * mpuAy + mpuAz * mpuAz)) * 180.0f / M_PI;
-      if (fabsf(mpuGz) > MPU_YAW_DEADBAND_DPS) {
+      if (fabsf(mpuGz) > (still ? MPU_STILL_FREEZE_DPS : MPU_YAW_DEADBAND_DPS)) {
         mpuYaw += mpuGz * dt;
         if (mpuYaw > 180.0f) mpuYaw -= 360.0f;
         if (mpuYaw < -180.0f) mpuYaw += 360.0f;
