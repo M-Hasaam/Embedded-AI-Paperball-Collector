@@ -18,6 +18,11 @@ const int ECHO_PIN = 2;   // moved from GPIO 11
 const int BUZZER_PIN = 14;
 const float BUZZER_ON_CM = 20.0f;                 // alarm starts below this distance
 const float BUZZER_OFF_CM = 23.0f;                // alarm stops above this (gap avoids flicker at the limit)
+// A single false short echo (noise on the ECHO line, a stray reflection) used to start the alarm with nothing in front of the
+// car. Now a reading below the sensor's 2 cm minimum counts as noise, the distance used is the median of the last three
+// readings, and the alarm needs BUZZER_CONFIRM close readings in a row.
+const float SENSOR_MIN_CM = 2.0f;
+const int BUZZER_CONFIRM = 2;
 const unsigned long BUZZER_BEEP_MS = 120;         // beep on / off time while alarming
 
 const char* DISTANCE_CHAR_UUID = "11223344-5566-7788-99AA-BBCCDDEEFF00";
@@ -548,12 +553,24 @@ void updateDistance() {
   if (now - lastDistanceRead < DISTANCE_INTERVAL_MS) return;
   lastDistanceRead = now;
 
-  float cm = readDistanceCm();
+  float raw = readDistanceCm();
+  if (raw >= 0 && raw < SENSOR_MIN_CM) raw = -1;            // below the sensor's minimum range: noise, not an obstacle
 
-  // Alarm: on below BUZZER_ON_CM, off above BUZZER_OFF_CM, off when nothing is in range (-1).
-  if (cm < 0) distanceAlarm = false;
-  else if (cm < BUZZER_ON_CM) distanceAlarm = true;
-  else if (cm > BUZZER_OFF_CM) distanceAlarm = false;
+  // Median of the last three readings (no echo counts as a very large distance), so one stray value is ignored.
+  static float recent[3] = {9999.0f, 9999.0f, 9999.0f};
+  static int recentAt = 0;
+  recent[recentAt] = raw < 0 ? 9999.0f : raw;
+  recentAt = (recentAt + 1) % 3;
+  float lo = recent[0] < recent[1] ? recent[0] : recent[1];
+  float hi = recent[0] < recent[1] ? recent[1] : recent[0];
+  float median = recent[2] < lo ? lo : (recent[2] > hi ? hi : recent[2]);
+  float cm = median >= 9999.0f ? -1.0f : median;
+
+  // Alarm: on after BUZZER_CONFIRM close readings in a row, off above BUZZER_OFF_CM, off when nothing is in range (-1).
+  static int closeReadings = 0;
+  if (cm < 0) { distanceAlarm = false; closeReadings = 0; }
+  else if (cm < BUZZER_ON_CM) { if (++closeReadings >= BUZZER_CONFIRM) distanceAlarm = true; }
+  else { closeReadings = 0; if (cm > BUZZER_OFF_CM) distanceAlarm = false; }
 
   char buf[16];
   if (cm < 0) snprintf(buf, sizeof(buf), "-1");
