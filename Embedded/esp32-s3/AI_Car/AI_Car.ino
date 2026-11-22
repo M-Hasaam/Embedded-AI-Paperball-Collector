@@ -154,7 +154,8 @@ const int MOTOR_PINS[4] = {LU, LD, RU, RD};
 const int MOTOR_PWM_FREQ_HZ = 1000;
 const int MOTOR_PWM_BITS = 8;
 const uint32_t MOTOR_PWM_MAX = (1UL << MOTOR_PWM_BITS) - 1;
-int motorSpeedPct = 100;
+int motorSpeedPct = 100;    // wheel speed for driving straight (U, D), percent
+int turnSpeedPct = 70;      // wheel speed for turning on the spot (L, R), percent
 int motorState[4] = {0, 0, 0, 0};  // last requested direction (1 = on) for LU, LD, RU, RD
 
 // Straight-drive assist (see updateStraightAssist): power scale of each side, 1.0 = full. The faster side is
@@ -333,7 +334,8 @@ void motors(int lu, int ld, int ru, int rd) {
   if (lu || ld) encoderLeftDir = lu ? 1 : -1;
   if (ru || rd) encoderRightDir = ru ? 1 : -1;
 
-  uint32_t duty = MOTOR_PWM_MAX * motorSpeedPct / 100;
+  bool turning = (lu && rd) || (ld && ru);   // the two sides run in opposite directions: turning on the spot
+  uint32_t duty = MOTOR_PWM_MAX * (turning ? turnSpeedPct : motorSpeedPct) / 100;
   for (int i = 0; i < 4; i++) {
     float scale = (i < 2) ? leftScale : rightScale;  // MOTOR_PINS = {LU, LD, RU, RD}: 0,1 = left side, 2,3 = right
     ledcWrite(MOTOR_PINS[i], motorState[i] ? (uint32_t)(duty * scale) : 0);
@@ -396,7 +398,20 @@ void handleCommand(String message) {
     return;
   }
 
-  // Wheel speed: P<0-100> (percent, same for all wheels). Also applies to wheels that are running right now.
+  // Turn speed: Q<0-100> (percent) for turning on the spot (L, R). Also applies to a turn that is running right now.
+  if (message.charAt(0) == 'Q') {
+    int pct = -1;
+    if (sscanf(message.c_str(), "Q%d", &pct) == 1 && pct >= 0 && pct <= 100) {
+      turnSpeedPct = pct;
+      motors(motorState[0], motorState[1], motorState[2], motorState[3]);
+      Serial.printf("Turn speed: %d%%\n", pct);
+    } else {
+      Serial.println("Invalid turn speed. Use: Q60");
+    }
+    return;
+  }
+
+  // Drive speed: P<0-100> (percent) for driving straight forward or backward (U, D). Also applies to wheels that are running right now.
   if (message.charAt(0) == 'P') {
     int pct = -1;
     if (sscanf(message.c_str(), "P%d", &pct) == 1 && pct >= 0 && pct <= 100) {

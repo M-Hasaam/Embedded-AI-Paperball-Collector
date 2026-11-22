@@ -55,7 +55,8 @@ SERVO_RANGE_GAP = 5                       # the two ends of the range slider sta
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 SERVO_SPEED = 60                  # default deg/s
 SERVO_MEMORY_FILE = Path(__file__).with_name("servo_last_angles.json")   # where each servo was left (so a restart starts from there)
-CAR_SPEED_DEFAULT = 100           # wheel speed in percent (one slider for all wheels)
+CAR_SPEED_DEFAULT = 100           # wheel speed in percent for driving straight (forward / backward)
+CAR_TURN_SPEED_DEFAULT = 70       # wheel speed in percent for turning on the spot
 CAR_SPEED_MIN = 20                # below this the wheels usually stall
 
 # Path map (dead reckoning: gyro heading + wheel-encoder distance; falls back to drive time x speed without encoders)
@@ -405,9 +406,10 @@ class PathRunner:
     STALL_S = 0.6               # ... for this long (longer than the Bluetooth + motor lag)
     STALL_STEP_PCT = 10         # raise the turn speed by this much each time
 
-    def __init__(self, tracker, send, get_speed, get_dist, on_finish=None):
+    def __init__(self, tracker, send, get_speed, get_dist, on_finish=None, get_turn_speed=None):
         self.tracker, self.send = tracker, send
         self.get_speed, self.get_dist = get_speed, get_dist
+        self.get_turn_speed = get_turn_speed or get_speed     # the turn slider (turns use their own speed)
         self.on_finish = on_finish
         self.active = False
         self.status = "Idle"
@@ -455,13 +457,13 @@ class PathRunner:
             self.on_finish(True)
 
     def _set_speed(self, pct):
-        self.send(f"P{pct}")
-        self._speed_changed = pct != self.get_speed()
+        self.send(f"Q{pct}")                       # automated turns set the turn speed
+        self._speed_changed = pct != self.get_turn_speed()
 
     def _restore_speed(self):
         if self._speed_changed:
             self._speed_changed = False
-            self.send(f"P{self.get_speed()}")
+            self.send(f"Q{self.get_turn_speed()}")   # back to what the turn slider says
 
     def tick(self, now, gz):
         if not self.active:
@@ -816,7 +818,8 @@ class Dashboard:
         # Path map: dead reckoning from the gyro heading + wheel-encoder distance
         self.tracker = PathTracker()
         self.runner = PathRunner(self.tracker, self._runner_send, lambda: int(self.car_speed.get()),
-                                 lambda: self.dist_cm, self._runner_finished)
+                                 lambda: self.dist_cm, self._runner_finished,
+                                 get_turn_speed=lambda: int(self.car_turn.get()))
         self.path_window = None
         self.dist_cm = None            # latest distance reading, None = nothing in range
         self.gz = 0.0                  # latest turning speed (deg/s)
@@ -956,15 +959,30 @@ class Dashboard:
                 b.bind("<Leave>", lambda e: self._drive_button_release())  # only stops if the button was held
         # one speed slider for all wheels (sent as P<percent>)
         self.speed_dragging, self.last_speed_send, self.pending_speed = False, 0.0, None
+        # two speed sliders side by side: driving straight (P<percent>) and turning on the spot (Q<percent>)
+        self.turn_dragging, self.last_turn_send, self.pending_turn = False, 0.0, None
         speed_row = tk.Frame(dr, bg=CARD)
         speed_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        tk.Label(speed_row, text="Speed", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        speed_row.columnconfigure(0, weight=1, uniform="speeds")
+        speed_row.columnconfigure(1, weight=1, uniform="speeds")
+        left = tk.Frame(speed_row, bg=CARD)
+        left.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        tk.Label(left, text="Straight speed", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
         self.car_speed_var = tk.StringVar(value=f"{CAR_SPEED_DEFAULT}%")
-        tk.Label(speed_row, textvariable=self.car_speed_var, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold")).pack(side="right")
-        self.car_speed = self._scale(speed_row, CAR_SPEED_MIN, 100, CAR_SPEED_DEFAULT, self._speed_changed)
+        tk.Label(left, textvariable=self.car_speed_var, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold"), width=5, anchor="e").pack(side="right")
+        self.car_speed = self._scale(left, CAR_SPEED_MIN, 100, CAR_SPEED_DEFAULT, self._speed_changed)
         self.car_speed.pack(side="left", fill="x", expand=True, padx=8)
         self.car_speed.bind("<ButtonPress-1>", lambda e: setattr(self, "speed_dragging", True))
         self.car_speed.bind("<ButtonRelease-1>", lambda e: self._speed_released())
+        right = tk.Frame(speed_row, bg=CARD)
+        right.grid(row=0, column=1, sticky="ew")
+        tk.Label(right, text="Turn speed", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        self.car_turn_var = tk.StringVar(value=f"{CAR_TURN_SPEED_DEFAULT}%")
+        tk.Label(right, textvariable=self.car_turn_var, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold"), width=5, anchor="e").pack(side="right")
+        self.car_turn = self._scale(right, CAR_SPEED_MIN, 100, CAR_TURN_SPEED_DEFAULT, self._turn_speed_changed)
+        self.car_turn.pack(side="left", fill="x", expand=True, padx=8)
+        self.car_turn.bind("<ButtonPress-1>", lambda e: setattr(self, "turn_dragging", True))
+        self.car_turn.bind("<ButtonRelease-1>", lambda e: self._turn_speed_released())
         # straight-drive assist: the car slows the faster side so it keeps going straight. Two independent options
         # (sent as G0..G3): gyro heading hold, and matching the left and right wheel travel from the encoders.
         assist_row = tk.Frame(dr, bg=CARD)
@@ -1407,7 +1425,8 @@ class Dashboard:
                         pass
                 self.connected.set()
                 self._post(self.servo_commanded.clear)   # the car may have restarted: its servos are idle again
-                self._post(self._send_speed)   # make the car match the slider after (re)connecting
+                self._post(self._send_speed)   # make the car match the sliders after (re)connecting
+                self._post(self._send_turn_speed)
                 self._post(self._send_straight)   # and the straight-drive checkbox
                 self._post(self._send_guard)      # and the overload guard settings
                 self._post(lambda: self.car_text.set("Connected to AI_Car"))
@@ -1564,6 +1583,36 @@ class Dashboard:
 
     def _send_speed(self):
         self._send(f"P{int(self.car_speed.get())}")
+
+    def _turn_speed_changed(self, value):
+        self.car_turn_var.set(f"{int(float(value))}%")
+        if self.turn_dragging:
+            self._send_turn_speed_throttled()
+
+    def _send_turn_speed(self):
+        self._send(f"Q{int(self.car_turn.get())}")
+
+    def _send_turn_speed_throttled(self):
+        if self.pending_turn is not None:
+            return
+        wait = SERVO_SEND_INTERVAL - (time.monotonic() - self.last_turn_send)
+        if wait <= 0:
+            self.last_turn_send = time.monotonic()
+            self._send_turn_speed()
+        else:
+            self.pending_turn = self.root.after(int(wait * 1000) + 1, self._flush_turn_speed)
+
+    def _flush_turn_speed(self):
+        self.pending_turn = None
+        self.last_turn_send = time.monotonic()
+        self._send_turn_speed()
+
+    def _turn_speed_released(self):
+        self.turn_dragging = False
+        if self.pending_turn is not None:
+            self.root.after_cancel(self.pending_turn)
+            self.pending_turn = None
+        self._send_turn_speed()
 
     def _send_guard(self):
         """Send the overload guard switch and its two thresholds (the stop level is kept above the slow-down level)."""
