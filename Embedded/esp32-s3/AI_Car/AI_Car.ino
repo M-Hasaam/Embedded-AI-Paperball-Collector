@@ -98,8 +98,8 @@ const int ENCODER_LEFT_PIN = 8;
 const int ENCODER_RIGHT_PIN = 3;   // GPIO 3 is a strapping pin: if the board fails to boot, move this wire
 
 // Set these two to match your hardware (distance and speed depend on them).
-const int ENCODER_SLOTS_PER_REV = 40;             // calibrated: 100 cm of travel gave ~196 ticks (0.51 cm/tick) with a 6.5 cm wheel
-const float WHEEL_DIAMETER_CM = 6.5f;
+const int ENCODER_SLOTS_PER_REV = 40;             // 40 pulses per turn (checked: 5 hand turns = 199-201 pulses on each wheel)
+const float WHEEL_DIAMETER_CM = 7.0f;             // measured; 100 cm of travel gives about 182-186 pulses = 0.55 cm per pulse
 const float ENCODER_CM_PER_TICK = 3.14159265f * WHEEL_DIAMETER_CM / ENCODER_SLOTS_PER_REV;
 const unsigned long ENCODER_DEBOUNCE_US = 300;    // ignore pulses closer together than this (noise)
 const unsigned long ENCODER_NOTIFY_INTERVAL_MS = 200;
@@ -184,7 +184,14 @@ void writeServo(int index, int angle) {
 
 // Wheel speed: PWM on the motor-driver pins, one setting for all wheels (command P<0-100>, percent).
 const int MOTOR_PINS[4] = {LU, LD, RU, RD};
-const int MOTOR_PWM_FREQ_HZ = 1000;
+// Encoder accuracy notes (measured with tape, 100 cm drives): at 1 kHz, and at 5 kHz when a speed remap made 50% run at the
+// same speed as 1 kHz did, the right encoder lost about 28-34% of its pulses while the car drove at a medium speed (about
+// 40-48 pulses/s, 50% setting). At 100% power, and at 5 kHz / 20 kHz where 50% is slow (about 15 cm/s, the motors need about
+// 28% power before they turn), both encoders agree and read within 3-8% of the real distance. Interference on the right
+// encoder's signal wire is the likely cause (a 1k + 100 nF filter on the signal evened the wheels out but also ate pulses;
+// capacitors across the motors and on the supply changed nothing). So this build trades speed at the low settings for
+// accurate distance: 5 kHz, no speed remap.
+const int MOTOR_PWM_FREQ_HZ = 5000;
 const int MOTOR_PWM_BITS = 8;
 const uint32_t MOTOR_PWM_MAX = (1UL << MOTOR_PWM_BITS) - 1;
 int motorSpeedPct = 100;    // wheel speed for driving straight (U, D), percent
@@ -359,7 +366,27 @@ void attachServo(int i, int firstAngle) {
   }
 }
 
+// Soft start: when the car starts to drive straight (from rest, or after changing direction) the power does not jump to
+// the chosen speed: it begins at SOFT_START_MIN of it and rises to 100% over SOFT_START_MS, so the wheels do not spin
+// on the floor (spinning wheels count encoder pulses without moving the car). Turns on the spot are not ramped: the
+// closed-loop turn (Y) manages its own power.
+// Soft stop: the same on the way down. When straight driving is stopped the power falls to 0 over SOFT_STOP_MS instead of
+// being cut, so the wheels do not lock and skid. The car counts as stopped at once (the assist, the encoders' direction
+// memory and the stop command all see 0); only the PWM output tapers off. Any new motor command ends the taper.
+const unsigned long SOFT_START_MS = 400;
+const float SOFT_START_MIN = 0.4f;
+const unsigned long SOFT_STOP_MS = 250;
+int driveSignature = 0;                 // which motor pattern was running at the last motors() call (0 = stopped)
+unsigned long driveStartMs = 0;
+bool softStartActive = false;
+float lastRamp = 1.0f;                  // the start ramp factor applied at the last call (where a soft stop begins from)
+bool softStopActive = false;
+int softStopPattern[4] = {0, 0, 0, 0};  // the pins that were driving when the stop came
+unsigned long softStopStartMs = 0;
+float softStopFrom = 1.0f;
+
 void motors(int lu, int ld, int ru, int rd) {
+  int previous[4] = {motorState[0], motorState[1], motorState[2], motorState[3]};
   motorState[0] = lu;
   motorState[1] = ld;
   motorState[2] = ru;
@@ -370,12 +397,54 @@ void motors(int lu, int ld, int ru, int rd) {
   if (ru || rd) encoderRightDir = ru ? 1 : -1;
 
   bool turning = (lu && rd) || (ld && ru);   // the two sides run in opposite directions: turning on the spot
+  int signature = (lu ? 1 : 0) | (ld ? 2 : 0) | (ru ? 4 : 0) | (rd ? 8 : 0);
+  if (signature != driveSignature) {         // started, stopped or changed direction (not just a change of power)
+    bool wasTurning = (previous[0] && previous[3]) || (previous[1] && previous[2]);
+    if (signature == 0 && driveSignature != 0 && !wasTurning) {          // straight driving is being stopped: taper off
+      softStopActive = true;
+      for (int i = 0; i < 4; i++) softStopPattern[i] = previous[i];
+      softStopStartMs = millis();
+      softStopFrom = lastRamp;
+    } else {
+      softStopActive = false;                                            // a new command ends any taper
+    }
+    driveSignature = signature;
+    driveStartMs = millis();
+    softStartActive = signature != 0 && !turning;
+  }
+  float ramp = 1.0f;
+  if (softStartActive) {
+    unsigned long elapsed = millis() - driveStartMs;
+    if (elapsed >= SOFT_START_MS) softStartActive = false;
+    else ramp = SOFT_START_MIN + (1.0f - SOFT_START_MIN) * (float)elapsed / (float)SOFT_START_MS;
+  }
+  lastRamp = ramp;
+  float stopRamp = 0.0f;
+  if (softStopActive) {
+    unsigned long elapsed = millis() - softStopStartMs;
+    if (elapsed >= SOFT_STOP_MS) softStopActive = false;
+    else stopRamp = softStopFrom * (1.0f - (float)elapsed / (float)SOFT_STOP_MS);
+  }
+
   int pct = turning ? (turnPctNow >= 0 ? turnPctNow : turnSpeedPct) : motorSpeedPct;
   uint32_t duty = MOTOR_PWM_MAX * pct / 100;
   for (int i = 0; i < 4; i++) {
     float scale = (i < 2) ? leftScale : rightScale;  // MOTOR_PINS = {LU, LD, RU, RD}: 0,1 = left side, 2,3 = right
-    ledcWrite(MOTOR_PINS[i], motorState[i] ? (uint32_t)(duty * scale) : 0);
+    uint32_t value = 0;
+    if (motorState[i]) value = (uint32_t)(duty * scale * ramp);
+    else if (softStopActive && softStopPattern[i]) value = (uint32_t)(duty * scale * stopRamp);
+    ledcWrite(MOTOR_PINS[i], value);
   }
+}
+
+// Called from loop(): while a soft start or soft stop is running, apply the changing power every 20 ms.
+void updateSoftStart() {
+  static unsigned long last = 0;
+  if (!softStartActive && !softStopActive) return;
+  unsigned long now = millis();
+  if (now - last < 20) return;
+  last = now;
+  motors(motorState[0], motorState[1], motorState[2], motorState[3]);
 }
 
 void handleCommand(String message) {
@@ -1423,6 +1492,7 @@ void loop() {
   notifyMpu();
   updateEncoders();
   updatePulseLog();
+  updateSoftStart();
   updateStraightAssist();
   updateServoGuard();
   notifyServoStatus();
