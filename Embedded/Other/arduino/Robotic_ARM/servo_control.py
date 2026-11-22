@@ -24,8 +24,8 @@ class ServoControllerApp:
         # Keep the pins and limits in sync with servo.ino. Servos get no signal until first commanded.
         self.servo_config = [
             {"pin": 6,  "name": "Gripper",  "angle": 90,  "min": 0, "max": 120},
-            {"pin": 9,  "name": "Elbow",    "angle": 120, "min": 0, "max": 180},
-            {"pin": 10, "name": "Shoulder", "angle": 90,  "min": 0, "max": 180},
+            {"pin": 9,  "name": "Elbow",    "angle": 120, "min": 80, "max": 180},   # the elbow also has a limit that depends on the
+            {"pin": 10, "name": "Shoulder", "angle": 90,  "min": 40, "max": 170},   # shoulder angle: the Uno enforces it (servo.ino)
             {"pin": 11, "name": "Servo 4",  "angle": 90,  "min": 0, "max": 180},
         ]
         self.SPEED_DEFAULT = 60
@@ -38,6 +38,7 @@ class ServoControllerApp:
         self.speed_labels = []
 
         self.sliders = []
+        self.held_markers = []
         self.entries = []
         self.angle_vars = []
 
@@ -84,11 +85,13 @@ class ServoControllerApp:
             btn_minus.grid(row=0, column=1, padx=2)
 
             # Slider
-            slider = ttk.Scale(row_frame, from_=0, to=180, orient="horizontal", variable=var,
+            slider = ttk.Scale(row_frame, from_=cfg["min"], to=cfg["max"], orient="horizontal", variable=var,
                                command=lambda val, idx=i: self.on_slider_move(idx, val))
             slider.grid(row=0, column=2, sticky="ew", padx=5)
             row_frame.columnconfigure(2, weight=1)
             self.sliders.append(slider)
+            # red marker (only the elbow's is ever shown): the angle the Uno's elbow limit is holding the elbow at, while it acts
+            self.held_markers.append(tk.Frame(slider, bg="#d1242f", width=6))
 
             # +5 Deg Button
             btn_plus = ttk.Button(row_frame, text="+5°", width=4, command=lambda idx=i: self.adjust_angle(idx, 5))
@@ -113,8 +116,13 @@ class ServoControllerApp:
             sp_label.grid(row=1, column=4)
             self.speed_labels.append(sp_label)
 
+        # a limit message from the Uno (empty = nothing to report): shown in red while it lasts
+        self.limit_alert = tk.StringVar(value="")
+        self.limit_alert_label = ttk.Label(self.root, textvariable=self.limit_alert, foreground="#d1242f", font=("Helvetica", 10, "bold"),
+                                           wraplength=700, justify="left")
+
         # --- Speed presets (apply to all servos; each servo's slider can still be tuned) ---
-        speed_frame = ttk.LabelFrame(self.root, text=" Motion Speed (all servos) ", padding=10)
+        speed_frame = self.speed_frame = ttk.LabelFrame(self.root, text=" Motion Speed (all servos) ", padding=10)
         speed_frame.pack(fill="x", padx=15, pady=6)
         for text, spd in (("Slow 30°/s", 30), ("Default 60°/s", 60), ("Fast 180°/s", 180), ("Max 600°/s", 600)):
             ttk.Button(speed_frame, text=text, command=lambda v=spd: self.set_all_speeds(v)).pack(side="left", expand=True, fill="x", padx=3)
@@ -156,6 +164,7 @@ class ServoControllerApp:
             self.arduino = None
             self.btn_connect.config(text="Connect")
             self.lbl_status.config(text="Disconnected", foreground="red")
+            self.show_limit(-1, "")
         else:
             port = self.port_combobox.get()
             if not port:
@@ -182,6 +191,30 @@ class ServoControllerApp:
                 return
             if line.startswith("OK"):
                 self.root.after(0, lambda s=line: self.lbl_status.config(text=f"Arduino: {s}", foreground="green"))
+            elif line.startswith("LIM"):
+                parts = line.split(" ", 2)      # "LIM <held angle or -1> <message>"
+                try:
+                    held = int(parts[1])
+                except (IndexError, ValueError):
+                    continue
+                self.root.after(0, lambda h=held, m=(parts[2] if len(parts) > 2 else ""): self.show_limit(h, m))
+
+    def show_limit(self, held, message):
+        """Red message and a red, non-draggable marker on the elbow slider at the angle the limit holds the elbow at."""
+        if message:
+            self.limit_alert.set("⚠ " + message)
+            if not self.limit_alert_label.winfo_ismapped():
+                self.limit_alert_label.pack(fill="x", padx=15, before=self.speed_frame)
+        else:
+            self.limit_alert.set("")
+            self.limit_alert_label.pack_forget()
+        marker, slider = self.held_markers[1], self.sliders[1]
+        if held < 0:
+            marker.place_forget()
+        else:
+            lo, hi = float(slider.cget("from")), float(slider.cget("to"))
+            x, _ = slider.coords(min(max(held, lo), hi))
+            marker.place(x=x - 3, y=0, width=6, relheight=1.0)
 
     def clamp(self, idx, angle):
         cfg = self.servo_config[idx]
