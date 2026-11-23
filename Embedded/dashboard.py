@@ -22,12 +22,15 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
 from bleak import BleakClient, BleakScanner
 from PIL import Image, ImageTk
+
+from moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, MoveFileError, MovePlayer, arm_step, describe_step,
+                   drive_step, load_move, new_move, save_move, turn_step, validate_move, wait_step)
 
 # ---------------------------------------------------------------- settings
 # Camera (ESP32 WiFi bridge)
@@ -426,6 +429,21 @@ def plan_steps(waypoints):
     return [["goto", x, y] for x, y in waypoints]
 
 
+def remaining_along_heading(x, y, heading_deg, tx, ty):
+    """How far ahead of the car (along its heading; 0 = up/+y, + = left) the point (tx, ty) still is; negative once passed."""
+    h = math.radians(heading_deg)
+    return (tx - x) * -math.sin(h) + (ty - y) * math.cos(h)
+
+
+def servo_commands(index, angle, speed, last_angle=None):
+    """The commands that move one servo: V<i> <angle> <speed>. For the first command since the car started (its servos are
+    idle) pass the angle the arm was left at: the car is told with H<i> first and then glides from there instead of snapping."""
+    commands = [f"V{index} {angle} {speed}"]
+    if last_angle is not None:
+        commands.insert(0, f"H{index} {last_angle}")
+    return commands
+
+
 class PathRunner:
     """Drives a list of steps on its own, re-aiming before every leg.
 
@@ -553,9 +571,10 @@ class PathRunner:
                     self.abort("obstacle ahead")
                     return
             arrived = now >= self.until
-            if len(step) >= 4 and step[1] > 0:         # stop when the car will roll to the target point (stop early by the coast)
-                h = math.radians(tr.heading_now(now))
-                if (step[2] - tr.x) * -math.sin(h) + (step[3] - tr.y) * math.cos(h) <= max(0.5, self.coast_cm):
+            if len(step) >= 4:                         # stop when the car will roll to the target point (stop early by the coast)
+                ahead = remaining_along_heading(tr.x, tr.y, tr.heading_now(now), step[2], step[3])
+                margin = max(0.5, self.coast_cm)
+                if (step[1] > 0 and ahead <= margin) or (step[1] < 0 and ahead >= -margin):   # forward, or reversing
                     arrived = True
             if arrived:
                 why = "time limit" if now >= self.until else "reached the point"
@@ -917,6 +936,48 @@ def _nice_step(span, target=8):
     return 100
 
 
+class DashboardCar:
+    """The Moves player's view of the car (see moves.PlayerCar): its commands, mapped onto what the dashboard already does."""
+
+    def __init__(self, app):
+        self.app = app
+        self._driving = False       # the last motion was a drive (counted by the car's encoders), not a turn (the path runner)
+
+    def servo(self, index, angle, speed):
+        self.app.send_servo_command(index, angle, speed)
+
+    def servo_angles(self):
+        return {i: int(self.app.servo_scales[i].get()) for i in range(len(SERVO_NAMES))}
+
+    def _as_runner(self, start, value):
+        """turn_by sends S itself; that must not count as 'you touched the controls' and abort the move."""
+        self.app._runner_sending = True
+        try:
+            return start(value)
+        finally:
+            self.app._runner_sending = False
+
+    def start_drive(self, cm, speed, assist):
+        self._driving = True
+        return self.app.drive_encoder(cm, speed, assist)
+
+    def start_turn(self, deg):
+        self._driving = False
+        return self._as_runner(self.app.turn_by, deg)
+
+    def motion_active(self):
+        return self.app.drive_busy() if self._driving else self.app.runner.active
+
+    def motion_ok(self):
+        return not self.app.drive_failed if self._driving else self.app.runner_ok
+
+    def stop(self):
+        self.app.path_abort()
+
+    def connected(self):
+        return self.app.connected.is_set()
+
+
 class PulseWindow:
     """Both wheels' encoder pulses against time, drawn like the path map so a screenshot of it can be shared.
     Runs are kept in memory only (nothing is saved to disk); the arrows step through them."""
@@ -1198,6 +1259,274 @@ class PulseWindow:
                            f"left {rl}, right {rr}")
 
 
+class MovesWindow:
+    """Record, edit, save and replay arm and car steps (see moves.py). 'Add arm pose' captures the four servo sliders and
+    their speeds; drive, turn and wait steps ask for a number. Steps run one after another, top to bottom."""
+
+    def __init__(self, app, car=None):
+        self.app = app
+        self.car = car or DashboardCar(app)
+        self.move = new_move("untitled")
+        self.move["smooth"] = True          # new moves start smooth; a file without the setting (older ones) plays as before
+        self.move["assist_gyro"] = True     # drives steer straight by the gyro heading and the wheel encoders (both on by default)
+        self.move["assist_encoders"] = True
+        self.player = MovePlayer(self.car, SERVO_NAMES)
+        self._was_active = False
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Moves - record and replay arm and car steps")
+        win.configure(bg=BG)
+        win.geometry("800x560+140+30")          # wide enough for a four-servo pose on one line
+        win.minsize(640, 440)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        self.smooth_var = tk.BooleanVar(master=win, value=True)
+        self.assist_gyro_var = tk.BooleanVar(master=win, value=True)
+        self.assist_enc_var = tk.BooleanVar(master=win, value=True)
+
+        tk.Label(win, text="Pose the arm with the sliders in the dashboard, then Add arm pose. Steps run one after another, "
+                           "top to bottom. Drives run at 100% or 50% speed and are counted by the car's wheel encoders.",
+                 bg=BG, fg=MUTED, font=(FONT, 9), wraplength=760,
+                 justify="left").pack(anchor="w", padx=12, pady=(10, 4))
+        self.listbox = tk.Listbox(win, bg=CARD, fg=TEXT, selectbackground=ACCENT, selectforeground="#ffffff", activestyle="none",
+                                  highlightthickness=1, highlightbackground=LINE, relief="flat", font=(FONT, 10), height=12,
+                                  exportselection=False)
+        self.listbox.pack(fill="both", expand=True, padx=12, pady=4)
+
+        def row(buttons, pady=(4, 0)):
+            frame = tk.Frame(win, bg=BG)
+            frame.pack(fill="x", padx=12, pady=pady)
+            for text, command, kw in buttons:
+                app._button(frame, text, command, **kw).pack(side="left", padx=(0, 6))
+            return frame
+
+        row([("Add arm pose", self._add_arm_dialog, {}), ("Add drive 100% (cm)", lambda: self._add_drive_dialog(100), {}),
+             ("Add drive 50% (cm)", lambda: self._add_drive_dialog(50), {}),
+             ("Add turn (°)", self._add_turn_dialog, {}), ("Add wait (s)", self._add_wait_dialog, {})])
+        row([("Edit", self._edit_dialog, {}), ("Delete", self.delete_selected, {}), ("Up", lambda: self.move_selected(-1), {}),
+             ("Down", lambda: self.move_selected(1), {}), ("Save...", self._save_dialog, {}), ("Open...", self._open_dialog, {})])
+        play_row = row([("Test play", self._play_dialog, {}), ("STOP", self.stop, {"danger": True})], pady=(10, 0))
+        tk.Checkbutton(
+            play_row, text="Smooth arm moves (arrive together, no stops between arm steps)", variable=self.smooth_var,
+            command=lambda: self.set_smooth(self.smooth_var.get()), bg=BG, fg=TEXT, selectcolor=CARD_HI, activebackground=BG,
+            activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0, anchor="w", font=(FONT, 9), cursor="hand2",
+        ).pack(side="left", padx=(14, 0))
+        assist_row = tk.Frame(win, bg=BG)
+        assist_row.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(assist_row, text="Drives steer straight with:", bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        for text, var in (("gyro heading", self.assist_gyro_var), ("wheel encoders", self.assist_enc_var)):
+            tk.Checkbutton(
+                assist_row, text=text, variable=var, bg=BG, fg=TEXT, selectcolor=CARD_HI, activebackground=BG,
+                activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0, anchor="w", font=(FONT, 9), cursor="hand2",
+                command=lambda: self.set_assist(self.assist_gyro_var.get(), self.assist_enc_var.get()),
+            ).pack(side="left", padx=(10, 0))
+        self.status_var = tk.StringVar(value="Add some steps, then Test play.")
+        tk.Label(win, textvariable=self.status_var, bg=BG, fg=TEXT, font=(FONT, 10), wraplength=600, justify="left",
+                 anchor="w").pack(fill="x", padx=12, pady=(8, 12))
+        win.after(50, self._tick)
+
+    # ---- editing ------------------------------------------------------
+    def _status(self, text):
+        self.status_var.set(text)
+
+    def _refresh(self, select=None):
+        self.listbox.delete(0, "end")
+        for step in self.move["steps"]:
+            self.listbox.insert("end", describe_step(step, SERVO_NAMES))
+        if select is not None and 0 <= select < len(self.move["steps"]):
+            self.select(select)
+
+    def select(self, index):
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(index)
+        self.listbox.activate(index)
+
+    def _selected(self):
+        chosen = self.listbox.curselection()
+        return chosen[0] if chosen else None
+
+    def _add(self, step):
+        self.move["steps"].append(step)
+        self._refresh(select=len(self.move["steps"]) - 1)
+
+    def _pose_step(self, wait):
+        return arm_step({i: (int(self.app.servo_scales[i].get()), int(self.app.speed_scales[i].get()))
+                         for i in range(len(SERVO_NAMES))}, wait=wait)
+
+    def add_arm_pose(self, wait):
+        self._add(self._pose_step(wait))
+
+    def add_drive(self, cm, speed=100):
+        self._add(drive_step(cm, speed))
+
+    def add_turn(self, deg):
+        self._add(turn_step(deg))
+
+    def add_wait(self, seconds):
+        self._add(wait_step(seconds))
+
+    def delete_selected(self):
+        i = self._selected()
+        if i is None:
+            return
+        del self.move["steps"][i]
+        self._refresh(select=min(i, len(self.move["steps"]) - 1))
+
+    def move_selected(self, delta):
+        i = self._selected()
+        steps = self.move["steps"]
+        if i is None or not 0 <= i + delta < len(steps):
+            return
+        steps[i], steps[i + delta] = steps[i + delta], steps[i]
+        self._refresh(select=i + delta)
+
+    def edit_selected_value(self, value):
+        """Change a drive's cm, a turn's degrees or a wait's seconds."""
+        i = self._selected()
+        if i is None:
+            return
+        field = {"drive": "cm", "turn": "deg", "wait": "seconds"}.get(self.move["steps"][i].get("type"))
+        if field:
+            self.move["steps"][i][field] = value
+            self._refresh(select=i)
+
+    def recapture_selected_pose(self):
+        """Replace the selected arm step's angles and speeds with the sliders' current ones (its pause is kept)."""
+        i = self._selected()
+        if i is not None and self.move["steps"][i].get("type") == "arm":
+            self.move["steps"][i] = self._pose_step(self.move["steps"][i].get("wait", 0.5))
+            self._refresh(select=i)
+
+    def set_assist(self, gyro, encoders):
+        """Straight-drive assist for this move's drive steps: the gyro heading and/or the wheel encoders."""
+        self.move["assist_gyro"], self.move["assist_encoders"] = bool(gyro), bool(encoders)
+        self.assist_gyro_var.set(bool(gyro))
+        self.assist_enc_var.set(bool(encoders))
+
+    def set_smooth(self, on):
+        """Smooth arm moves: the servos of a step arrive together and arm steps follow each other without a stop."""
+        self.move["smooth"] = bool(on)
+        self.smooth_var.set(bool(on))
+
+    # ---- checking and files -------------------------------------------
+    def errors(self):
+        return validate_move(self.move, list(zip(SERVO_MIN_ANGLES, SERVO_MAX_ANGLES)))
+
+    def save(self, path):
+        path = Path(path)
+        self.move["name"] = path.stem
+        save_move(path, self.move)
+        self._status(f"Saved {path.name}")
+
+    def load(self, path):
+        try:
+            move = load_move(path)
+        except MoveFileError as e:
+            self._status(str(e))
+            return False
+        self.move = move
+        self.smooth_var.set(move.get("smooth") is True)       # a file without the setting plays as before
+        self.assist_gyro_var.set(bool(move.get("assist_gyro", True)))        # drive steps: both assists on unless the file says no
+        self.assist_enc_var.set(bool(move.get("assist_encoders", True)))
+        self._refresh()
+        errors = self.errors()
+        self._status(f"Opened {Path(path).name}" + (f" - {len(errors)} problem(s), it will not play: {errors[0]}" if errors else ""))
+        return True
+
+    # ---- playing -------------------------------------------------------
+    def play(self):
+        errors = self.errors()
+        if errors:
+            self._status(errors[0] + (f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""))
+            return False
+        if self.player.active:
+            return False
+        started = self.player.start(self.move, time.monotonic())
+        self._status(self.player.status)
+        return started
+
+    def stop(self):
+        was_playing = self.player.active
+        self.player.abort("stopped by you")
+        if not was_playing:
+            self.car.stop()
+        self._status(self.player.status if was_playing else "Stopped")
+
+    def _tick(self):
+        if self.win is None:
+            return
+        self.player.tick(time.monotonic())
+        if self.player.active or self._was_active:
+            self._status(self.player.status)
+        self._was_active = self.player.active
+        self.win.after(50, self._tick)
+
+    def close(self):
+        if self.win is None:
+            return
+        self.player.abort("window closed")
+        self.app.moves_window = None
+        win, self.win = self.win, None
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    # ---- the buttons: ask, then call the methods above -----------------
+    def _ask(self, title, prompt, **kw):
+        return simpledialog.askfloat(title, prompt, parent=self.win, **kw)
+
+    def _add_arm_dialog(self):
+        wait = self._ask("Arm pose", "Pause after the arm arrives (seconds):", initialvalue=0.5, minvalue=0, maxvalue=MAX_WAIT_S)
+        if wait is not None:
+            self.add_arm_pose(wait)
+
+    def _add_drive_dialog(self, speed):
+        cm = self._ask(f"Drive at {speed}%", f"Distance in cm, counted by the wheel encoders (negative = backwards, up to {MAX_DRIVE_CM}):",
+                       minvalue=-MAX_DRIVE_CM, maxvalue=MAX_DRIVE_CM)
+        if cm:
+            self.add_drive(cm, speed)
+
+    def _add_turn_dialog(self):
+        deg = self._ask("Turn", f"Degrees (positive = left, up to {MAX_TURN_DEG}):", minvalue=-MAX_TURN_DEG, maxvalue=MAX_TURN_DEG)
+        if deg:
+            self.add_turn(deg)
+
+    def _add_wait_dialog(self):
+        seconds = self._ask("Wait", "Seconds:", minvalue=0.1, maxvalue=MAX_WAIT_S)
+        if seconds:
+            self.add_wait(seconds)
+
+    def _edit_dialog(self):
+        i = self._selected()
+        if i is None:
+            return
+        step = self.move["steps"][i]
+        if step.get("type") == "arm":
+            self.recapture_selected_pose()
+            self._status("The pose was replaced by the sliders' current angles and speeds.")
+            return
+        field = {"drive": "cm", "turn": "deg", "wait": "seconds"}.get(step.get("type"))
+        if field:
+            value = self._ask("Edit step", f"New {field}:", initialvalue=step.get(field))
+            if value:
+                self.edit_selected_value(value)
+
+    def _play_dialog(self):
+        if messagebox.askokcancel("Play moves", "The arm and the car will move. Is the area clear?", parent=self.win):
+            self.play()
+
+    def _save_dialog(self):
+        MOVES_DIR.mkdir(exist_ok=True)
+        path = filedialog.asksaveasfilename(parent=self.win, initialdir=MOVES_DIR, defaultextension=".json",
+                                            initialfile=self.move.get("name", "untitled") + ".json", filetypes=[("Moves", "*.json")])
+        if path:
+            self.save(Path(path))
+
+    def _open_dialog(self):
+        path = filedialog.askopenfilename(parent=self.win, initialdir=MOVES_DIR, filetypes=[("Moves", "*.json")])
+        if path:
+            self.load(Path(path))
+
+
 # ---------------------------------------------------------------- dashboard
 class RangeSlider(tk.Canvas):
     """A slider with two handles: drag either end to set the lowest and highest value (whole numbers)."""
@@ -1300,8 +1629,17 @@ class Dashboard:
         self.tracker = PathTracker()
         self.runner = PathRunner(self.tracker, self._runner_send, lambda: int(self.car_speed.get()),
                                  lambda: self.dist_cm, self._runner_finished)
+        self.runner_ok = True          # how the last drive/turn run ended (the Moves player reads this)
+        # the car's own encoder drive (command M<cm> <speed>): it reports a state number with every encoder reading
+        self.encoder_seq = 0           # encoder readings received so far
+        self.drive_state = 0           # 0 idle, 1 driving, 2 stopping, 3 failed (stalled or too slow)
+        self.drive_failed = False
+        self.drive_wait_seq = None     # encoder_seq when the drive command was sent; None = no drive is being waited for
+        self.drive_deadline = 0.0
+        self._applying_servo = False   # True while send_servo_command moves the sliders itself (their callbacks must not send)
         self.path_window = None
         self.pulse_window = None
+        self.moves_window = None
         self.dist_cm = None            # latest distance reading, None = nothing in range
         self.gz = 0.0                  # latest turning speed (deg/s)
         self._yaw_resync = True        # the car's yaw was zeroed / it rebooted: don't treat the jump as a turn
@@ -1359,6 +1697,7 @@ class Dashboard:
         self.cam_badge.pack(side="right", padx=(0, 8))
         self._button(header, "Path map", self.open_path_window).pack(side="right", padx=(0, 8))
         self._button(header, "Pulse chart", self.open_pulse_window).pack(side="right", padx=(0, 8))
+        self._button(header, "Moves", self.open_moves_window).pack(side="right", padx=(0, 8))
 
         # camera column
         left = tk.Frame(root, bg=BG)
@@ -1548,12 +1887,6 @@ class Dashboard:
         rail_row = tk.Frame(s, bg=CARD)
         rail_row.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(4, 0))
         tk.Label(rail_row, textvariable=self.rail_text, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
-        self.elbow_bypass_var = tk.BooleanVar(value=False)       # always starts off; the car's bypass is off after any restart
-        tk.Checkbutton(
-            rail_row, text="Bypass elbow limit (arm can break)", variable=self.elbow_bypass_var, command=self._elbow_bypass_toggled,
-            bg=CARD, fg=BAD, selectcolor=CARD_HI, activebackground=CARD, activeforeground=BAD, highlightthickness=0, bd=0,
-            takefocus=0, anchor="e", font=(FONT, 9), cursor="hand2",
-        ).pack(side="right")
         self.rail_alert_label = tk.Label(rail_row, textvariable=self.rail_alert, bg=CARD, fg=WARN, font=(FONT, 10, "bold"))
         self.rail_alert_label.pack(side="right")
         # overload guard controls: switch, and the sag (in mV) at which the car slows down / stops the servos
@@ -1580,6 +1913,13 @@ class Dashboard:
         for sc in (self.sag_slow, self.sag_stop):
             sc.bind("<ButtonRelease-1>", lambda e: self._send_guard())
         self._button(guard_row, "Reset max", self._reset_sag_peak).pack(side="right")
+        # the elbow-limit bypass sits here, not beside the supply alert above (their texts ran into each other)
+        self.elbow_bypass_var = tk.BooleanVar(value=False)       # always starts off; the car's bypass is off after any restart
+        tk.Checkbutton(
+            guard_row, text="Bypass elbow limit (arm can break)", variable=self.elbow_bypass_var, command=self._elbow_bypass_toggled,
+            bg=CARD, fg=BAD, selectcolor=CARD_HI, activebackground=CARD, activeforeground=BAD, highlightthickness=0, bd=0,
+            takefocus=0, anchor="e", font=(FONT, 9), cursor="hand2",
+        ).pack(side="right", padx=(0, 14))
         tk.Label(guard_row, textvariable=self.guard_levels_var, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(16, 0))
 
         style = ttk.Style()
@@ -1722,11 +2062,13 @@ class Dashboard:
 
     def _on_encoder(self, _sender, data):
         try:
-            lt, rt, lcm, rcm, lv, rv = (float(v) for v in bytes(data).decode("ascii").split(","))
+            values = [float(v) for v in bytes(data).decode("ascii").split(",")]
+            lt, rt, lcm, rcm, lv, rv = values[:6]
         except ValueError:
             return
+        drive_state = int(values[6]) if len(values) > 6 else 0       # the car's encoder drive: 0 idle, 1 driving, 2 stopping, 3 failed
         stamp = time.monotonic()
-        self._post(lambda: self._show_encoder(lcm, rcm, lv, rv, stamp))
+        self._post(lambda: (self._note_drive_state(drive_state), self._show_encoder(lcm, rcm, lv, rv, stamp)))
 
     def _on_servo_status(self, _sender, data):
         # "numbers,...;limit message": the car sends the text of any limit that is acting (the elbow's limit depends on the shoulder)
@@ -1976,6 +2318,8 @@ class Dashboard:
         if message in ("U", "D", "L", "R", "S"):
             if self.runner.active and not self._runner_sending:
                 self.runner.abort("manual control")       # you touched the controls: take over
+            if self.moves_window is not None and self.moves_window.player.active and not self._runner_sending:
+                self.moves_window.player.abort("manual control")
             self.tracker.set_command(message)
         elif message in ("Z", "C"):
             self._yaw_resync = True                        # the car zeroes its heading on these
@@ -2009,6 +2353,12 @@ class Dashboard:
             self.pulse_window = PulseWindow(self)
         else:
             self.pulse_window.win.lift()
+
+    def open_moves_window(self):
+        if self.moves_window is None:
+            self.moves_window = MovesWindow(self)
+        else:
+            self.moves_window.win.lift()
 
     def _path_ready(self):
         if not self.connected.is_set():
@@ -2048,9 +2398,42 @@ class Dashboard:
     def turn_by(self, delta):
         """Turn in place by `delta` degrees (+ = left) using the gyro, then report how close it got."""
         if not self._path_ready() or self.runner.active:
-            return
+            return False
         self._send("S")
-        self.runner.start([["turn_to", self.tracker.heading + delta]], f"Turn {delta:+d}°", time.monotonic())
+        return self.runner.start([["turn_to", self.tracker.heading + delta]], f"Turn {delta:+g}°", time.monotonic())
+
+    def drive_encoder(self, cm, pct, assist=3):
+        """Drive `cm` straight (+ forward, - back) at `pct` percent speed. The car counts its own wheel encoders (no Bluetooth
+        delay, so even a 5 cm drive is exact) and stops where the distance says. `assist` is the straight-drive assist for this
+        drive only (1 = gyro heading, 2 = encoders; 3 = both, 0 = none); the car puts its own setting back afterwards.
+        Returns whether the command was sent."""
+        if not self.connected.is_set() or self.runner.active:
+            return False
+        self.drive_failed = False
+        self.drive_wait_seq = self.encoder_seq
+        self.drive_deadline = time.monotonic() + 5.0 + abs(cm) / 3.0    # slower than 3 cm/s overall: something is wrong
+        self._send(f"M{cm:g} {pct} {assist}")
+        return True
+
+    def _note_drive_state(self, state):
+        """Every encoder reading carries the car's drive state (0 idle, 1 driving, 2 stopping, 3 failed)."""
+        self.drive_state = state
+        self.encoder_seq += 1
+        if state == 3:
+            self.drive_failed = True
+
+    def drive_busy(self):
+        """True from the drive command until the car has reported idle. It has to report at least twice after the command, so a
+        short drive that is already over by the first reading is not mistaken for one that never started."""
+        if self.drive_wait_seq is None:
+            return False
+        if time.monotonic() > self.drive_deadline:
+            self.drive_failed, self.drive_wait_seq = True, None          # no word from the car: give up waiting
+            return False
+        if self.drive_state != 0 or self.encoder_seq < self.drive_wait_seq + 2:
+            return True
+        self.drive_wait_seq = None
+        return False
 
     def path_run_plan(self, waypoints):
         """Drive from here through the waypoints clicked on the map (recorded, so it can be returned along)."""
@@ -2066,6 +2449,7 @@ class Dashboard:
 
     def path_abort(self):
         self.runner.abort("aborted by you")
+        self.drive_wait_seq = None          # the S below also ends a drive the car is running by itself
         self._send("S")
 
     def path_clear(self):
@@ -2076,6 +2460,7 @@ class Dashboard:
             self.path_window.refresh(force=True)
 
     def _runner_finished(self, ok):
+        self.runner_ok = ok
         self.tracker.recording, self.tracker.phase = True, "out"
         if ok and self.runner.label == "Return":
             self.tracker.corners = [(self.tracker.x, self.tracker.y)]   # back home: nothing left to undo
@@ -2238,18 +2623,29 @@ class Dashboard:
         var.set(f"{int(float(value))}°/s")
         # the car only learns a servo's speed together with an angle command, so send the current target again with the new
         # speed: a servo that is on its way changes speed at once instead of keeping the old one until the next move
-        if index in self.servo_commanded:
+        if index in self.servo_commanded and not self._applying_servo:
             self._send_servo_throttled(index)
 
     def _send_servo(self, index):
-        angle = int(self.servo_scales[index].get())
+        self.send_servo_command(index, int(self.servo_scales[index].get()), int(self.speed_scales[index].get()))
+
+    def send_servo_command(self, index, angle, speed):
+        """Move servo `index` to `angle` at `speed` deg/s the way the sliders do (the Moves player uses this too). The sliders
+        follow, so what you see, and what 'Add arm pose' captures, is where the arm was sent."""
+        self._applying_servo = True
+        try:
+            self.servo_scales[index].set(angle)
+            self.speed_scales[index].set(speed)
+        finally:
+            self._applying_servo = False
+        last = None
         if self.connected.is_set() and index not in self.servo_commanded:
             # first command to this servo since the car (re)started: it is idle, so tell it where the arm was left first,
             # and it glides from there at the set speed instead of snapping to the target
             self.servo_commanded.add(index)
-            if str(index) in self.last_angles:
-                self._send(f"H{index} {self.last_angles[str(index)]}")
-        self._send(f"V{index} {angle} {int(self.speed_scales[index].get())}")
+            last = self.last_angles.get(str(index))
+        for command in servo_commands(index, angle, speed, last):
+            self._send(command)
         if self.connected.is_set():
             self.last_angles[str(index)] = angle
             self._schedule_servo_memory_save()
@@ -2303,6 +2699,8 @@ class Dashboard:
         self.root.withdraw()            # the window disappears at once; the car link is closed properly in the background
         self.stop_event.set()
         self.camera.stop_event.set()
+        if self.moves_window is not None:
+            self.moves_window.close()       # stops a move that is playing
         if self.pulse_window is not None:
             self.pulse_window.close()       # lets go of the car's COM port
         # The Bluetooth thread is a daemon thread: if the program exits now it is killed before it can disconnect, and the car
