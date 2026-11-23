@@ -85,3 +85,18 @@ Each stage gets its own plan.
 
 Window layout and key bindings; the exact JSON field names; how the player waits for a servo to arrive (the firmware reports angles); the calibration screen;
 the numbers listed above; what the status line says.
+
+## Stage 2a: the trained model in the dashboard (approved 2026-11-24)
+
+The first piece of Stage 2: run the v2.1 paper-ball model on the live camera picture and show what it finds. No driving yet.
+
+- `Embedded/ball_detector.py`: the model code (picture prepared with the same letterbox as the phone app, the output decoded and
+  de-duplicated), a drawing helper and a background worker. The model is `Training/paper_ball_detector/roboflow-paperball.onnx`,
+  read with the OpenCV the dashboard already has (about 32 ms a picture on this laptop). The worker takes the newest camera frame,
+  skips frames while it is busy, and loads the model only when detection is first switched on.
+- In the camera card: a **"Detect paper balls"** checkbox (off by default), a minimum-confidence slider (0.25 to 0.90, default 0.50),
+  a status line ("2 balls, best 87%, 31 ms"), and a **"Test on a photo..."** button that runs the same model on a picture from disk
+  and shows the result in the camera area (so the model can be checked while the camera is down), with a "Back to live" button.
+- Boxes are drawn in green with their scores, the best one thicker. The model is shared by the live worker and the photo test and
+  runs one picture at a time.
+- Not in this stage: distance from the picture, steering the car, saving detections.
