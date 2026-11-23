@@ -198,6 +198,7 @@ int motorSpeedPct = 100;    // wheel speed for driving straight (U, D), percent
 int turnSpeedPct = 70;      // wheel speed for turning on the spot (L, R), percent
 int turnPctNow = -1;        // power override while a closed-loop turn (Y command) is running, -1 = use turnSpeedPct
 bool turnActive = false;    // a closed-loop turn on the gyro is running (see updateTurn)
+int drivePctNow = -1;       // power override while a drive by encoder distance (M command, see updateDrive) runs, -1 = use motorSpeedPct
 int motorState[4] = {0, 0, 0, 0};  // last requested direction (1 = on) for LU, LD, RU, RD
 
 // Straight-drive assist (see updateStraightAssist): power scale of each side, 1.0 = full. The faster side is
@@ -433,7 +434,7 @@ void motors(int lu, int ld, int ru, int rd) {
     else stopRamp = softStopFrom * (1.0f - (float)elapsed / (float)SOFT_STOP_MS);
   }
 
-  int pct = turning ? (turnPctNow >= 0 ? turnPctNow : turnSpeedPct) : motorSpeedPct;
+  int pct = turning ? (turnPctNow >= 0 ? turnPctNow : turnSpeedPct) : (drivePctNow >= 0 ? drivePctNow : motorSpeedPct);
   uint32_t duty = MOTOR_PWM_MAX * pct / 100;
   for (int i = 0; i < 4; i++) {
     float scale = (i < 2) ? leftScale : rightScale;  // MOTOR_PINS = {LU, LD, RU, RD}: 0,1 = left side, 2,3 = right
@@ -454,6 +455,139 @@ void updateSoftStart() {
   motors(motorState[0], motorState[1], motorState[2], motorState[3]);
 }
 
+// ---- Drive by encoder distance: command M<cm> <speed %> ----
+// The car counts the wheel encoders itself (no Bluetooth delay, so even a 5 cm drive is exact) and stops where the distance
+// says, allowing for the distance it still rolls after the stop command. That allowance is a time at the current speed, learned
+// from every drive (one value for the 50% class and one for the 100% class). The encoders are only accurate at 50% and 100%
+// power (measured against a tape), which is what the dashboard offers. The drive state goes to the dashboard as the 7th number
+// of every encoder reading: 0 idle, 1 driving, 2 stopping (waiting for the car to stand still), 3 failed (stalled or too slow).
+const int DRIVE_MIN_PCT = 20;
+const float DRIVE_MAX_CM = 300.0f;
+int driveState = 0;
+float driveTargetCm = 0;                           // + forward, - back
+const float DRIVE_SHORT_CM = 15.0f;                // drives shorter than this end while the car is still speeding up (see driveCoastSec)
+int driveCls = 1;                                  // coast class of the running drive: +1 from 75% power, +2 for a short drive
+long driveStartL = 0, driveStartR = 0;             // encoder ticks when the drive began
+float driveLastCm = 0, driveSpeedCmS = 0, driveStopSpeed = 0;
+unsigned long driveBeganMs = 0, driveSampleMs = 0, driveProgressMs = 0, driveStillSince = 0, driveStopMs = 0, driveEndMs = 0;
+float driveCoastSec[4] = {0.20f, 0.15f, 0.28f, 0.22f};   // how long the car rolls on after the stop command, as a time at its speed
+// Four classes: [0] 50% long, [1] 100% long, [2] 50% short, [3] 100% short (first guesses; each drive corrects its own class, kept
+// until restart). Short drives get their own values because the speed the car measures lags behind while it is still speeding up,
+// which makes it stop a little late: a 5 cm drive needs a longer allowance than a 30 cm drive at the same power.
+
+void driveWheelCm(float &left, float &right) {     // distance each wheel covered in the direction of the drive
+  noInterrupts();
+  long l = encoderLeftTicks, r = encoderRightTicks;
+  interrupts();
+  left = (l - driveStartL) * ENCODER_CM_PER_TICK;
+  right = (r - driveStartR) * ENCODER_CM_PER_TICK;
+  if (driveTargetCm < 0) {
+    left = -left;
+    right = -right;
+  }
+}
+
+int driveSavedMode = 0;                            // the straight-assist setting (G command) to put back when a drive that set its own ends
+bool driveModeChanged = false;
+
+void endDrive(int state) {                         // 0 = idle; 3 = failed, which stays reported for a moment so the dashboard sees it
+  driveState = state;
+  drivePctNow = -1;
+  driveEndMs = millis();
+  if (driveModeChanged) {
+    straightMode = driveSavedMode;
+    driveModeChanged = false;
+  }
+}
+
+// mode: straight-assist setting for this drive only (1 = gyro heading, 2 = encoders, 3 = both, 0 = none); -1 = keep the current one.
+void startDrive(float cm, int pct, int mode) {
+  if (driveModeChanged) {                          // a drive that is still running set its own mode: put the real one back first
+    straightMode = driveSavedMode;
+    driveModeChanged = false;
+  }
+  if (mode >= 0 && mode <= 3) {
+    driveSavedMode = straightMode;
+    straightMode = mode;
+    driveModeChanged = true;
+  }
+  turnActive = false;                              // a drive takes over from a closed-loop turn
+  turnPctNow = -1;
+  driveTargetCm = cm;
+  drivePctNow = pct;
+  driveCls = (pct >= 75 ? 1 : 0) + (fabsf(cm) < DRIVE_SHORT_CM ? 2 : 0);
+  noInterrupts();
+  driveStartL = encoderLeftTicks;
+  driveStartR = encoderRightTicks;
+  interrupts();
+  driveBeganMs = driveSampleMs = driveProgressMs = millis();
+  driveLastCm = 0;
+  driveSpeedCmS = 0;
+  driveStillSince = 0;
+  driveState = 1;
+  Serial.printf("Drive %.1f cm at %d%% (coast %.2f s, straight assist %d)\n", cm, pct, driveCoastSec[driveCls], straightMode);
+  if (cm > 0) motors(1, 0, 1, 0); else motors(0, 1, 0, 1);
+}
+
+void updateDrive() {
+  if (driveState == 0) return;
+  unsigned long now = millis();
+  if (driveState == 3) {
+    if (now - driveEndMs > 700) driveState = 0;
+    return;
+  }
+  float dl, dr;
+  driveWheelCm(dl, dr);
+  float done = (dl + dr) / 2.0f;                   // how far the car went (both wheels averaged)
+  // Speed and arrival are judged from the SLOWER wheel: an encoder that chatters on a slot edge while the motors start to
+  // hum adds ticks without the wheel moving, and one such wheel must not make a short drive look finished.
+  float sure = dl < dr ? dl : dr;
+  if (now - driveSampleMs >= 100) {                // speed along the drive, smoothed, from the last 100 ms
+    float inst = (sure - driveLastCm) / ((now - driveSampleMs) / 1000.0f);
+    driveSpeedCmS = 0.5f * driveSpeedCmS + 0.5f * inst;
+    if (fabsf(inst) > 0.5f) driveProgressMs = now;
+    driveLastCm = sure;
+    driveSampleMs = now;
+  }
+  if (driveState == 1) {
+    float remaining = fabsf(driveTargetCm) - sure;
+    // never "arrived" in the first 150 ms: the motors have only just started (the soft start begins at 40% power)
+    bool arrived = now - driveBeganMs >= 150 && remaining <= (driveSpeedCmS > 0 ? driveSpeedCmS : 0.0f) * driveCoastSec[driveCls];
+    bool stalled = now - driveProgressMs > 1500;   // the wheels hum and do not turn
+    bool tooSlow = now - driveBeganMs > 3000UL + (unsigned long)(fabsf(driveTargetCm) * 250.0f);   // under 4 cm/s overall
+    if (arrived || stalled || tooSlow) {
+      driveStopSpeed = driveSpeedCmS;
+      driveStopMs = now;
+      motors(0, 0, 0, 0);
+      Serial.printf("Drive stop command after %lu ms: left %.1f cm, right %.1f cm, speed %.1f cm/s, still to go %.1f cm\n",
+                    now - driveBeganMs, dl, dr, driveSpeedCmS, remaining);
+      if (arrived) {
+        driveState = 2;
+        driveStillSince = 0;
+      } else {
+        Serial.printf("Drive failed: %s (covered %.1f of %.1f cm)\n", stalled ? "the wheels did not move" : "too slow", done, fabsf(driveTargetCm));
+        endDrive(3);
+      }
+    }
+    return;
+  }
+  // state 2: the stop command is out; once the car stands still, learn from the distance it really covered
+  if (fabsf(driveSpeedCmS) < 0.5f) {
+    if (driveStillSince == 0) driveStillSince = now;
+  } else {
+    driveStillSince = 0;
+  }
+  if ((driveStillSince != 0 && now - driveStillSince >= 400) || now - driveStopMs > 3000) {
+    float over = done - fabsf(driveTargetCm);      // + = it went past the target
+    if (driveStopSpeed > 2.0f) {                   // learn, but never jump: one odd drive must not ruin the next ones
+      float step = constrain(0.6f * over / driveStopSpeed, -0.05f, 0.05f);
+      driveCoastSec[driveCls] = constrain(driveCoastSec[driveCls] + step, 0.03f, 0.8f);
+    }
+    Serial.printf("Drive done: asked %.1f cm, covered %.1f cm (%+.1f), coast class %d now %.2f s\n", fabsf(driveTargetCm), done, over, driveCls, driveCoastSec[driveCls]);
+    endDrive(0);
+  }
+}
+
 void handleCommand(String message) {
   message.trim();
   if (message.length() == 0) return;
@@ -467,6 +601,7 @@ void handleCommand(String message) {
     if (command == 'U' || command == 'D' || command == 'L' || command == 'R' || command == 'S') {
       turnActive = false;   // any drive command takes over from a closed-loop turn
       turnPctNow = -1;
+      if (driveState == 1 || driveState == 2) endDrive(0);   // ... and from a drive by encoder distance (S stops it)
     }
     switch (command) {
       case 'U': motors(1, 0, 1, 0); break;
@@ -495,7 +630,22 @@ void handleCommand(String message) {
   // Straight-drive assist: G0 = off, G1 = gyro, G2 = encoders, G3 = both.
   if (message.charAt(0) == 'G' && message.length() == 2 && message.charAt(1) >= '0' && message.charAt(1) <= '3') {
     straightMode = message.charAt(1) - '0';
+    driveModeChanged = false;                       // your choice stands: a drive that is running does not put the old mode back
     Serial.printf("Straight assist mode %d (1 = gyro, 2 = encoders, 3 = both, 0 = off)\n", straightMode);
+    return;
+  }
+
+  // Drive by encoder distance: M<cm> <speed %> [<assist>]: cm + forward / - back, up to 300, speed 20..100 (the dashboard offers
+  // 50 and 100); assist 0..3 = the straight-assist setting for this drive only (like G), left out = the current G setting.
+  if (message.charAt(0) == 'M') {
+    float cm = 0;
+    int pct = 0, mode = -1;
+    int got = sscanf(message.c_str() + 1, "%f %d %d", &cm, &pct, &mode);
+    if (got >= 2 && cm != 0 && fabsf(cm) <= DRIVE_MAX_CM && pct >= DRIVE_MIN_PCT && pct <= 100 && (got == 2 || (mode >= 0 && mode <= 3))) {
+      startDrive(cm, pct, got == 3 ? mode : -1);
+    } else {
+      Serial.printf("Bad drive command: %s\n", message.c_str());
+    }
     return;
   }
 
@@ -912,6 +1062,7 @@ float wrapDeg(float a) {
 }
 
 void startTurn(float delta) {
+  if (driveState == 1 || driveState == 2) endDrive(0);     // a turn takes over from a drive by encoder distance
   if (delta == 0 || !mpuOk) {
     if (turnActive) { motors(0, 0, 0, 0); }
     turnActive = false;
@@ -1087,9 +1238,9 @@ void updateEncoders() {
   lastEncoderLeftTicks = left;
   lastEncoderRightTicks = right;
 
-  char buf[80];
-  snprintf(buf, sizeof(buf), "%ld,%ld,%.1f,%.1f,%.1f,%.1f",
-           left, right, left * ENCODER_CM_PER_TICK, right * ENCODER_CM_PER_TICK, leftSpeed, rightSpeed);
+  char buf[96];
+  snprintf(buf, sizeof(buf), "%ld,%ld,%.1f,%.1f,%.1f,%.1f,%d",
+           left, right, left * ENCODER_CM_PER_TICK, right * ENCODER_CM_PER_TICK, leftSpeed, rightSpeed, driveState);
   Serial.printf("Encoder: %s\n", buf);
 
   if (deviceConnected && pEncoderCharacteristic) {
@@ -1320,6 +1471,7 @@ class ServerCallbacks: public BLEServerCallbacks {
     deviceConnected = false;
     turnActive = false;
     turnPctNow = -1;
+    endDrive(0);
     motors(0, 0, 0, 0);
     Serial.println("BLE Client Disconnected");
     BLEDevice::startAdvertising();
@@ -1505,6 +1657,7 @@ void loop() {
   updateTurn();
   notifyMpu();
   updateEncoders();
+  updateDrive();
   updatePulseLog();
   updateSoftStart();
   updateStraightAssist();
