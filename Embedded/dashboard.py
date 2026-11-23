@@ -29,6 +29,7 @@ import numpy as np
 from bleak import BleakClient, BleakScanner
 from PIL import Image, ImageTk
 
+from ball_detector import DetectorWorker, draw_detections, summarize
 from moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, MoveFileError, MovePlayer, arm_step, describe_step,
                    drive_step, load_move, new_move, save_move, turn_step, validate_move, wait_step)
 
@@ -1623,6 +1624,10 @@ class Dashboard:
         self.run_status_var = tk.StringVar(value="")       # progress of turns / planned path / return
         self.photo = None
         self.last_frame_id = -1
+        self.test_photo = None             # a picture the model was tested on (RGB, boxes drawn); shown instead of the live camera
+        self.detect_var = tk.BooleanVar(value=False)      # "Detect paper balls": off until you tick it
+        self.detect_status_var = tk.StringVar(value="")
+        self.detect_conf_var = tk.StringVar(value="50%")
         self.saved = 0
 
         # Path map: dead reckoning from the gyro heading + wheel-encoder distance
@@ -1651,6 +1656,8 @@ class Dashboard:
 
         self.camera = CameraWorker(CAMERA_HOST, CAMERA_PORT)
         self.camera.start()
+        self.detector = DetectorWorker(self.camera)       # the trained paper-ball model; loaded only when first used
+        self.detector.start()
         if "--no-ble" in sys.argv:  # test switch: camera only, to see if Bluetooth slows the WiFi
             self.car_text.set("BLE disabled (--no-ble)")
         else:
@@ -1704,21 +1711,7 @@ class Dashboard:
         left.grid(row=1, column=0, sticky="nsew", padx=(16, 8))
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
-        cam_card, cam_body = self._card(left, "Camera")
-        cam_card.grid(row=0, column=0, sticky="nsew")
-        self.video = tk.Label(cam_body, bg="#000000", fg=MUTED, font=(FONT, 12), text="No camera signal")
-        self.video.pack(fill="both", expand=True)
-        self.video.bind("<Configure>", lambda e: setattr(self, "last_frame_id", -1))
-        bar = tk.Frame(cam_body, bg=CARD)
-        bar.pack(fill="x", pady=(8, 0))
-        self._button(bar, "Save frame", self._save_frame).pack(side="left")
-        tk.Label(bar, text="Rotate", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(16, 4))
-        combo = ttk.Combobox(bar, textvariable=self.rotate_var, values=list(ROTATIONS), width=6, state="readonly")
-        combo.pack(side="left")
-        combo.bind("<<ComboboxSelected>>", lambda e: setattr(self.camera, "rotate", ROTATIONS[self.rotate_var.get()]))
-        self.cam_info = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=(FONT, 9))
-        self.cam_info.pack(side="right")
-        tk.Label(bar, textvariable=self.run_status_var, bg=CARD, fg=WARN, font=(FONT, 10, "bold")).pack(side="left", padx=(16, 0))
+        self._build_camera_card(left)
 
         # right column
         right = tk.Frame(root, bg=BG)
@@ -1977,8 +1970,56 @@ class Dashboard:
         color = GOOD if self.connected.is_set() else (WARN if "Searching" in self.car_text.get() or "Connecting" in self.car_text.get() else BAD)
         self._set_dot(self.car_badge, color)
 
+    def _build_camera_card(self, parent):
+        """The camera picture and its controls. Returns the card's body frame.
+
+        The control rows are packed first, at the bottom: a window that is too short then cuts the picture, never the controls.
+        The rows are narrow, and the status text takes whatever room is left (width=1 and stretching), so a longer message can
+        never widen the card and squeeze the cards on its right."""
+        cam_card, cam_body = self._card(parent, "Camera")
+        cam_card.grid(row=0, column=0, sticky="nsew")
+        self.video = tk.Label(cam_body, bg="#000000", fg=MUTED, font=(FONT, 12), text="No camera signal")
+        self.video.bind("<Configure>", lambda e: setattr(self, "last_frame_id", -1))
+        det_row2 = tk.Frame(cam_body, bg=CARD)
+        det_row2.pack(side="bottom", fill="x", pady=(2, 0))
+        det_row1 = tk.Frame(cam_body, bg=CARD)
+        det_row1.pack(side="bottom", fill="x", pady=(6, 0))
+        bar = tk.Frame(cam_body, bg=CARD)
+        bar.pack(side="bottom", fill="x", pady=(8, 0))
+        self.video.pack(side="top", fill="both", expand=True)
+
+        self._button(bar, "Save frame", self._save_frame).pack(side="left")
+        tk.Label(bar, text="Rotate", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(16, 4))
+        combo = ttk.Combobox(bar, textvariable=self.rotate_var, values=list(ROTATIONS), width=6, state="readonly")
+        combo.pack(side="left")
+        combo.bind("<<ComboboxSelected>>", lambda e: setattr(self.camera, "rotate", ROTATIONS[self.rotate_var.get()]))
+        self.cam_info = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=(FONT, 9))
+        self.cam_info.pack(side="right")
+        tk.Label(bar, textvariable=self.run_status_var, bg=CARD, fg=WARN, font=(FONT, 10, "bold")).pack(side="left", padx=(16, 0))
+
+        # the trained paper-ball model: boxes on the live picture, and a test on a photo from disk
+        tk.Checkbutton(
+            det_row1, text="Detect paper balls", variable=self.detect_var, command=self._detect_toggled, bg=CARD, fg=TEXT,
+            selectcolor=CARD_HI, activebackground=CARD, activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0,
+            anchor="w", font=(FONT, 9), cursor="hand2",
+        ).pack(side="left")
+        tk.Label(det_row1, text="confidence", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(12, 4))
+        conf_scale = self._scale(det_row1, 25, 90, 50, self._detect_conf_changed, thin=True)
+        conf_scale.configure(length=100)
+        conf_scale.pack(side="left")
+        tk.Label(det_row1, textvariable=self.detect_conf_var, bg=CARD, fg=ACCENT, font=(FONT, 9, "bold"), width=4).pack(side="left")
+        self._button(det_row2, "Test on a photo...", self._test_photo_dialog).pack(side="left")
+        self._button(det_row2, "Back to live", self.back_to_live).pack(side="left", padx=(6, 0))
+        tk.Label(det_row2, textvariable=self.detect_status_var, bg=CARD, fg=GOOD, font=(FONT, 9, "bold"), width=1,
+                 anchor="w").pack(side="left", fill="x", expand=True, padx=(12, 0))
+        return cam_body
+
     def _refresh_camera(self):
-        fid, rgb = self.camera.snapshot()
+        showing_photo = self.test_photo is not None
+        if showing_photo:
+            fid, rgb = -2, self.test_photo     # a still picture: drawn once, and again only when the window is resized
+        else:
+            fid, rgb = self.camera.snapshot()
         if rgb is None:
             if not self.camera.connected:
                 self.video.configure(image="", text="No camera signal")
@@ -1987,6 +2028,13 @@ class Dashboard:
         if fid == self.last_frame_id:
             return
         self.last_frame_id = fid
+        if not showing_photo and self.detect_var.get():
+            self._show_detector_error()
+            result = self.detector.latest()
+            if result is not None:
+                if result[0] >= fid - 5:       # the model's answer for a frame from the last moments: draw it on this one
+                    rgb = draw_detections(rgb, result[1])
+                self.detect_status_var.set(summarize(result[1], result[2]))
         w, h = self.video.winfo_width(), self.video.winfo_height()
         if w < 20 or h < 20:
             return
@@ -1996,10 +2044,68 @@ class Dashboard:
         img = Image.fromarray(rgb).resize(size, Image.BILINEAR)
         self.photo = ImageTk.PhotoImage(img)
         self.video.configure(image=self.photo, text="")
+        if showing_photo:
+            return
         with self.camera.lock:
             kb = len(self.camera.last_jpeg or b"") / 1000
         # Link speed = frame size x FPS: big (detailed / close-up) frames mean few FPS on the same link.
         self.cam_info.configure(text=f"{iw}×{ih}  ·  {kb:.0f} KB/frame  ·  link {self.camera.link_kbps:.0f} KB/s")
+
+    # ---- the trained paper-ball model ----------------------------------
+    def _detect_toggled(self):
+        """The 'Detect paper balls' checkbox."""
+        self.detector.enabled = bool(self.detect_var.get())
+        if self.detector.enabled:
+            self.detector.error = ""
+            self.detect_status_var.set("starting the model ...")
+        else:
+            self.detect_status_var.set("")
+
+    def _detect_conf_changed(self, value):
+        pct = int(float(value))
+        self.detector.conf = pct / 100.0
+        self.detect_conf_var.set(f"{pct}%")
+
+    def _show_detector_error(self):
+        """If the model could not be loaded the worker switches itself off: untick the box and say why, once."""
+        if self.detector.error:
+            self.detect_var.set(False)
+            self.detect_status_var.set(self.detector.error)
+            self.detector.error = ""
+
+    def show_test_photo(self, path):
+        """Run the model on a picture from disk and show it, with the boxes, in the camera area (the camera does not have to
+        be working). Returns whether it worked."""
+        try:
+            data = np.fromfile(str(path), np.uint8)           # (reads any path, also one with special characters)
+        except OSError:
+            data = np.empty(0, np.uint8)
+        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+        if bgr is None:
+            self.detect_status_var.set(f"Cannot read {Path(path).name} as a picture")
+            return False
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        try:
+            found, ms = self.detector.detect_now(rgb)
+        except Exception as e:
+            self.detect_status_var.set(f"Cannot run the model: {e}")
+            return False
+        self.test_photo = draw_detections(rgb, found)
+        self.last_frame_id = -1                               # redraw the camera area now
+        self.detect_status_var.set(f"photo: {summarize(found, ms)}")
+        return True
+
+    def back_to_live(self):
+        self.test_photo = None
+        self.last_frame_id = -1
+        self.detect_status_var.set("")
+
+    def _test_photo_dialog(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Test the paper-ball model on a photo",
+            filetypes=[("Pictures", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")])
+        if path:
+            self.show_test_photo(path)
 
     def _save_frame(self):
         with self.camera.lock:
@@ -2699,6 +2805,7 @@ class Dashboard:
         self.root.withdraw()            # the window disappears at once; the car link is closed properly in the background
         self.stop_event.set()
         self.camera.stop_event.set()
+        self.detector.stop_event.set()
         if self.moves_window is not None:
             self.moves_window.close()       # stops a move that is playing
         if self.pulse_window is not None:
