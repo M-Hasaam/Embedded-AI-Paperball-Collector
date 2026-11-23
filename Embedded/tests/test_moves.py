@@ -1,0 +1,407 @@
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from moves import (ARM_MARGIN_S, MoveFileError, MovePlayer, arm_duration, arm_step, describe_step,  # noqa: E402
+                   drive_step, load_move, new_move, save_move, sync_speeds, turn_step, validate_move, wait_step)
+
+LIMITS = [(0, 120), (80, 180), (40, 170), (0, 180)]
+NAMES = ["Gripper", "Elbow", "Shoulder", "Servo 4"]
+
+
+def move_with(*steps):
+    move = new_move("t")
+    move["steps"] = list(steps)
+    return move
+
+
+def one_of_each():
+    move = new_move("all")
+    move["steps"] = [arm_step({1: (150, 30), 2: (120, 30)}, wait=0.5), drive_step(20), turn_step(90), wait_step(1)]
+    return move
+
+
+class StepsTest(unittest.TestCase):
+    def test_arm_step_sorts_servos(self):
+        step = arm_step({2: (120, 30), 1: (150, 30)})
+        self.assertEqual(step["servos"], [{"i": 1, "angle": 150, "speed": 30}, {"i": 2, "angle": 120, "speed": 30}])
+
+    def test_describe_each_type(self):
+        self.assertEqual(describe_step(arm_step({1: (150, 30), 2: (120, 30)}, wait=0.5), NAMES),
+                         "Arm: Elbow 150°@30/s, Shoulder 120°@30/s, then wait 0.5 s")
+        self.assertEqual(describe_step(drive_step(20), NAMES), "Drive: forward 20 cm at 100%")
+        self.assertEqual(describe_step(drive_step(-10, 50), NAMES), "Drive: back 10 cm at 50%")
+        self.assertEqual(describe_step({"type": "drive", "cm": 20}, NAMES), "Drive: forward 20 cm at 100%")   # older files: no speed
+        self.assertEqual(describe_step(turn_step(90), NAMES), "Turn: left 90°")
+        self.assertEqual(describe_step(turn_step(-90), NAMES), "Turn: right 90°")
+        self.assertEqual(describe_step(wait_step(1), NAMES), "Wait: 1 s")
+
+    def test_arm_duration_uses_slowest_servo(self):
+        step = arm_step({1: (150, 30), 2: (120, 60)}, wait=0.5)
+        self.assertAlmostEqual(arm_duration(step, {1: 120, 2: 90}), 1.0 + ARM_MARGIN_S + 0.5)
+
+    def test_arm_duration_without_movement(self):
+        step = arm_step({1: (150, 30)}, wait=0.5)
+        self.assertAlmostEqual(arm_duration(step, {1: 150}), ARM_MARGIN_S + 0.5)
+
+
+class SyncTest(unittest.TestCase):
+    def speeds(self, step):
+        return {s["i"]: s["speed"] for s in step["servos"]}
+
+    def test_sync_makes_servos_arrive_together(self):
+        step = arm_step({1: (100, 60), 2: (140, 60)})            # elbow 10 deg, shoulder 20 deg
+        self.assertEqual(self.speeds(sync_speeds(step, {1: 110, 2: 120})), {1: 30, 2: 60})
+
+    def test_sync_never_exceeds_the_stored_speeds(self):
+        step = arm_step({1: (90, 20), 2: (100, 60)})             # elbow 30 deg at 20/s = 1.5 s, shoulder 10 deg
+        result = sync_speeds(step, {1: 120, 2: 90})
+        self.assertEqual(self.speeds(result)[1], 20)
+        self.assertLessEqual(self.speeds(result)[2], 60)
+        self.assertGreaterEqual(self.speeds(result)[2], 1)
+
+    def test_sync_leaves_unmoving_servos_and_the_input_alone(self):
+        step = arm_step({0: (90, 60), 1: (100, 60), 2: (140, 60)})
+        before = {"servos": [dict(s) for s in step["servos"]]}
+        result = sync_speeds(step, {0: 90, 1: 110, 2: 120})
+        self.assertEqual(self.speeds(result)[0], 60)             # the gripper does not move: its speed is irrelevant and kept
+        self.assertEqual(step["servos"], before["servos"])       # the recorded step is not changed
+
+    def test_sync_without_movement_changes_nothing(self):
+        step = arm_step({1: (110, 60)})
+        self.assertEqual(sync_speeds(step, {1: 110}), step)
+
+    def test_arm_duration_margin_can_be_zero(self):
+        step = arm_step({1: (150, 30)}, wait=0.5)
+        self.assertAlmostEqual(arm_duration(step, {1: 120}, margin=0), 1.0 + 0.5)
+
+
+class ValidateTest(unittest.TestCase):
+    def test_drive_speed_must_be_50_or_100(self):
+        for good in (50, 100):
+            self.assertEqual(validate_move(move_with(drive_step(20, good)), LIMITS), [])
+        self.assertEqual(validate_move(move_with({"type": "drive", "cm": 20}), LIMITS), [])     # older files: no speed, 100%
+        for bad in (30, 75, 0, "fast", None):
+            errors = validate_move(move_with(drive_step(20, bad)), LIMITS)
+            self.assertEqual(len(errors), 1, bad)
+            self.assertIn("Step 1", errors[0])
+            self.assertIn("speed", errors[0])
+
+    def test_assist_options_must_be_true_or_false(self):
+        move = one_of_each()
+        for key in ("assist_gyro", "assist_encoders"):
+            for good in (True, False):
+                move[key] = good
+                self.assertEqual(validate_move(move, LIMITS), [])
+            move[key] = 1
+            errors = validate_move(move, LIMITS)
+            self.assertEqual(len(errors), 1, key)
+            self.assertIn(key, errors[0])
+            del move[key]
+
+    def test_smooth_must_be_true_or_false(self):
+        move = one_of_each()
+        for good in (True, False):
+            move["smooth"] = good
+            self.assertEqual(validate_move(move, LIMITS), [])
+        move["smooth"] = "yes"
+        errors = validate_move(move, LIMITS)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("smooth", errors[0])
+
+    def test_valid_move_has_no_errors(self):
+        self.assertEqual(validate_move(one_of_each(), LIMITS), [])
+
+    def test_errors_name_step_and_field(self):
+        move = new_move("bad")
+        move["steps"] = [arm_step({1: (200, 30)})]
+        errors = validate_move(move, LIMITS)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Step 1", errors[0])
+        self.assertIn("angle", errors[0])
+        for step in (drive_step(0), turn_step(500), wait_step(0), {"type": "arm", "servos": [], "wait": 0}, {"type": "fly"}):
+            move["steps"] = [wait_step(1), step]
+            errors = validate_move(move, LIMITS)
+            self.assertTrue(errors, step)
+            self.assertTrue(all("Step 2" in e for e in errors), (step, errors))
+
+    def test_missing_fields_do_not_crash(self):
+        for steps in ([{"type": "arm"}], [{"type": "drive"}], [{"cm": "far", "type": "drive"}], [{}], ["junk"]):
+            errors = validate_move({"steps": steps}, LIMITS)
+            self.assertTrue(errors, steps)
+        self.assertTrue(validate_move({}, LIMITS))
+        self.assertTrue(validate_move({"steps": "nope"}, LIMITS))
+
+
+class FileTest(unittest.TestCase):
+    def test_save_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sub" / "x.json"
+            move = one_of_each()
+            save_move(path, move)
+            self.assertEqual(load_move(path), move)
+
+    def test_load_rejects_garbage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in (("a.json", "not json"), ("b.json", "[1,2]"), ("c.json", '{"name": "x"}')):
+                path = Path(tmp) / name
+                path.write_text(text)
+                with self.assertRaises(MoveFileError, msg=name):
+                    load_move(path)
+            with self.assertRaises(MoveFileError):
+                load_move(Path(tmp) / "missing.json")
+
+    def test_example_file_is_valid(self):
+        move = load_move(Path(__file__).with_name("example_grab.json"))     # a sample of the file format; your own moves live in moves/
+        self.assertEqual(validate_move(move, LIMITS), [])
+
+
+class FakeCar:
+    """Records every command the player sends; motion (drive/turn) stays busy until finish_motion()."""
+
+    def __init__(self):
+        self.calls = []
+        self.connected_flag = True
+        self.angles = {1: 120, 2: 90}
+        self.motion_result = True
+        self.start_result = True
+        self.busy = False
+
+    def servo(self, index, angle, speed):
+        self.calls.append(("servo", index, angle, speed))
+        self.angles[index] = angle
+
+    def servo_angles(self):
+        return dict(self.angles)
+
+    def start_drive(self, cm, speed, assist):
+        self.calls.append(("start_drive", cm, speed, assist))
+        self.busy = self.start_result
+        return self.start_result
+
+    def start_turn(self, deg):
+        self.calls.append(("start_turn", deg))
+        self.busy = self.start_result
+        return self.start_result
+
+    def motion_active(self):
+        return self.busy
+
+    def motion_ok(self):
+        return self.motion_result
+
+    def stop(self):
+        self.calls.append(("stop",))
+        self.busy = False
+
+    def connected(self):
+        return self.connected_flag
+
+    def finish_motion(self):
+        self.busy = False
+
+    def kinds(self):
+        return [c[0] for c in self.calls]
+
+
+def player_for(car):
+    return MovePlayer(car, NAMES)
+
+
+def move_of(*steps):
+    move = new_move("t")
+    move["steps"] = list(steps)
+    return move
+
+
+class PlayerTest(unittest.TestCase):
+    def test_plays_steps_in_order(self):
+        car = FakeCar()
+        player = player_for(car)
+        self.assertTrue(player.start(move_of(arm_step({1: (150, 30)}, wait=0), drive_step(20), turn_step(90), wait_step(1)), 0.0))
+        self.assertEqual(car.kinds(), ["servo"])
+        player.tick(1.0)
+        self.assertEqual(car.kinds(), ["servo"])            # the elbow is still on its way (1.3 s)
+        player.tick(1.31)
+        self.assertEqual(car.kinds(), ["servo", "start_drive"])
+        player.tick(1.5)
+        car.finish_motion()
+        player.tick(1.6)
+        self.assertEqual(car.kinds()[-1], "start_turn")
+        car.finish_motion()
+        player.tick(1.7)                                     # the wait step begins, 1 s long
+        player.tick(2.69)
+        self.assertTrue(player.active)
+        player.tick(2.71)
+        self.assertFalse(player.active)
+        self.assertTrue(player.ok)
+        self.assertEqual(player.status, "Done")
+        self.assertLess(car.kinds().index("servo"), car.kinds().index("start_drive"))
+        self.assertLess(car.kinds().index("start_drive"), car.kinds().index("start_turn"))
+
+    def test_arm_waits_for_travel(self):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(arm_step({1: (150, 30)}, wait=0), drive_step(20)), 10.0)
+        player.tick(11.0)
+        self.assertNotIn("start_drive", car.kinds())
+        player.tick(11.0 + ARM_MARGIN_S + 0.01)
+        self.assertIn("start_drive", car.kinds())
+
+    def test_drive_passes_its_own_speed_and_defaults_to_100(self):
+        for step, expected in ((drive_step(20, 50), 50), (drive_step(20, 100), 100), ({"type": "drive", "cm": 20}, 100)):
+            car = FakeCar()
+            player = player_for(car)
+            player.start(move_of(step), 0.0)
+            self.assertIn(("start_drive", 20, expected, 3), car.calls)
+            car.finish_motion()
+            player.tick(0.1)
+            self.assertTrue(player.ok)
+
+    def test_drive_straight_assist_follows_the_moves_ticks(self):
+        # bit 1 = gyro heading, bit 2 = encoders (the car's G command uses the same numbers); both on unless the move says otherwise
+        for settings, expected in (({}, 3), ({"assist_gyro": False}, 2), ({"assist_encoders": False}, 1),
+                                   ({"assist_gyro": False, "assist_encoders": False}, 0), ({"assist_gyro": True}, 3)):
+            car = FakeCar()
+            player = player_for(car)
+            move = move_of(drive_step(20, 100))
+            move.update(settings)
+            player.start(move, 0.0)
+            self.assertIn(("start_drive", 20, 100, expected), car.calls, settings)
+
+    def test_abort_stops_the_car(self):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(drive_step(20), arm_step({1: (150, 30)})), 0.0)
+        player.abort("test")
+        self.assertEqual(car.kinds().count("stop"), 1)
+        self.assertFalse(player.active)
+        self.assertFalse(player.ok)
+        self.assertIn("test", player.status)
+        before = list(car.calls)
+        player.tick(5.0)
+        self.assertEqual(car.calls, before)
+
+    def test_abort_twice_is_harmless(self):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(wait_step(5)), 0.0)
+        player.abort("one")
+        before = list(car.calls)
+        player.abort("two")
+        self.assertEqual(car.calls, before)
+        self.assertIn("one", player.status)
+
+    def test_disconnect_aborts(self):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(wait_step(5)), 0.0)
+        car.connected_flag = False
+        player.tick(1.0)
+        self.assertFalse(player.active)
+        self.assertIn("disconnected", player.status)
+        self.assertIn("stop", car.kinds())
+
+    def test_failed_motion_aborts_and_skips_arm_steps(self):
+        car = FakeCar()
+        car.motion_result = False
+        player = player_for(car)
+        player.start(move_of(drive_step(20), arm_step({1: (150, 30)})), 0.0)
+        car.finish_motion()
+        player.tick(0.5)
+        self.assertFalse(player.active)
+        self.assertFalse(player.ok)
+        self.assertNotIn("servo", car.kinds())
+
+    def test_refuses_empty_and_double_start(self):
+        car = FakeCar()
+        player = player_for(car)
+        self.assertFalse(player.start({"steps": []}, 0.0))
+        self.assertEqual(player.status, "Nothing to play")
+        self.assertEqual(car.calls, [])
+        self.assertTrue(player.start(move_of(wait_step(5)), 0.0))
+        before = list(car.calls)
+        self.assertFalse(player.start(move_of(wait_step(5)), 0.1))
+        self.assertEqual(car.calls, before)
+        self.assertTrue(player.active)
+
+    def test_smooth_skips_the_margin_between_arm_steps(self):
+        car = FakeCar()
+        player = player_for(car)
+        move = move_of(arm_step({1: (150, 30)}, wait=0), arm_step({1: (120, 30)}, wait=0))
+        move["smooth"] = True
+        player.start(move, 10.0)
+        player.tick(10.5)
+        self.assertEqual(car.kinds().count("servo"), 1)
+        player.tick(11.01)                                   # the first step's travel (1.0 s) is over: no 0.3 s margin
+        self.assertEqual(car.kinds().count("servo"), 2)
+
+    def test_not_smooth_keeps_the_margin_between_arm_steps(self):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(arm_step({1: (150, 30)}, wait=0), arm_step({1: (120, 30)}, wait=0)), 10.0)
+        player.tick(11.01)
+        self.assertEqual(car.kinds().count("servo"), 1)
+        player.tick(11.0 + ARM_MARGIN_S + 0.01)
+        self.assertEqual(car.kinds().count("servo"), 2)
+
+    def test_smooth_keeps_the_margin_before_a_drive(self):
+        car = FakeCar()
+        player = player_for(car)
+        move = move_of(arm_step({1: (150, 30)}, wait=0), drive_step(20))
+        move["smooth"] = True
+        player.start(move, 10.0)
+        player.tick(11.01)
+        self.assertNotIn("start_drive", car.kinds())
+        player.tick(11.0 + ARM_MARGIN_S + 0.01)
+        self.assertIn("start_drive", car.kinds())
+
+    def test_smooth_sends_synchronised_speeds(self):
+        car = FakeCar()                                      # the arm starts at elbow 120, shoulder 90
+        player = player_for(car)
+        move = move_of(arm_step({1: (110, 60), 2: (120, 60)}, wait=0))   # elbow 10 deg, shoulder 30 deg
+        move["smooth"] = True
+        player.start(move, 0.0)
+        self.assertIn(("servo", 1, 110, 20), car.calls)
+        self.assertIn(("servo", 2, 120, 60), car.calls)
+
+    def test_not_smooth_sends_the_stored_speeds(self):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(arm_step({1: (110, 60), 2: (120, 60)}, wait=0)), 0.0)
+        self.assertIn(("servo", 1, 110, 60), car.calls)
+        self.assertIn(("servo", 2, 120, 60), car.calls)
+
+    def test_editing_the_move_while_playing_does_not_change_the_playback(self):
+        car = FakeCar()
+        player = player_for(car)
+        move = move_of(wait_step(1), arm_step({1: (150, 30)}, wait=0))
+        player.start(move, 0.0)
+        move["steps"].insert(0, drive_step(50))              # the window's Up/Down/Delete/Add edit this same list
+        player.tick(1.01)
+        self.assertEqual(car.kinds(), ["servo"])             # the second step of the move as it was when playing began
+        self.assertNotIn("start_drive", car.kinds())
+
+    def test_refuses_when_not_connected(self):
+        car = FakeCar()
+        car.connected_flag = False
+        player = player_for(car)
+        self.assertFalse(player.start(move_of(wait_step(1)), 0.0))
+        self.assertEqual(player.status, "Car not connected")
+        self.assertEqual(car.calls, [])
+
+    def test_drive_start_refused_aborts(self):
+        car = FakeCar()
+        car.start_result = False
+        player = player_for(car)
+        self.assertFalse(player.start(move_of(drive_step(20)), 0.0))
+        self.assertFalse(player.active)
+        self.assertFalse(player.ok)
+        self.assertIn("could not start", player.status)
+
+
+if __name__ == "__main__":
+    unittest.main()

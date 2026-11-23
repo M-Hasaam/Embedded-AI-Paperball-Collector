@@ -1,0 +1,20 @@
+{
+  "name": "example_grab",
+  "version": 1,
+  "smooth": true,
+  "assist_gyro": true,
+  "assist_encoders": true,
+  "steps": [
+    {
+      "type": "arm",
+      "servos": [
+        {"i": 1, "angle": 150, "speed": 30},
+        {"i": 2, "angle": 120, "speed": 30}
+      ],
+      "wait": 0.5
+    },
+    {"type": "drive", "cm": 20, "speed": 100},
+    {"type": "turn", "deg": 90},
+    {"type": "wait", "seconds": 1}
+  ]
+}
