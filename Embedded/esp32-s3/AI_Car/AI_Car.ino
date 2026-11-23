@@ -225,7 +225,7 @@ const int SERVO_BACKOFF_DEG = 5;                   // when the overload guard st
 // The elbow can break if it goes outside this window for the shoulder's angle (measured on the arm; plotted in
 // docs/arm-limits). Between two rows the TIGHTER of the two is used, and LIMIT_MARGIN keeps the elbow a little inside
 // every limit that is tighter than the servo's own 80..180 range. See elbowWindow(), updateServos() and the V / H commands.
-const int ELBOW = 1, SHOULDER = 2;
+const int GRIPPER = 0, ELBOW = 1, SHOULDER = 2;
 const int LIMIT_ROWS = 14;
 const int LIMIT_SHOULDER[LIMIT_ROWS]  = {  40,  60,  70,  80,  90, 100, 110, 115, 120, 130, 140, 150, 160, 170};
 const int LIMIT_ELBOW_MIN[LIMIT_ROWS] = { 135, 120, 105, 100, 100, 100, 100, 100,  95,  95,  95,  90, 100, 120};
@@ -781,8 +781,11 @@ void updateServos() {
     if (currentAngles[i] == targetAngles[i]) { lastServoUpdate[i] = now; servoAccum[i] = 0; continue; }
 
     int rail = servoRail[i];
-    if (railState[rail] == 2) { lastServoUpdate[i] = now; servoAccum[i] = 0; continue; }  // overload: hold still
-    float speed = servoSpeeds[i] * railSpeedScale[rail];
+    // The gripper overloads when it squeezes an object, and the guard then holds it still. Opening it (toward 0 degrees) lets go of
+    // the load, so it is always allowed, at the speed that was asked for, even while the guard has the supply stopped or slowed.
+    bool gripperOpening = (i == GRIPPER && targetAngles[i] < currentAngles[i]);
+    if (railState[rail] == 2 && !gripperOpening) { lastServoUpdate[i] = now; servoAccum[i] = 0; continue; }  // overload: hold still
+    float speed = servoSpeeds[i] * (gripperOpening ? 1.0f : railSpeedScale[rail]);
     if (speed < 1.0f) speed = 1.0f;
 
     unsigned long dtMs = now - lastServoUpdate[i];
