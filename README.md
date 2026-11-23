@@ -91,6 +91,7 @@ Embedded/
   dashboard.py         PC dashboard: camera (ESP32 Wi-Fi bridge) + car (ESP32-S3 over Bluetooth LE)
   esp32/WifiBridge/    ESP32 camera bridge firmware + PC viewers (camera_yolo, camera_distance, camera_serial)
   esp32-s3/AI_Car/     ESP32-S3 car (BLE, 4 servos): AI_Car.ino and control_car.py
+  moves.py, moves/     recorded arm and car moves (JSON), made in the dashboard's Moves window; tests in tests/
   Other/               older Arduino sketches and the ESP32-CAM web server
 Training/
   paper_ball_detector/ dataset, trainer, Colab notebook, evaluation, export, results, trained model
