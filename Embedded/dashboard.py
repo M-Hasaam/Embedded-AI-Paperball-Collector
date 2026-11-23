@@ -22,7 +22,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import simpledialog, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
@@ -1548,6 +1548,12 @@ class Dashboard:
         rail_row = tk.Frame(s, bg=CARD)
         rail_row.grid(row=2, column=0, columnspan=len(SERVO_NAMES), sticky="ew", pady=(4, 0))
         tk.Label(rail_row, textvariable=self.rail_text, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        self.elbow_bypass_var = tk.BooleanVar(value=False)       # always starts off; the car's bypass is off after any restart
+        tk.Checkbutton(
+            rail_row, text="Bypass elbow limit (arm can break)", variable=self.elbow_bypass_var, command=self._elbow_bypass_toggled,
+            bg=CARD, fg=BAD, selectcolor=CARD_HI, activebackground=CARD, activeforeground=BAD, highlightthickness=0, bd=0,
+            takefocus=0, anchor="e", font=(FONT, 9), cursor="hand2",
+        ).pack(side="right")
         self.rail_alert_label = tk.Label(rail_row, textvariable=self.rail_alert, bg=CARD, fg=WARN, font=(FONT, 10, "bold"))
         self.rail_alert_label.pack(side="right")
         # overload guard controls: switch, and the sag (in mV) at which the car slows down / stops the servos
@@ -1910,6 +1916,7 @@ class Dashboard:
                 self._post(self._send_turn_speed)
                 self._post(self._send_straight)   # and the straight-drive checkbox
                 self._post(self._send_guard)      # and the overload guard settings
+                self._post(self._reset_elbow_bypass)   # and the elbow limit is on (a bypass never survives a reconnect)
                 self._post(lambda s=time.monotonic() - started: self.car_text.set(f"Connected to AI_Car ({s:.1f} s)"))
                 while not self.stop_event.is_set() and client.is_connected:
                     await asyncio.sleep(0.1)
@@ -2134,6 +2141,25 @@ class Dashboard:
             self.root.after_cancel(self.pending_turn)
             self.pending_turn = None
         self._send_turn_speed()
+
+    def _elbow_bypass_toggled(self):
+        """The 'Bypass elbow limit' checkbox. Turning the limit off asks first; turning it back on needs no question."""
+        if self.elbow_bypass_var.get():
+            if not messagebox.askokcancel(
+                    "Bypass the elbow limit",
+                    "Turn the shoulder-dependent elbow limit OFF?\n\nOnly the servo's own range (80-180°) will stay. The elbow "
+                    "can break if it goes outside the measured window for the shoulder's angle.\n\nThe limit switches itself "
+                    "back on whenever the dashboard reconnects or the car restarts.", parent=self.root, icon="warning"):
+                self.elbow_bypass_var.set(False)
+                return
+            self._send("B1")
+        else:
+            self._send("B0")
+
+    def _reset_elbow_bypass(self):
+        """After every (re)connect the limit is on again: the car forgets the bypass when it restarts, and the checkbox must agree."""
+        self.elbow_bypass_var.set(False)
+        self._send("B0")
 
     def _send_guard(self):
         """Send the overload guard switch and its two thresholds (the stop level is kept above the slow-down level)."""

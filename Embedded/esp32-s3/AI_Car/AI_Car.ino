@@ -236,11 +236,14 @@ bool elbowWaiting = false;                         // the elbow was commanded be
 int elbowWaitStart = -1;                           // its start angle while it waits
 int elbowWaitSpeed = SERVO_SPEED_DEFAULT;          // and the speed it was asked for
 bool shoulderHeld = false;                         // the shoulder is waiting for the elbow to get out of the way
+bool elbowLimitBypass = false;                     // command B1: ignore the table above (only the servo's own 80..180 range stays).
+                                                   // Never saved: it is off again after every restart and the dashboard sends B0 on connect.
 
 // Allowed elbow range for one shoulder angle.
 void elbowWindowAt(int s, int &lo, int &hi) {
   lo = SERVO_ANGLE_MIN[ELBOW];
   hi = SERVO_ANGLE_MAX[ELBOW];
+  if (elbowLimitBypass) return;                    // the whole servo range, whatever the shoulder does
   if (s < LIMIT_SHOULDER[0]) s = LIMIT_SHOULDER[0];
   if (s > LIMIT_SHOULDER[LIMIT_ROWS - 1]) s = LIMIT_SHOULDER[LIMIT_ROWS - 1];
   for (int k = 0; k < LIMIT_ROWS - 1; k++) {
@@ -297,6 +300,10 @@ void elbowLimitMessage(char* out, size_t n) {
     return;
   }
   if (!servoAttached[ELBOW]) return;
+  if (elbowLimitBypass) {                          // a constant reminder in red on the dashboard while the limit is off
+    snprintf(out, n, "ELBOW LIMIT BYPASSED: the shoulder-dependent limit is off (the arm can break)");
+    return;
+  }
   int sNow, lo, hi;
   elbowWindowNow(sNow, lo, hi);
   if (shoulderHeld) {
@@ -489,6 +496,13 @@ void handleCommand(String message) {
   if (message.charAt(0) == 'G' && message.length() == 2 && message.charAt(1) >= '0' && message.charAt(1) <= '3') {
     straightMode = message.charAt(1) - '0';
     Serial.printf("Straight assist mode %d (1 = gyro, 2 = encoders, 3 = both, 0 = off)\n", straightMode);
+    return;
+  }
+
+  // Elbow-limit bypass: B1 = ignore the shoulder-dependent elbow limit (the servo's own 80..180 range stays), B0 = limit on.
+  if (message.charAt(0) == 'B' && message.length() == 2 && (message.charAt(1) == '0' || message.charAt(1) == '1')) {
+    elbowLimitBypass = (message.charAt(1) == '1');
+    Serial.printf("Elbow limit: %s\n", elbowLimitBypass ? "BYPASSED (the arm can break)" : "on");
     return;
   }
 
