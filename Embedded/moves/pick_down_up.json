@@ -1,0 +1,199 @@
+{
+  "name": "pick_down_up",
+  "version": 1,
+  "steps": [
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 90,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 120,
+          "speed": 60
+        },
+        {
+          "i": 2,
+          "angle": 90,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.1
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 0,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 105,
+          "speed": 60
+        },
+        {
+          "i": 2,
+          "angle": 130,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 0,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 95,
+          "speed": 60
+        },
+        {
+          "i": 2,
+          "angle": 140,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 0,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 90,
+          "speed": 60
+        },
+        {
+          "i": 2,
+          "angle": 150,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 0,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 90,
+          "speed": 30
+        },
+        {
+          "i": 2,
+          "angle": 155,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "drive",
+      "cm": 5.0,
+      "speed": 50
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 100,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 90,
+          "speed": 30
+        },
+        {
+          "i": 2,
+          "angle": 155,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 100,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 120,
+          "speed": 30
+        },
+        {
+          "i": 2,
+          "angle": 90,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "drive",
+      "cm": -5.0,
+      "speed": 50
+    }
+  ],
+  "smooth": true
+}
