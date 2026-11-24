@@ -32,11 +32,11 @@ def build_card(parent):
     app = types.SimpleNamespace(
         rotate_var=tk.StringVar(master=ROOT, value="none"), run_status_var=tk.StringVar(master=ROOT),
         detect_var=tk.BooleanVar(master=ROOT), lines_var=tk.BooleanVar(master=ROOT), detect_status_var=tk.StringVar(master=ROOT),
-        detect_conf_var=tk.StringVar(master=ROOT, value="50%"), camera=types.SimpleNamespace(rotate=None),
+        detect_conf_var=tk.StringVar(master=ROOT, value="50%"), record_rate_var=tk.StringVar(master=ROOT, value="5 per s"), camera=types.SimpleNamespace(rotate=None),
         detector=types.SimpleNamespace(conf=0.5), last_frame_id=0)
     for name in ("_card", "_button", "_scale", "_detect_conf_changed"):
         setattr(app, name, functools.partial(getattr(D, name), app))
-    app._save_frame = app._detect_toggled = app._test_photo_dialog = app.back_to_live = lambda: None
+    app._save_frame = app._detect_toggled = app._test_photo_dialog = app.back_to_live = app.toggle_recording = lambda: None
     return app, D._build_camera_card(app, parent)
 
 

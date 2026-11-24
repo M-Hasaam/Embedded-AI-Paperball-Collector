@@ -35,7 +35,8 @@ from helpers.ball_approach import Approach, BallTracker, Reading
 from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, draw_guides, draw_spot_marker, load_model,
                                    save_model)
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
-from helpers.paths import data_file
+from helpers.paths import DATA_DIR, data_file
+from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
 from helpers.moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, MoveFileError, MovePlayer, arm_step, describe_step,
                    drive_step, load_move, new_move, save_move, turn_step, validate_move, wait_step)
 
@@ -46,6 +47,8 @@ CAMERA_PORT = 8080
 CAMERA_WIFI_NAME = "ESP32-BRIDGE"
 CAMERA_ROTATE = "none"            # none | cw | ccw | 180   (also selectable in the UI)
 CAPTURE_DIR = Path(__file__).resolve().parent / "captures"
+RECORD_TEXT, STOP_RECORD_TEXT = "● Record", "■ Stop"
+RECORD_DIR = DATA_DIR / "recordings"    # the Record button: one folder of the camera's frames per recording (not kept in git)
 
 # Car (ESP32-S3 over BLE)
 CAR_NAME = "AI_Car"
@@ -56,6 +59,7 @@ MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011"       # "yaw,pitch,roll,g
 ENCODER_CHAR_UUID = "33445566-7788-99AA-BBCC-DDEEFF001122"   # "leftTicks,rightTicks,leftCm,rightCm,leftCm/s,rightCm/s"
 SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233"   # "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState"
 TOF_CHAR_UUID = "55667788-99AA-BBCC-DDEE-FF0011223344"        # gripper VL53L0X: mm, "-1" = nothing in range, "NA" = sensor not found
+TOF_WAITING = "Gripper: waiting"
 TOF_STALE_S = 1.5                 # no gripper reading for this long = show "no new readings" (the car sends about ten a second)
 TOF_NEAR_MM = 60                 # closer than this = something is in the jaws. The VL53L0X reads about 30-50 mm for anything closer than its 30 mm blind zone (a 1 cm object read 40), so 60 still counts that
 # The S3's ADC reads a few percent high, so the displayed servo-supply voltage is multiplied by these (arm, gripper).
@@ -152,6 +156,7 @@ class CameraWorker(threading.Thread):
         self.frame_rgb = None        # newest frame (RGB ndarray)
         self.frame_id = 0
         self.last_jpeg = None        # camera's exact JPEG, for saving
+        self.recorder = None         # a helpers.recorder.FrameRecorder while the Record button is on; gets every frame
         self.fps = 0.0
         self.link_kbps = 0.0         # WiFi throughput actually received (KB/s)
         self.connected = False
@@ -163,6 +168,16 @@ class CameraWorker(threading.Thread):
     def snapshot(self):
         with self.lock:
             return self.frame_id, self.frame_rgb
+
+    def _publish(self, jpeg, rgb):
+        """A new frame arrived: keep it as the newest, and hand the camera's exact JPEG to the recorder if one is running."""
+        with self.lock:
+            self.frame_rgb = rgb
+            self.last_jpeg = jpeg
+            self.frame_id += 1
+        recorder = self.recorder
+        if recorder is not None:
+            recorder.offer(jpeg)
 
     @staticmethod
     def _read_wifi_ssid():
@@ -253,10 +268,7 @@ class CameraWorker(threading.Thread):
                 if rot is not None:
                     img = cv2.rotate(img, rot)
                 rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                with self.lock:
-                    self.frame_rgb = rgb
-                    self.last_jpeg = jpeg
-                    self.frame_id += 1
+                self._publish(jpeg, rgb)
                 count += len(jpegs)
                 self.silent_hint = ""
                 self.message = "Live"
@@ -1919,8 +1931,7 @@ class Dashboard:
         self.cam_text = tk.StringVar(value="Starting...")
         self.dist_var = tk.StringVar(value="--")
         self.dist_note = tk.StringVar(value="waiting for sensor")
-        self.tof_var = tk.StringVar(value="--")
-        self.tof_note = tk.StringVar(value="waiting for sensor")
+        self.tof_var = tk.StringVar(value=TOF_WAITING)          # the whole text of the gripper line in the Distance card's title row
         self.tof_mm = None             # latest gripper sensor reading in mm, None = nothing in range or no sensor
         self.tof_stamp = None          # time.monotonic() of the newest reading, None = none since connecting
         self.heading_var = tk.StringVar(value="--")
@@ -1938,6 +1949,7 @@ class Dashboard:
         self.enc_speed_var = tk.StringVar(value="waiting for encoders")
         self.enc_wheels_var = tk.StringVar(value="L -- · R --")
         self.rotate_var = tk.StringVar(value=CAMERA_ROTATE)
+        self.record_rate_var = tk.StringVar(value=DEFAULT_RATE)
         self.run_status_var = tk.StringVar(value="")       # progress of turns / planned path / return
         self.photo = None
         self.last_frame_id = -1
@@ -2067,19 +2079,10 @@ class Dashboard:
         self.dist_bar = tk.Canvas(d, height=10, bg=CARD_HI, highlightthickness=0)
         self.dist_bar.pack(fill="x", pady=(6, 0))
 
-        # gripper sensor (VL53L0X), the same layout as the distance above but smaller
-        tk.Frame(d, bg=LINE, height=1).pack(fill="x", pady=(8, 4))
-        trow = tk.Frame(d, bg=CARD)
-        trow.pack(fill="x")
-        tk.Label(trow, text="Gripper (VL53L0X)", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", anchor="s")
-        tk.Label(trow, textvariable=self.tof_note, bg=CARD, fg=MUTED, font=(FONT, 10)).pack(side="right", anchor="s")
-        trow2 = tk.Frame(d, bg=CARD)
-        trow2.pack(fill="x")
-        self.tof_label = tk.Label(trow2, textvariable=self.tof_var, bg=CARD, fg=MUTED, font=(FONT, 20, "bold"), width=5, anchor="w")
-        self.tof_label.pack(side="left")
-        tk.Label(trow2, text=" mm", bg=CARD, fg=MUTED, font=(FONT, 11)).pack(side="left", pady=(8, 0))
-        self.tof_bar = tk.Canvas(d, height=8, bg=CARD_HI, highlightthickness=0)
-        self.tof_bar.pack(fill="x", pady=(4, 0))
+        # gripper sensor (VL53L0X): one line of text on the right of the card's title row, so it costs no height (a block of its own
+        # made the whole window 91 px taller and cut off the Drive card)
+        self.tof_label = tk.Label(dist_card, textvariable=self.tof_var, bg=CARD, fg=MUTED, font=(FONT, 9, "bold"))
+        self.tof_label.place(relx=1.0, x=-14, y=11, anchor="ne")
 
         # motion
         imu_card, m = self._card(right, "Motion (MPU-6050)")
@@ -2301,6 +2304,7 @@ class Dashboard:
         self._refresh_badges()
         self._path_tick()
         self._tof_tick(time.monotonic())
+        self._record_tick()
         if not self.closing:
             self.root.after(30, self._pump)
 
@@ -2363,6 +2367,11 @@ class Dashboard:
         tk.Label(det_row1, textvariable=self.detect_conf_var, bg=CARD, fg=ACCENT, font=(FONT, 9, "bold"), width=4).pack(side="left")
         self._button(det_row2, "Test on a photo...", self._test_photo_dialog).pack(side="left")
         self._button(det_row2, "Back to live", self.back_to_live).pack(side="left", padx=(6, 0))
+        self.record_button = self._button(det_row2, RECORD_TEXT, self.toggle_recording)
+        self.record_button.configure(width=13)
+        self.record_button.pack(side="left", padx=(6, 0))
+        rate = ttk.Combobox(det_row2, textvariable=self.record_rate_var, values=list(RATES), width=10, state="readonly")
+        rate.pack(side="left", padx=(4, 0))
         tk.Label(det_row2, textvariable=self.detect_status_var, bg=CARD, fg=GOOD, font=(FONT, 9, "bold"), width=1,
                  anchor="w").pack(side="left", fill="x", expand=True, padx=(12, 0))
         return cam_body
@@ -2465,6 +2474,36 @@ class Dashboard:
         if path:
             self.show_test_photo(path)
 
+    # ---- recording frames for training pictures ---------------------------
+    def toggle_recording(self):
+        if self.camera.recorder is None:
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        recorder = FrameRecorder(RECORD_DIR, RATES.get(self.record_rate_var.get(), RATES[DEFAULT_RATE]), self.rotate_var.get())
+        recorder.start()
+        self.camera.recorder = recorder
+        self.record_button.configure(text=f"{STOP_RECORD_TEXT} (0)")
+
+    def stop_recording(self):
+        recorder, self.camera.recorder = self.camera.recorder, None
+        if recorder is not None:
+            recorder.stop()
+        self.record_button.configure(text=RECORD_TEXT)
+
+    def _record_tick(self):
+        """Keeps the button's frame count up to date, and stops (saying why) if the disk refused a frame."""
+        recorder = self.camera.recorder
+        if recorder is None:
+            return
+        if recorder.error:
+            self.detect_status_var.set(recorder.error)
+            self.stop_recording()
+            return
+        self.record_button.configure(text=f"{STOP_RECORD_TEXT} ({recorder.frames})")
+
     def _save_frame(self):
         with self.camera.lock:
             jpeg = self.camera.last_jpeg
@@ -2525,23 +2564,15 @@ class Dashboard:
         self._post(lambda: self._show_tof(mm))
 
     def _show_tof(self, mm):
-        bar = self.tof_bar
-        bar.delete("all")
-        w = max(bar.winfo_width(), 1)
         self.tof_mm = None if mm < 0 else mm
         self.tof_stamp = time.monotonic()
         if mm < 0:
-            self.tof_var.set("--")
-            self.tof_note.set("nothing in range")
+            self.tof_var.set("Gripper: out of range")
             self.tof_label.configure(fg=MUTED)
             return
         near = mm < TOF_NEAR_MM
-        color = GOOD if near else TEXT
-        self.tof_var.set(str(mm))
-        self.tof_note.set("something in the jaws" if near else "empty")
-        self.tof_label.configure(fg=color)
-        fill = w * (1 - min(mm, 300) / 300)  # fuller bar = closer
-        bar.create_rectangle(0, 0, max(fill, 3), 8, fill=GOOD if near else ACCENT, outline="")
+        self.tof_var.set(f"Gripper {mm} mm · in jaws" if near else f"Gripper {mm} mm")
+        self.tof_label.configure(fg=GOOD if near else TEXT)
 
     def _tof_tick(self, now):
         """The car sends a reading about ten times a second; when they stop (the sensor froze, the car is restarting it) the last value
@@ -2550,16 +2581,12 @@ class Dashboard:
             return
         self.tof_stamp = None
         self.tof_mm = None
-        self.tof_bar.delete("all")
-        self.tof_var.set("--")
-        self.tof_note.set("no new readings")
+        self.tof_var.set("Gripper: no readings")
         self.tof_label.configure(fg=MUTED)
 
     def _show_tof_missing(self):
-        self.tof_bar.delete("all")
         self.tof_mm = None
-        self.tof_var.set("--")
-        self.tof_note.set("sensor not found (check the wires)")
+        self.tof_var.set("Gripper: not found")
         self.tof_label.configure(fg=MUTED)
 
     def _on_mpu(self, _sender, data):
@@ -2704,10 +2731,8 @@ class Dashboard:
         self.dist_note.set("waiting for sensor")
         self.dist_label.configure(fg=MUTED)
         self.dist_bar.delete("all")
-        self.tof_var.set("--")
-        self.tof_note.set("waiting for sensor")
+        self.tof_var.set(TOF_WAITING)
         self.tof_label.configure(fg=MUTED)
-        self.tof_bar.delete("all")
         self.tof_mm = self.tof_stamp = None
         self.heading_var.set("--")
         self.spin_var.set("Turning speed: --")
@@ -3226,6 +3251,7 @@ class Dashboard:
         self._send("S")
         self._save_servo_memory()
         self.root.withdraw()            # the window disappears at once; the car link is closed properly in the background
+        self.stop_recording()           # the recording's notes (frame count, rotation) are written
         self.stop_event.set()
         self.camera.stop_event.set()
         self.detector.stop_event.set()

@@ -97,7 +97,7 @@ Dashboard/             the PC program (python Dashboard/dashboard.py)
                        (the trained paper-ball model on the camera picture), paths.py (where everything lives); Collect (drive
                        to a ball and pick it up): ball_distance.py, grab_spot.py, ball_approach.py
   data/                what the dashboard writes (the car's address, the servo memory, the runner log, the camera distance
-                       calibration, the grab spot); not kept in git
+                       calibration, the grab spot, data/recordings/ = the Record button's camera frames); not kept in git
   moves/               recorded arm and car moves (JSON), made in the dashboard's Moves window
   tests/               the automatic tests (python -m unittest discover -s Dashboard/tests)
 Training/

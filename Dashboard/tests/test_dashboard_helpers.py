@@ -3,6 +3,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,7 +17,7 @@ class CtrlCTest(unittest.TestCase):
         calls = []
         app = types.SimpleNamespace(interrupted=interrupted, closing=False, ui_queue=queue.Queue(),
                                     _refresh_camera=lambda: calls.append("camera"), _refresh_badges=lambda: None,
-                                    _path_tick=lambda: None, _tof_tick=lambda now: None, _close=lambda: calls.append("close"), _pump=lambda: None,
+                                    _path_tick=lambda: None, _tof_tick=lambda now: None, _record_tick=lambda: None, _close=lambda: calls.append("close"), _pump=lambda: None,
                                     root=types.SimpleNamespace(after=lambda ms, fn: calls.append("again")))
         dashboard.Dashboard._pump(app)
         return calls
@@ -61,14 +62,10 @@ class DistanceStampTest(unittest.TestCase):
 
 
 class GripperSensorTest(unittest.TestCase):
-    """The gripper's VL53L0X: millimetres as text, "-1" = nothing in range, "NA" = the car cannot find the sensor."""
+    """The gripper's VL53L0X: millimetres as text, "-1" = nothing in range, "NA" = the car cannot find the sensor.
+    It is one line of text in the Distance card's title row (a block of its own made the window 91 px taller and cut the Drive card)."""
 
     def make_app(self):
-        class Bar:
-            def delete(self, *a): pass
-            def winfo_width(self): return 100
-            def create_rectangle(self, *a, **k): pass
-
         class Var:
             v = None
             def set(self, v): self.v = v
@@ -78,38 +75,38 @@ class GripperSensorTest(unittest.TestCase):
             def configure(self, **k): self.fg = k.get("fg", self.fg)
 
         posted = []
-        return types.SimpleNamespace(tof_bar=Bar(), tof_var=Var(), tof_note=Var(), tof_label=Label(), tof_mm=None, tof_stamp=None,
-                                     posted=posted, _post=lambda fn: fn(),
+        return types.SimpleNamespace(tof_var=Var(), tof_label=Label(), tof_mm=None, tof_stamp=None, posted=posted, _post=lambda fn: fn(),
                                      _show_tof=lambda mm: posted.append(("tof", mm)), _show_tof_missing=lambda: posted.append(("missing",)))
 
     def test_a_reading_is_shown_and_stamped(self):
         app = self.make_app()
         before = time.monotonic()
         dashboard.Dashboard._show_tof(app, 123)
-        self.assertEqual((app.tof_mm, app.tof_var.v), (123, "123"))
+        self.assertEqual((app.tof_mm, app.tof_var.v), (123, "Gripper 123 mm"))
         self.assertTrue(before <= app.tof_stamp <= time.monotonic())
 
     def test_close_means_something_is_in_the_jaws(self):
         app = self.make_app()
         dashboard.Dashboard._show_tof(app, dashboard.TOF_NEAR_MM - 1)
-        self.assertIn("jaws", app.tof_note.v)
+        self.assertIn("in jaws", app.tof_var.v)
+        self.assertEqual(app.tof_label.fg, dashboard.GOOD)
         dashboard.Dashboard._show_tof(app, dashboard.TOF_NEAR_MM + 1)
-        self.assertNotIn("jaws", app.tof_note.v)
+        self.assertNotIn("in jaws", app.tof_var.v)
+        self.assertNotEqual(app.tof_label.fg, dashboard.GOOD)
 
     def test_nothing_in_range_clears_the_value(self):
         app = self.make_app()
         dashboard.Dashboard._show_tof(app, 80)
         dashboard.Dashboard._show_tof(app, -1)
         self.assertIsNone(app.tof_mm)
-        self.assertEqual(app.tof_var.v, "--")
+        self.assertEqual(app.tof_var.v, "Gripper: out of range")
 
     def test_sensor_not_found_says_so_and_drops_the_old_reading(self):
         app = self.make_app()
         dashboard.Dashboard._show_tof(app, 80)
         dashboard.Dashboard._show_tof_missing(app)
         self.assertIsNone(app.tof_mm)
-        self.assertEqual(app.tof_var.v, "--")
-        self.assertIn("not found", app.tof_note.v)
+        self.assertEqual(app.tof_var.v, "Gripper: not found")
 
     def test_the_notification_text_is_understood(self):
         for data, expected in ((b"42", ("tof", 42)), (b"-1", ("tof", -1)), (b"NA", ("missing",))):
@@ -124,25 +121,107 @@ class GripperSensorTest(unittest.TestCase):
 
     def test_a_value_that_stops_updating_is_not_left_on_screen_as_if_live(self):
         app = self.make_app()
-        app._show_tof_missing = lambda: dashboard.Dashboard._show_tof_missing(app)
         dashboard.Dashboard._show_tof(app, 29)
         now = app.tof_stamp
         dashboard.Dashboard._tof_tick(app, now + dashboard.TOF_STALE_S - 0.1)      # still fresh: untouched
-        self.assertEqual(app.tof_var.v, "29")
+        self.assertIn("29", app.tof_var.v)
         dashboard.Dashboard._tof_tick(app, now + dashboard.TOF_STALE_S + 0.1)      # stale: shown as no data
-        self.assertEqual(app.tof_var.v, "--")
+        self.assertEqual(app.tof_var.v, "Gripper: no readings")
         self.assertIsNone(app.tof_mm)
-        self.assertIn("no new readings", app.tof_note.v)
 
     def test_no_reading_yet_is_not_called_stale(self):
         app = self.make_app()
-        app.tof_var.set("--")
+        app.tof_var.set("Gripper: waiting")
         dashboard.Dashboard._tof_tick(app, 1e9)
-        self.assertEqual(app.tof_var.v, "--")
-        self.assertIsNone(app.tof_note.v)
+        self.assertEqual(app.tof_var.v, "Gripper: waiting")
 
     def test_the_sensor_is_subscribed_to_with_the_car_s_uuid(self):
         self.assertEqual(dashboard.TOF_CHAR_UUID, "55667788-99AA-BBCC-DDEE-FF0011223344")
+
+
+class RecordingTest(unittest.TestCase):
+    """The Record button: the camera thread hands every frame to a recorder that saves the camera's JPEGs into a folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patch = mock.patch.object(dashboard, "RECORD_DIR", Path(self.tmp.name))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def make_app(self, rate="every frame", rotate="cw"):
+        class Var:
+            def __init__(self, v=""): self.v = v
+            def get(self): return self.v
+            def set(self, v): self.v = v
+
+        class Button:
+            text = ""
+            def configure(self, **k): self.text = k.get("text", self.text)
+
+        camera = dashboard.CameraWorker("host", 1)
+        return types.SimpleNamespace(camera=camera, record_rate_var=Var(rate), rotate_var=Var(rotate), record_button=Button(),
+                                     detect_status_var=Var())
+
+    def test_the_camera_thread_hands_each_frame_to_the_recorder(self):
+        app = self.make_app()
+        dashboard.Dashboard.start_recording(app)
+        app.camera._publish(b"jpeg-1", "rgb-1")
+        app.camera._publish(b"jpeg-2", "rgb-2")
+        self.assertEqual(app.camera.last_jpeg, b"jpeg-2")                       # the picture shown is unchanged by recording
+        self.assertEqual(app.camera.frame_id, 2)
+        self.assertEqual(sorted(p.read_bytes() for p in app.camera.recorder.folder.glob("*.jpg")), [b"jpeg-1", b"jpeg-2"])
+
+    def test_without_a_recording_frames_are_only_shown(self):
+        camera = dashboard.CameraWorker("host", 1)
+        camera._publish(b"jpeg", "rgb")
+        self.assertEqual((camera.frame_id, camera.recorder), (1, None))
+
+    def test_start_uses_the_menu_rate_and_the_rotation_setting(self):
+        app = self.make_app(rate="1 per s", rotate="ccw")
+        dashboard.Dashboard.start_recording(app)
+        rec = app.camera.recorder
+        self.assertEqual((rec.min_gap, rec.rotate), (1.0, "ccw"))
+        self.assertTrue(str(rec.folder).startswith(self.tmp.name))
+        self.assertIn("Stop", app.record_button.text)
+
+    def test_stop_ends_the_recording_and_the_button_offers_to_record_again(self):
+        app = self.make_app()
+        dashboard.Dashboard.start_recording(app)
+        rec = app.camera.recorder
+        dashboard.Dashboard.stop_recording(app)
+        self.assertIsNone(app.camera.recorder)
+        self.assertFalse(rec.active)
+        self.assertIn("Record", app.record_button.text)
+        self.assertIn("recording.json", [p.name for p in rec.folder.iterdir()])
+
+    def test_the_button_toggles(self):
+        app = self.make_app()
+        app.toggle = lambda: dashboard.Dashboard.toggle_recording(app)
+        app.start_recording = lambda: dashboard.Dashboard.start_recording(app)
+        app.stop_recording = lambda: dashboard.Dashboard.stop_recording(app)
+        app.toggle()
+        self.assertIsNotNone(app.camera.recorder)
+        app.toggle()
+        self.assertIsNone(app.camera.recorder)
+
+    def test_the_tick_shows_the_number_of_frames_saved(self):
+        app = self.make_app()
+        dashboard.Dashboard.start_recording(app)
+        app.camera._publish(b"a", "x")
+        app.camera._publish(b"b", "x")
+        dashboard.Dashboard._record_tick(app)
+        self.assertIn("2", app.record_button.text)
+
+    def test_a_disk_error_stops_the_recording_and_is_shown(self):
+        app = self.make_app()
+        app.stop_recording = lambda: dashboard.Dashboard.stop_recording(app)
+        dashboard.Dashboard.start_recording(app)
+        with mock.patch.object(Path, "write_bytes", side_effect=OSError("disk full")):
+            app.camera._publish(b"a", "x")
+        dashboard.Dashboard._record_tick(app)
+        self.assertIsNone(app.camera.recorder)
+        self.assertIn("disk full", app.detect_status_var.v)
 
 
 class ServoCommandsTest(unittest.TestCase):
