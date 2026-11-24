@@ -24,6 +24,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import font as tkfont
 
 import cv2
 import numpy as np
@@ -2081,8 +2082,15 @@ class Dashboard:
 
         # gripper sensor (VL53L0X): one line of text on the right of the card's title row, so it costs no height (a block of its own
         # made the whole window 91 px taller and cut off the Drive card)
-        self.tof_label = tk.Label(dist_card, textvariable=self.tof_var, bg=CARD, fg=MUTED, font=(FONT, 9, "bold"))
+        # It shortens itself to the room left of the title (see _fit_tof): the full text covered the title in a narrow window.
+        self.tof_shown = tk.StringVar(value=TOF_WAITING)
+        self.tof_label = tk.Label(dist_card, textvariable=self.tof_shown, bg=CARD, fg=MUTED, font=(FONT, 9, "bold"))
         self.tof_label.place(relx=1.0, x=-14, y=11, anchor="ne")
+        self.tof_title = dist_card.winfo_children()[0]
+        self._tof_font = tkfont.Font(font=self.tof_label.cget("font"))
+        self.tof_var.trace_add("write", lambda *_: self._fit_tof())
+        dist_card.bind("<Configure>", lambda e: self._fit_tof())
+        self._fit_tof()
 
         # motion
         imu_card, m = self._card(right, "Motion (MPU-6050)")
@@ -2562,6 +2570,21 @@ class Dashboard:
         except ValueError:
             return
         self._post(lambda: self._show_tof(mm))
+
+    def _fit_tof(self):
+        """Show the gripper text in the room left of the card title: the full text, else without '· in jaws', else just the number."""
+        full = self.tof_var.get()
+        short = full.split(" · ")[0]
+        tiny = short.replace("Gripper:", "").replace("Gripper", "").strip()
+        title = self.tof_title
+        room = title.master.winfo_width() - 14 - (title.winfo_x() + title.winfo_reqwidth()) - 10
+        text = tiny
+        for candidate in (full, short, tiny):
+            if self._tof_font.measure(candidate) <= room:
+                text = candidate
+                break
+        if self.tof_shown.get() != text:
+            self.tof_shown.set(text)
 
     def _show_tof(self, mm):
         self.tof_mm = None if mm < 0 else mm

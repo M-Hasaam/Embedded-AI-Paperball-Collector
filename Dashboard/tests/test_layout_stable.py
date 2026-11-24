@@ -91,13 +91,23 @@ class LayoutStableTest(unittest.TestCase):
         self.win.update_idletasks()
         self.assertLessEqual(self.win.winfo_reqheight(), 880)
 
-    def test_the_gripper_line_does_not_cover_the_card_title(self):
+    def test_the_gripper_line_never_covers_the_card_title(self):
+        # in a narrower window the full text covered the title ("DISTANCE (ULTRASON"): it must get shorter instead
         app = self.app
-        app.tof_var.set("Gripper 25 mm · in jaws")
-        self.win.geometry("1400x900+3000+3000")
+        app.tof_var.set("Gripper 54 mm · in jaws")
+        for width in (1400, 1100, 900, 760):
+            self.win.geometry(f"{width}x900+3000+3000")
+            self.win.update()
+            title = app.tof_title
+            self.assertLessEqual(title.winfo_x() + title.winfo_reqwidth(), app.tof_label.winfo_x(), f"covered at {width} px")
+            self.assertIn("54", app.tof_shown.get())                      # still says the number
+
+    def test_the_full_text_is_shown_when_there_is_room(self):
+        app = self.app
+        app.tof_var.set("Gripper 54 mm · in jaws")
+        self.win.geometry("1600x900+3000+3000")
         self.win.update()
-        title = app.tof_label.master.winfo_children()[0]
-        self.assertLessEqual(title.winfo_x() + title.winfo_reqwidth(), app.tof_label.winfo_x())
+        self.assertEqual(app.tof_shown.get(), "Gripper 54 mm · in jaws")
 
 
 if __name__ == "__main__":
