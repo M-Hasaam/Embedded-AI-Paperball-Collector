@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -7,6 +8,56 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dashboard  # noqa: E402
+
+
+class CtrlCTest(unittest.TestCase):
+    def pump(self, interrupted):
+        import queue
+        calls = []
+        app = types.SimpleNamespace(interrupted=interrupted, closing=False, ui_queue=queue.Queue(),
+                                    _refresh_camera=lambda: calls.append("camera"), _refresh_badges=lambda: None,
+                                    _path_tick=lambda: None, _close=lambda: calls.append("close"), _pump=lambda: None,
+                                    root=types.SimpleNamespace(after=lambda ms, fn: calls.append("again")))
+        dashboard.Dashboard._pump(app)
+        return calls
+
+    def test_ctrl_c_closes_the_dashboard_the_same_way_as_the_window_button(self):
+        self.assertEqual(self.pump(True), ["close"])               # closes, does not draw another picture, does not run again
+
+    def test_without_ctrl_c_the_pump_runs_as_usual(self):
+        self.assertEqual(self.pump(False), ["camera", "again"])
+
+
+class DistanceStampTest(unittest.TestCase):
+    def make_app(self):
+        class Bar:
+            def delete(self, *a): pass
+            def winfo_width(self): return 100
+            def create_rectangle(self, *a, **k): pass
+
+        class Var:
+            def set(self, v): self.v = v
+
+        class Label:
+            def configure(self, **k): pass
+
+        return types.SimpleNamespace(dist_bar=Bar(), dist_var=Var(), dist_note=Var(), dist_label=Label(), dist_cm=None, dist_stamp=None)
+
+    def test_a_reading_is_stamped_with_the_time(self):
+        app = self.make_app()
+        before = time.monotonic()
+        dashboard.Dashboard._show_distance(app, 25.0)
+        self.assertEqual(app.dist_cm, 25.0)
+        self.assertTrue(before <= app.dist_stamp <= time.monotonic())
+
+    def test_no_echo_is_still_a_new_reading(self):
+        app = self.make_app()
+        dashboard.Dashboard._show_distance(app, 25.0)
+        first = app.dist_stamp
+        time.sleep(0.05)
+        dashboard.Dashboard._show_distance(app, -1)
+        self.assertIsNone(app.dist_cm)
+        self.assertGreater(app.dist_stamp, first)
 
 
 class ServoCommandsTest(unittest.TestCase):
@@ -185,7 +236,7 @@ class ManualControlHookTest(unittest.TestCase):
 
         app = types.SimpleNamespace(
             connected=types.SimpleNamespace(is_set=lambda: True), loop=types.SimpleNamespace(is_running=lambda: True),
-            runner=types.SimpleNamespace(active=False), _runner_sending=sending, _yaw_resync=False, _write=write,
+            runner=types.SimpleNamespace(active=False), _runner_sending=sending, collect_window=None, _yaw_resync=False, _write=write,
             tracker=types.SimpleNamespace(set_command=lambda m: None),
             moves_window=types.SimpleNamespace(player=types.SimpleNamespace(active=True, abort=aborted.append)))
         return app, aborted
@@ -207,6 +258,29 @@ class ManualControlHookTest(unittest.TestCase):
         app, aborted = self.fake_app(sending=False)
         self.send(app, "U")
         self.assertEqual(aborted, ["manual control"])
+
+    def collect_app(self, sending, active=True):
+        app, _ = self.fake_app(sending=sending)
+        stops = []
+        app.collect_window = types.SimpleNamespace(approach=types.SimpleNamespace(active=active), stop=lambda: stops.append(1))
+        return app, stops
+
+    def test_manual_control_stops_collect(self):
+        for message in ("S", "U"):
+            app, stops = self.collect_app(sending=False)
+            self.send(app, message)
+            self.assertEqual(stops, [1], msg=message)
+
+    def test_collect_is_not_stopped_by_other_commands_the_runner_or_when_idle(self):
+        app, stops = self.collect_app(sending=False)
+        self.send(app, "P100")
+        self.assertEqual(stops, [])
+        app, stops = self.collect_app(sending=True)                  # the car's own turn commands come through the runner
+        self.send(app, "S")
+        self.assertEqual(stops, [])
+        app, stops = self.collect_app(sending=False, active=False)
+        self.send(app, "S")
+        self.assertEqual(stops, [])
 
     def test_commands_that_are_not_driving_do_not_abort(self):
         app, aborted = self.fake_app(sending=False)

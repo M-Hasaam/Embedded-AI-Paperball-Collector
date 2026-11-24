@@ -13,6 +13,7 @@ import asyncio
 import json
 import math
 import queue
+import signal
 import socket
 import statistics
 import struct
@@ -29,8 +30,13 @@ import numpy as np
 from bleak import BleakClient, BleakScanner
 from PIL import Image, ImageTk
 
-from ball_detector import DetectorWorker, draw_detections, summarize
-from moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, MoveFileError, MovePlayer, arm_step, describe_step,
+from helpers.ball_detector import DetectorWorker, draw_detections, summarize
+from helpers.ball_approach import Approach, BallTracker, Reading
+from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, draw_guides, draw_spot_marker, load_model,
+                                   save_model)
+from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
+from helpers.paths import data_file
+from helpers.moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, MoveFileError, MovePlayer, arm_step, describe_step,
                    drive_step, load_move, new_move, save_move, turn_step, validate_move, wait_step)
 
 # ---------------------------------------------------------------- settings
@@ -43,7 +49,7 @@ CAPTURE_DIR = Path(__file__).resolve().parent / "captures"
 
 # Car (ESP32-S3 over BLE)
 CAR_NAME = "AI_Car"
-CAR_ADDRESS_FILE = Path(__file__).with_name("ai_car_address.txt")   # the car's Bluetooth address, saved after the first connection
+CAR_ADDRESS_FILE = data_file("ai_car_address.txt")   # the car's Bluetooth address, saved after the first connection
 CHAR_UUID = "87654321-4321-4321-4321-BA0987654321"           # commands (write)
 DISTANCE_CHAR_UUID = "11223344-5566-7788-99AA-BBCCDDEEFF00"  # distance cm, "-1" = no echo
 MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011"       # "yaw,pitch,roll,gx,gy,gz,ax,ay,az"
@@ -60,7 +66,7 @@ SERVO_RANGE_DEFAULT = [(0, 100), (80, 180), (40, 170), (0, 180)]   # each servo 
 SERVO_RANGE_GAP = 5                       # the two ends of the range slider stay at least this far apart
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
 SERVO_SPEED = 60                  # default deg/s
-SERVO_MEMORY_FILE = Path(__file__).with_name("servo_last_angles.json")   # where each servo was left (so a restart starts from there)
+SERVO_MEMORY_FILE = data_file("servo_last_angles.json")   # where each servo was left (so a restart starts from there)
 CAR_SPEED_DEFAULT = 100           # wheel speed in percent for driving straight (forward / backward)
 CAR_TURN_SPEED_DEFAULT = 70       # wheel speed in percent for turning on the spot
 CAR_SPEED_MIN = 20                # below this the wheels usually stall
@@ -474,7 +480,7 @@ class PathRunner:
         self.turn_started, self.turn_moved, self.quiet_since = 0.0, False, None
         self.coast_cm = 10.0            # how far the car rolls on after a stop command; learned from every leg (it was 10-15 cm)
         self.stop_at = None             # where the stop command for the leg was sent
-        self.log_file = Path(__file__).with_name("path_runner_log.txt")   # one line per step, to see where a return goes wrong
+        self.log_file = data_file("path_runner_log.txt")   # one line per step, to see where a return goes wrong
         self.move_from = None
 
     def _log(self, now, text):
@@ -1528,6 +1534,309 @@ class MovesWindow:
             self.load(Path(path))
 
 
+# ---------------------------------------------------------------- collect: drive to a paper ball and pick it up
+class DashboardWorld:
+    """What the Approach sees of the dashboard: the steady ball, the time of the newest camera result, and the newest distance reading."""
+
+    def __init__(self, app, tracker):
+        self.app, self.tracker = app, tracker
+        self._frame_stamp = None
+
+    def feed(self, result):
+        if result is None:
+            return
+        self.tracker.update(result)
+        if self._frame_stamp is None or result.stamp > self._frame_stamp:
+            self._frame_stamp = result.stamp
+
+    def ball(self):
+        return self.tracker.ball()
+
+    def frame_stamp(self):
+        return self._frame_stamp
+
+    def reading(self):
+        stamp = self.app.dist_stamp
+        return None if stamp is None else Reading(self.app.dist_cm, stamp)
+
+    def camera_cm(self, ball):
+        model = self.app.distance_model
+        return None if model is None else model.distance_cm(ball.bottom_y)
+
+    def balls_seen_since(self, stamp):
+        return self.tracker.seen_since(stamp)
+
+
+class CollectWindow:
+    """Teach the camera its distances and the grab spot, then Collect: the car turns to the paper ball, hops toward it, and plays a
+    recorded pick-up move when the ultrasonic sensor says the ball is in the pick range (see ball_approach.py)."""
+
+    READING_MAX_AGE_S = 2.0           # a grab spot is taught from a reading no older than this
+
+    def __init__(self, app, car=None, moves_dir=MOVES_DIR, log_path=None):
+        self.app = app
+        self.car = car or DashboardCar(app)
+        self.moves_dir = Path(moves_dir)
+        self.log_path = Path(log_path) if log_path else data_file("collect_log.txt")     # every run is written here
+        self._logged, self._end_logged, self._player_status = 0, True, ""
+        self.tracker = BallTracker()
+        self.world = DashboardWorld(app, self.tracker)
+        self.approach = None
+        self.samples = []             # (distance cm, bottom row) pairs for the camera calibration
+        self.move = None              # the selected pick-up move, validated
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Collect - drive to a paper ball and pick it up")
+        win.configure(bg=BG)
+        win.geometry("640x640+160+40")
+        win.minsize(560, 520)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        self.status_var = tk.StringVar(master=win, value="Tick 'Detect paper balls' and put a ball in front of the camera.")
+        self.distance_var = tk.StringVar(master=win, value="")
+        self.spot_var = tk.StringVar(master=win, value=self._spot_text())
+        self.move_var = tk.StringVar(master=win)
+
+        def label(text, **kw):
+            return tk.Label(win, text=text, bg=BG, fg=kw.pop("fg", MUTED), font=(FONT, kw.pop("size", 9)), justify="left",
+                            anchor="w", **kw)
+
+        label("1. Camera distances (optional, makes it more accurate). Put the ball at a measured distance from the lens, "
+              "type it, Record. Do three or more different distances, then Fit and save.", wraplength=600).pack(fill="x", padx=12, pady=(10, 2))
+        cal = tk.Frame(win, bg=BG)
+        cal.pack(fill="x", padx=12, pady=2)
+        tk.Label(cal, text="Distance (cm)", bg=BG, fg=TEXT, font=(FONT, 9)).pack(side="left")
+        tk.Entry(cal, textvariable=self.distance_var, width=6, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat").pack(side="left", padx=6)
+        for text, command in (("Record", self._record_dialog), ("Clear", self.clear_samples), ("Fit and save", self.fit_and_save)):
+            app._button(cal, text, command).pack(side="left", padx=(0, 6))
+        self.samples_box = tk.Listbox(win, bg=CARD, fg=TEXT, highlightthickness=1, highlightbackground=LINE, relief="flat",
+                                      font=(FONT, 9), height=5, activestyle="none", exportselection=False)
+        self.samples_box.pack(fill="x", padx=12, pady=4)
+        label("2. Grab spot: put the ball where the pick-up move works (the car stopped, ball steady in the picture), then press Set grab spot.",
+              wraplength=600).pack(fill="x", padx=12, pady=(8, 2))
+        spot = tk.Frame(win, bg=BG)
+        spot.pack(fill="x", padx=12, pady=2)
+        app._button(spot, "Set grab spot", self.set_grab_spot).pack(side="left")
+        tk.Label(spot, textvariable=self.spot_var, bg=BG, fg=ACCENT, font=(FONT, 9, "bold")).pack(side="left", padx=10)
+        label("3. Choose the pick-up move and press Collect. The car moves by itself: STOP, the arrow keys or closing this window stop it.",
+              wraplength=600).pack(fill="x", padx=12, pady=(8, 2))
+        run = tk.Frame(win, bg=BG)
+        run.pack(fill="x", padx=12, pady=2)
+        self.combo = ttk.Combobox(run, textvariable=self.move_var, values=self.move_names(), width=24, state="readonly",
+                                  postcommand=lambda: self.combo.configure(values=self.move_names()))
+        self.combo.pack(side="left")
+        self.combo.bind("<<ComboboxSelected>>", lambda e: self.select_move(self.move_var.get()))
+        app._button(run, "Collect", self._collect_dialog).pack(side="left", padx=8)
+        app._button(run, "STOP", self.stop, danger=True).pack(side="left")
+        tk.Label(win, textvariable=self.status_var, bg=BG, fg=TEXT, font=(FONT, 10, "bold"), wraplength=600, justify="left",
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        self.log_box = tk.Listbox(win, bg=CARD, fg=TEXT, highlightthickness=1, highlightbackground=LINE, relief="flat",
+                                  font=(FONT, 9), height=12, activestyle="none", exportselection=False)
+        self.log_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        win.after(50, self._loop)
+
+    # ---- helpers ------------------------------------------------------
+    def _status(self, text):
+        self.status_var.set(text)
+
+    def _log(self, text):
+        """Append a line to the run log (what it decided, which move step it was on, why it stopped). Never breaks Collect."""
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+        except OSError:
+            pass
+
+    def _log_progress(self):
+        """Write what is new since the last call: decision lines, the move step in progress, and how the run ended."""
+        approach = self.approach
+        if approach is None:
+            return
+        for line in approach.log[self._logged:]:
+            self._log(line)
+        self._logged = len(approach.log)
+        if approach.player.active and approach.player.status != self._player_status:
+            self._player_status = approach.player.status
+            self._log(f"  move: {self._player_status}")
+        if not approach.active and not self._end_logged:
+            self._end_logged = True
+            self._log(approach.status)
+
+    def _spot_text(self):
+        spot = self.app.grab_spot
+        if spot is None:
+            return "no grab spot yet"
+        return f"grab spot: {spot.x_ratio * 100:.0f}% across, sensor {spot.ultrasonic_cm:.1f} cm (pick range {spot.pick_min:.0f}-{spot.pick_max:.0f})"
+
+    def _feed(self):
+        self.world.feed(self.app.detector.latest_frame())
+
+    def _refresh_samples(self, errors=None):
+        self.samples_box.delete(0, "end")
+        for n, (cm, row) in enumerate(self.samples):
+            text = f"{cm:g} cm  -  picture row {row:.0f}"
+            if errors and n < len(errors):
+                text += f"   (the model says {errors[n][1]:.1f} cm, off by {errors[n][2]:+.1f})"
+            self.samples_box.insert("end", text)
+
+    # ---- camera distances ---------------------------------------------
+    def record_sample(self, distance_cm):
+        self._feed()
+        ball = self.world.ball()
+        if ball is None:
+            self._status("No steady ball in the picture: tick 'Detect paper balls' and keep the ball still in view.")
+            return False
+        self.samples.append((float(distance_cm), ball.bottom_y))
+        self._refresh_samples()
+        self._status(f"Recorded {float(distance_cm):g} cm ({len(self.samples)} so far)")
+        return True
+
+    def clear_samples(self):
+        self.samples = []
+        self._refresh_samples()
+        self._status("Cleared the recorded distances")
+
+    def fit_and_save(self, path=CALIB_FILE):
+        try:
+            model = DistanceModel.fit(self.samples)
+            save_model(path, model)
+        except (CalibrationError, OSError) as e:
+            self._status(str(e))
+            return False
+        self.app.distance_model = model
+        self._refresh_samples(model.errors())
+        worst = max((abs(e[2]) for e in model.errors()), default=0.0)
+        self._status(f"Saved the camera distances (the worst point is off by {worst:.1f} cm). Tick 'Distance lines' to check them.")
+        return True
+
+    # ---- grab spot ----------------------------------------------------
+    def set_grab_spot(self, path=SPOT_FILE, now=None):
+        now = time.monotonic() if now is None else now
+        self._feed()
+        ball = self.world.ball()
+        reading = self.world.reading()
+        if ball is None:
+            self._status("No steady ball in the picture: the ball must be where the move works, and still.")
+            return False
+        if reading is None or reading.cm is None or now - reading.stamp > self.READING_MAX_AGE_S:
+            self._status("No fresh distance reading: the sensor must see the ball (is the car connected?).")
+            return False
+        camera = self.world.camera_cm(ball)
+        try:
+            spot = GrabSpot(ball.x_ratio, reading.cm, camera)
+            save_spot(path, spot)
+        except (GrabSpotError, OSError) as e:
+            self._status(str(e))
+            return False
+        self.app.grab_spot = spot
+        self.spot_var.set(self._spot_text())
+        self._status("Grab spot saved.")
+        return True
+
+    # ---- the move and collecting --------------------------------------
+    def move_names(self):
+        return sorted(p.stem for p in self.moves_dir.glob("*.json")) if self.moves_dir.exists() else []
+
+    def select_move(self, name):
+        try:
+            move = load_move(self.moves_dir / f"{name}.json")
+        except MoveFileError as e:
+            self.move = None
+            self._status(str(e))
+            return False
+        problems = validate_move(move, list(zip(SERVO_MIN_ANGLES, SERVO_MAX_ANGLES)))
+        if problems:
+            self.move = None
+            self._status(f"{name} will not play: {problems[0]}")
+            return False
+        self.move = move
+        self.move_var.set(name)
+        self._status(f"Move: {name}")
+        return True
+
+    def collect(self, now=None):
+        if self.approach is not None and self.approach.active:
+            self._status("Already collecting")
+            return False
+        if self.app.grab_spot is None:
+            self._status("Set the grab spot first.")
+            return False
+        if self.move is None:
+            self._status("Choose a pick-up move first.")
+            return False
+        if not self.car.connected():
+            self._status("The car is not connected.")
+            return False
+        if not self.select_move(self.move_var.get()):    # read the file again: it may have been edited and saved since it was chosen
+            return False
+        self.app.detect_var.set(True)                    # the camera needs the model running
+        self.app.detector.error = ""
+        self.app.detector.enabled = True
+        self.tracker.reset()
+        self.approach = Approach(self.world, self.car, MovePlayer(self.car, SERVO_NAMES), self.move, self.app.grab_spot)
+        if not self.approach.start(time.monotonic() if now is None else now):
+            self._status("Could not start.")
+            return False
+        self._logged, self._end_logged, self._player_status = 0, False, ""
+        self._log(f"Collect started: move '{self.move_var.get()}' ({len(self.move['steps'])} steps, smooth={self.move.get('smooth')}), "
+                  f"grab spot {self.app.grab_spot.x_ratio:.3f} across / sensor {self.app.grab_spot.ultrasonic_cm:.1f} cm")
+        self._status(self.approach.status)
+        return True
+
+    def stop(self):
+        if self.approach is not None and self.approach.active:
+            self.approach.abort("stopped by you")
+            self._status(self.approach.status)
+            self._log_progress()
+        else:
+            self.car.stop()
+            self._status("Stopped")
+
+    def tick(self, now):
+        self._feed()
+        if self.approach is None:
+            return
+        was_active = self.approach.active
+        self.approach.tick(now)
+        if was_active or self.approach.active:
+            self._status(self.approach.status)
+            self.log_box.delete(0, "end")
+            for line in self.approach.log[-12:]:
+                self.log_box.insert("end", line)
+            self.log_box.see("end")
+        self._log_progress()
+
+    def _loop(self):
+        if self.win is None:
+            return
+        self.tick(time.monotonic())
+        self.win.after(50, self._loop)
+
+    def close(self):
+        if self.win is None:
+            return
+        if self.approach is not None and self.approach.active:
+            self.approach.abort("window closed")
+            self._log_progress()
+        self.app.collect_window = None
+        win, self.win = self.win, None
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    # ---- the buttons: ask, then call the methods above -----------------
+    def _record_dialog(self):
+        try:
+            cm = float(self.distance_var.get().replace(",", "."))
+        except ValueError:
+            self._status("Type the ball's distance in cm first.")
+            return
+        self.record_sample(cm)
+
+    def _collect_dialog(self):
+        if messagebox.askokcancel("Collect", "The car will drive by itself and the arm will move. Is the area clear?", parent=self.win):
+            self.collect()
+
+
 # ---------------------------------------------------------------- dashboard
 class RangeSlider(tk.Canvas):
     """A slider with two handles: drag either end to set the lowest and highest value (whole numbers)."""
@@ -1596,6 +1905,7 @@ class Dashboard:
         self.connected = threading.Event()
         self.stop_event = threading.Event()
         self.closing = False
+        self.interrupted = False       # set by Ctrl+C in the terminal; _pump then closes the dashboard cleanly
         self.active_key = None
         self.heading_deg = 0.0
 
@@ -1628,6 +1938,17 @@ class Dashboard:
         self.detect_var = tk.BooleanVar(value=False)      # "Detect paper balls": off until you tick it
         self.detect_status_var = tk.StringVar(value="")
         self.detect_conf_var = tk.StringVar(value="50%")
+        self.lines_var = tk.BooleanVar(value=False)       # "Distance lines": the reversing-camera guide lines, off until ticked
+        self.distance_model = self.grab_spot = None       # the camera distance calibration and the taught grab spot (if saved)
+        startup_problems = []
+        for what, load, path, error in (("distance_model", load_model, CALIB_FILE, CalibrationError),
+                                        ("grab_spot", load_spot, SPOT_FILE, GrabSpotError)):
+            try:
+                setattr(self, what, load(path))
+            except error as e:
+                startup_problems.append(str(e))
+        self.detect_status_var.set("; ".join(startup_problems))
+        self.collect_window = None                        # the Collect window, when open (its grab direction is drawn on the picture)
         self.saved = 0
 
         # Path map: dead reckoning from the gyro heading + wheel-encoder distance
@@ -1646,6 +1967,7 @@ class Dashboard:
         self.pulse_window = None
         self.moves_window = None
         self.dist_cm = None            # latest distance reading, None = nothing in range
+        self.dist_stamp = None         # time.monotonic() of the newest reading (a "no echo" counts), None = none since connecting
         self.gz = 0.0                  # latest turning speed (deg/s)
         self._yaw_resync = True        # the car's yaw was zeroed / it rebooted: don't treat the jump as a turn
         self._runner_sending = False
@@ -1689,8 +2011,8 @@ class Dashboard:
 
     def _build_ui(self):
         root = self.root
-        root.columnconfigure(0, weight=3)
-        root.columnconfigure(1, weight=2, minsize=430)
+        root.columnconfigure(0, weight=3, uniform="main")     # uniform: the split stays 3:2 whatever the texts inside ask for
+        root.columnconfigure(1, weight=2, minsize=430, uniform="main")
         root.rowconfigure(1, weight=1)
 
         # header
@@ -1705,6 +2027,7 @@ class Dashboard:
         self._button(header, "Path map", self.open_path_window).pack(side="right", padx=(0, 8))
         self._button(header, "Pulse chart", self.open_pulse_window).pack(side="right", padx=(0, 8))
         self._button(header, "Moves", self.open_moves_window).pack(side="right", padx=(0, 8))
+        self._button(header, "Collect", self.open_collect_window).pack(side="right", padx=(0, 8))
 
         # camera column
         left = tk.Frame(root, bg=BG)
@@ -1721,8 +2044,8 @@ class Dashboard:
         # top row: distance and wheel encoders side by side (the right column has no height to spare)
         top = tk.Frame(right, bg=BG)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(0, weight=3)
-        top.columnconfigure(1, weight=2)
+        top.columnconfigure(0, weight=3, uniform="top")
+        top.columnconfigure(1, weight=2, uniform="top")
         top.rowconfigure(0, weight=1)
 
         # distance
@@ -1945,6 +2268,9 @@ class Dashboard:
         self.ui_queue.put(fn)
 
     def _pump(self):
+        if self.interrupted:                  # Ctrl+C in the terminal: close like the window's X button does
+            self._close()
+            return
         try:
             while True:
                 self.ui_queue.get_nowait()()
@@ -2003,7 +2329,12 @@ class Dashboard:
             selectcolor=CARD_HI, activebackground=CARD, activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0,
             anchor="w", font=(FONT, 9), cursor="hand2",
         ).pack(side="left")
-        tk.Label(det_row1, text="confidence", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(12, 4))
+        tk.Checkbutton(
+            det_row1, text="Distance lines", variable=self.lines_var, bg=CARD, fg=TEXT,
+            selectcolor=CARD_HI, activebackground=CARD, activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0,
+            anchor="w", font=(FONT, 9), cursor="hand2",
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(det_row1, text="confidence", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(8, 4))
         conf_scale = self._scale(det_row1, 25, 90, 50, self._detect_conf_changed, thin=True)
         conf_scale.configure(length=100)
         conf_scale.pack(side="left")
@@ -2035,6 +2366,11 @@ class Dashboard:
                 if result[0] >= fid - 5:       # the model's answer for a frame from the last moments: draw it on this one
                     rgb = draw_detections(rgb, result[1])
                 self.detect_status_var.set(summarize(result[1], result[2]))
+        if not showing_photo:
+            if self.lines_var.get() and self.distance_model is not None:
+                rgb = draw_guides(rgb, self.distance_model)
+            if self.collect_window is not None and self.grab_spot is not None:
+                rgb = draw_spot_marker(rgb, self.grab_spot.x_ratio)
         w, h = self.video.winfo_width(), self.video.winfo_height()
         if w < 20 or h < 20:
             return
@@ -2142,6 +2478,7 @@ class Dashboard:
         bar.delete("all")
         w = max(bar.winfo_width(), 1)
         self.dist_cm = None if cm < 0 else cm
+        self.dist_stamp = time.monotonic()
         if cm < 0:
             self.dist_var.set("--")
             self.dist_note.set("nothing in range")
@@ -2302,6 +2639,7 @@ class Dashboard:
         self.roll_var.set("Side tilt: --")
         self.heading_deg = 0.0
         self.dist_cm = None
+        self.dist_stamp = None
         self.enc_dist_var.set("--")
         self.enc_speed_var.set("waiting for encoders")
         self.enc_wheels_var.set("L -- · R --")
@@ -2426,6 +2764,9 @@ class Dashboard:
                 self.runner.abort("manual control")       # you touched the controls: take over
             if self.moves_window is not None and self.moves_window.player.active and not self._runner_sending:
                 self.moves_window.player.abort("manual control")
+            collect = self.collect_window
+            if collect is not None and collect.approach is not None and collect.approach.active and not self._runner_sending:
+                collect.stop()                             # collecting drives the car by itself: any manual command ends it
             self.tracker.set_command(message)
         elif message in ("Z", "C"):
             self._yaw_resync = True                        # the car zeroes its heading on these
@@ -2465,6 +2806,12 @@ class Dashboard:
             self.moves_window = MovesWindow(self)
         else:
             self.moves_window.win.lift()
+
+    def open_collect_window(self):
+        if self.collect_window is None:
+            self.collect_window = CollectWindow(self)
+        else:
+            self.collect_window.win.lift()
 
     def _path_ready(self):
         if not self.connected.is_set():
@@ -2806,6 +3153,8 @@ class Dashboard:
         self.stop_event.set()
         self.camera.stop_event.set()
         self.detector.stop_event.set()
+        if self.collect_window is not None:
+            self.collect_window.close()     # stops a collect run
         if self.moves_window is not None:
             self.moves_window.close()       # stops a move that is playing
         if self.pulse_window is not None:
@@ -2824,7 +3173,10 @@ class Dashboard:
 
 def main():
     root = tk.Tk()
-    Dashboard(root)
+    app = Dashboard(root)
+    # Ctrl+C would otherwise raise KeyboardInterrupt inside whatever Tk callback is running (a mess in the terminal, and the window
+    # stays open). Just note it: _pump closes the dashboard properly within 30 ms.
+    signal.signal(signal.SIGINT, lambda *args: setattr(app, "interrupted", True))
     root.mainloop()
 
 
