@@ -4,6 +4,7 @@
 #include <BLE2902.h>
 #include <string.h>
 #include <Wire.h>
+#include <VL53L0X.h>   // Arduino library "VL53L0X" by Pololu (Library Manager)
 #include <math.h>
 
 // HC-SR04 ultrasonic sensor pins.
@@ -48,6 +49,16 @@ const float MPU_STILL_BIAS_ALPHA = 0.004f;        // zero-point learning per sam
 const float MPU_STILL_FREEZE_DPS = 1.0f;          // while still, a rate below this is not added to the heading
 const char* MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011";
 
+// VL53L0X time-of-flight sensor in the gripper (GY-VL53L0X board, I2C address 0x29). It has its own I2C bus (Wire1) on two
+// other pins, so a bad wire or a loose connector on the moving arm cannot stop the MPU-6050 bus. Wire VIN -> 3V3, GND -> GND,
+// SDA -> TOF_SDA_PIN, SCL -> TOF_SCL_PIN (the board has pull-up resistors); leave XSHUT and GPIO1 unconnected.
+const int TOF_SDA_PIN = 39;
+const int TOF_SCL_PIN = 40;
+const unsigned long TOF_INTERVAL_MS = 100;        // time between readings sent to the PC (the sensor itself measures every 50 ms)
+const unsigned long TOF_STALL_MS = 1000;          // no new measurement for this long = the sensor froze: restart it
+const uint16_t TOF_MAX_MM = 1200;                // farther than this (or no echo) is sent as -1
+const char* TOF_CHAR_UUID = "55667788-99AA-BBCC-DDEE-FF0011223344";
+
 // Built-in RGB status LED (GPIO 48 on most ESP32-S3 boards; if your board shows no colour, its LED is on another pin).
 void statusLed(uint8_t r, uint8_t g, uint8_t b) {
 #ifdef RGB_BUILTIN
@@ -67,6 +78,11 @@ BLEServer* pServer = nullptr;
 BLECharacteristic* pCharacteristic = nullptr;
 BLECharacteristic* pDistanceCharacteristic = nullptr;
 BLECharacteristic* pMpuCharacteristic = nullptr;
+BLECharacteristic* pTofCharacteristic = nullptr;
+
+VL53L0X tof;
+bool tofOk = false;
+unsigned long lastTofRead = 0, lastTofRetry = 0, lastTofGood = 0;   // lastTofGood: when the sensor last gave a new measurement
 
 bool deviceConnected = false;
 unsigned long lastDistanceRead = 0;
@@ -871,6 +887,116 @@ void updateDistance() {
   }
 }
 
+// Frees an I2C bus whose data line a slave holds low (a sensor that was reset or lost power in the middle of a byte keeps
+// driving SDA until it sees enough clock pulses): up to 9 clock pulses on SCL, then a STOP. Returns true if SDA is high after.
+bool tofClearBus() {
+  pinMode(TOF_SCL_PIN, OUTPUT_OPEN_DRAIN);
+  pinMode(TOF_SDA_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(TOF_SDA_PIN, HIGH);
+  digitalWrite(TOF_SCL_PIN, HIGH);
+  delayMicroseconds(10);
+  for (int i = 0; i < 9 && digitalRead(TOF_SDA_PIN) == LOW; i++) {
+    digitalWrite(TOF_SCL_PIN, LOW);  delayMicroseconds(10);
+    digitalWrite(TOF_SCL_PIN, HIGH); delayMicroseconds(10);
+  }
+  digitalWrite(TOF_SDA_PIN, LOW);  delayMicroseconds(10);       // STOP: SDA rises while SCL is high
+  digitalWrite(TOF_SDA_PIN, HIGH); delayMicroseconds(10);
+  pinMode(TOF_SDA_PIN, INPUT_PULLUP);
+  pinMode(TOF_SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(10);
+  return digitalRead(TOF_SDA_PIN) == HIGH;
+}
+
+// Starts the gripper's VL53L0X on Wire1 and says on the serial port why it failed. It never blocks start-up for long: a missing
+// sensor just means tofOk stays false and updateTof() tries again. A data line held low is first freed with clock pulses (that
+// stayed "not found" for good before, until the whole board was restarted).
+bool tofInit() {
+  Wire1.end();
+  pinMode(TOF_SDA_PIN, INPUT_PULLUP);
+  pinMode(TOF_SCL_PIN, INPUT_PULLUP);
+  delay(2);
+  if (digitalRead(TOF_SCL_PIN) == LOW) { Serial.println("VL53L0X: SCL is held low (short to GND, or no power on the sensor board?)"); return false; }
+  if (digitalRead(TOF_SDA_PIN) == LOW) {
+    bool freed = tofClearBus();
+    Serial.println(freed ? "VL53L0X: SDA was held low, freed it with clock pulses"
+                         : "VL53L0X: SDA is held low and stays low (short to GND, or the sensor is stuck: power-cycle it)");
+    if (!freed) return false;
+  }
+  Wire1.begin(TOF_SDA_PIN, TOF_SCL_PIN);
+  Wire1.setClock(100000);       // 100 kHz: slower than the MPU's 400 kHz on purpose, the wires run along the moving arm
+  tof.setBus(&Wire1);
+  tof.setTimeout(100);
+  Wire1.beginTransmission(0x29);
+  if (Wire1.endTransmission() != 0) {
+    Serial.print("VL53L0X: nothing answers at 0x29. I2C devices on that bus:");
+    int found = 0;
+    for (uint8_t a = 1; a < 127; a++) {
+      Wire1.beginTransmission(a);
+      if (Wire1.endTransmission() == 0) { Serial.printf(" 0x%02X", a); found++; }
+    }
+    Serial.println(found ? "" : " none (check SDA/SCL/power)");
+    return false;
+  }
+  // Soft reset (the chip's own reset register), the way ST's driver does it: a sensor that froze keeps its frozen state through
+  // a plain re-init. The model id register reads 0 while the chip is in reset and 0xEE once it has started again.
+  tof.writeReg(0xBF, 0x00);
+  for (int i = 0; i < 10 && tof.readReg(0xC0) != 0x00; i++) delay(2);
+  delay(2);
+  tof.writeReg(0xBF, 0x01);
+  for (int i = 0; i < 10 && tof.readReg(0xC0) == 0x00; i++) delay(2);
+  delay(2);
+  if (!tof.init()) { Serial.println("VL53L0X: it answers but its start-up (init) failed"); return false; }
+  tof.startContinuous(50);
+  lastTofGood = millis();
+  return true;
+}
+
+// Reads the gripper sensor about every TOF_INTERVAL_MS and notifies the BLE client: millimetres as text, "-1" = nothing in
+// range, "NA" = sensor not found. While it is missing it is looked for again every 2 s (wired after boot).
+void updateTof() {
+  unsigned long now = millis();
+  if (turnActive) { lastTofGood = now; return; }       // keep the turn loop fast; a sensor read or init can take a few ms
+  if (!tofOk) {
+    if (now - lastTofRetry >= 2000) {
+      lastTofRetry = now;
+      tofOk = tofInit();
+      Serial.println(tofOk ? "VL53L0X ready" : "VL53L0X not found (check SDA/SCL/power)");
+      if (!tofOk && deviceConnected && pTofCharacteristic) {
+        pTofCharacteristic->setValue((uint8_t*)"NA", 2);
+        pTofCharacteristic->notify();
+      }
+    }
+    return;
+  }
+  if (now - lastTofRead < TOF_INTERVAL_MS) return;
+  if (!(tof.readReg(0x13) & 0x07)) {                   // RESULT_INTERRUPT_STATUS: no new measurement yet (never wait for one)
+    // A healthy sensor has one every 50 ms. None for TOF_STALL_MS means it froze or the bus hung (a failed read also looks like
+    // "no measurement"): restart it, and tell the PC so it does not keep showing the last value.
+    if (now - lastTofGood >= TOF_STALL_MS) {
+      Serial.println("VL53L0X stopped answering: restarting it");
+      tofOk = false;
+      lastTofRetry = now - 1500;                       // first retry in 0.5 s
+      if (deviceConnected && pTofCharacteristic) {
+        pTofCharacteristic->setValue((uint8_t*)"NA", 2);
+        pTofCharacteristic->notify();
+      }
+    }
+    return;
+  }
+  lastTofRead = now;
+  lastTofGood = now;
+  uint16_t mm = tof.readRangeContinuousMillimeters();
+  if (tof.timeoutOccurred()) { tofOk = false; lastTofRetry = now - 1500; return; }   // answered badly: restart it
+  char buf[12];
+  if (mm > TOF_MAX_MM) snprintf(buf, sizeof(buf), "-1");   // the library returns 65535 on a timeout and ~8190 for "nothing"
+  else snprintf(buf, sizeof(buf), "%u", (unsigned)mm);
+  Serial.printf("Gripper sensor: %s mm\n", buf);
+  if (deviceConnected && pTofCharacteristic) {
+    pTofCharacteristic->setValue((uint8_t*)buf, strlen(buf));
+    pTofCharacteristic->notify();
+  }
+}
+
 // Beeps (non-blocking) while distanceAlarm is set, silent otherwise.
 void updateBuzzer() {
   static unsigned long lastToggle = 0;
@@ -1553,6 +1679,10 @@ void setup() {
   lastMpuMicros = micros();
   Serial.println(mpuOk ? "MPU-6050 ready (keep the car still while it calibrates)" : "ERROR: MPU-6050 not found (check SDA/SCL/power)");
 
+  tofOk = tofInit();
+  lastTofRetry = millis();
+  Serial.println(tofOk ? "VL53L0X ready" : "VL53L0X not found (it is looked for again every 2 s)");
+
   // Servo signals are not started here: each servo starts when it is first commanded (see attachServo).
 
   BLEDevice::init("AI_Car");
@@ -1564,8 +1694,9 @@ void setup() {
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
+  // 30 attribute handles: the default 15 is exactly used up by the five characteristics before the gripper sensor's.
   BLEService* pService =
-    pServer->createService("12345678-1234-1234-1234-1234567890AB");
+    pServer->createService(BLEUUID("12345678-1234-1234-1234-1234567890AB"), 30);
 
   pCharacteristic = pService->createCharacteristic(
     "87654321-4321-4321-4321-BA0987654321",
@@ -1606,6 +1737,14 @@ void setup() {
     BLECharacteristic::PROPERTY_NOTIFY
   );
   pServoStatusCharacteristic->addDescriptor(new BLE2902());
+
+  // Gripper sensor (mm, ASCII text, "-1" = nothing in range, "NA" = sensor not found) notified to the client.
+  pTofCharacteristic = pService->createCharacteristic(
+    TOF_CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pTofCharacteristic->addDescriptor(new BLE2902());
 
   pService->start();
   markStage(6);
@@ -1655,6 +1794,7 @@ void loop() {
   updateStatusLed();
   updateServos();
   updateDistance();
+  updateTof();
   updateBuzzer();
   updateMpu();
   updateTurn();
