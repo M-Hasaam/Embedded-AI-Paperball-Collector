@@ -907,10 +907,13 @@ bool tofClearBus() {
   return digitalRead(TOF_SDA_PIN) == HIGH;
 }
 
-// Starts the gripper's VL53L0X on Wire1 and says on the serial port why it failed. It never blocks start-up for long: a missing
-// sensor just means tofOk stays false and updateTof() tries again. A data line held low is first freed with clock pulses (that
-// stayed "not found" for good before, until the whole board was restarted).
-bool tofInit() {
+// Starts the gripper's VL53L0X on Wire1 and says on the serial port why it failed. A missing sensor just means tofOk stays false
+// and updateTof() tries again. A data line held low is first freed with clock pulses (that stayed "not found" for good before,
+// until the whole board was restarted).
+// It must never hold up loop() for long: the stop taper, soft start, straight assist and encoder drives all run there. The I2C
+// driver waits 50 ms per address that does not answer, so a scan of all 126 addresses froze the car for 6 s at a time (it kept
+// driving after the key was released). The wait is cut to 5 ms, and only the start-up call (scan = true) lists the devices.
+bool tofInit(bool scan) {
   Wire1.end();
   pinMode(TOF_SDA_PIN, INPUT_PULLUP);
   pinMode(TOF_SCL_PIN, INPUT_PULLUP);
@@ -924,10 +927,12 @@ bool tofInit() {
   }
   Wire1.begin(TOF_SDA_PIN, TOF_SCL_PIN);
   Wire1.setClock(100000);       // 100 kHz: slower than the MPU's 400 kHz on purpose, the wires run along the moving arm
+  Wire1.setTimeOut(5);          // ms a transfer may take (the default 50 ms makes an empty bus very slow)
   tof.setBus(&Wire1);
   tof.setTimeout(100);
   Wire1.beginTransmission(0x29);
   if (Wire1.endTransmission() != 0) {
+    if (!scan) return false;
     Serial.print("VL53L0X: nothing answers at 0x29. I2C devices on that bus:");
     int found = 0;
     for (uint8_t a = 1; a < 127; a++) {
@@ -952,14 +957,17 @@ bool tofInit() {
 }
 
 // Reads the gripper sensor about every TOF_INTERVAL_MS and notifies the BLE client: millimetres as text, "-1" = nothing in
-// range, "NA" = sensor not found. While it is missing it is looked for again every 2 s (wired after boot).
+// range, "NA" = sensor not found. While it is missing it is looked for again every TOF_RETRY_MS (wired after boot), but only
+// while the car stands still: a start-up attempt can take a few hundred ms, which must never happen while it drives.
+const unsigned long TOF_RETRY_MS = 3000;
 void updateTof() {
   unsigned long now = millis();
   if (turnActive) { lastTofGood = now; return; }       // keep the turn loop fast; a sensor read or init can take a few ms
   if (!tofOk) {
-    if (now - lastTofRetry >= 2000) {
+    bool idle = !motorState[0] && !motorState[1] && !motorState[2] && !motorState[3] && driveState == 0;
+    if (idle && now - lastTofRetry >= TOF_RETRY_MS) {
       lastTofRetry = now;
-      tofOk = tofInit();
+      tofOk = tofInit(false);
       Serial.println(tofOk ? "VL53L0X ready" : "VL53L0X not found (check SDA/SCL/power)");
       if (!tofOk && deviceConnected && pTofCharacteristic) {
         pTofCharacteristic->setValue((uint8_t*)"NA", 2);
@@ -975,7 +983,7 @@ void updateTof() {
     if (now - lastTofGood >= TOF_STALL_MS) {
       Serial.println("VL53L0X stopped answering: restarting it");
       tofOk = false;
-      lastTofRetry = now - 1500;                       // first retry in 0.5 s
+      lastTofRetry = now - TOF_RETRY_MS + 500;         // first retry in 0.5 s
       if (deviceConnected && pTofCharacteristic) {
         pTofCharacteristic->setValue((uint8_t*)"NA", 2);
         pTofCharacteristic->notify();
@@ -986,7 +994,7 @@ void updateTof() {
   lastTofRead = now;
   lastTofGood = now;
   uint16_t mm = tof.readRangeContinuousMillimeters();
-  if (tof.timeoutOccurred()) { tofOk = false; lastTofRetry = now - 1500; return; }   // answered badly: restart it
+  if (tof.timeoutOccurred()) { tofOk = false; lastTofRetry = now - TOF_RETRY_MS + 500; return; }   // answered badly: restart it
   char buf[12];
   if (mm > TOF_MAX_MM) snprintf(buf, sizeof(buf), "-1");   // the library returns 65535 on a timeout and ~8190 for "nothing"
   else snprintf(buf, sizeof(buf), "%u", (unsigned)mm);
@@ -1679,9 +1687,9 @@ void setup() {
   lastMpuMicros = micros();
   Serial.println(mpuOk ? "MPU-6050 ready (keep the car still while it calibrates)" : "ERROR: MPU-6050 not found (check SDA/SCL/power)");
 
-  tofOk = tofInit();
+  tofOk = tofInit(true);
   lastTofRetry = millis();
-  Serial.println(tofOk ? "VL53L0X ready" : "VL53L0X not found (it is looked for again every 2 s)");
+  Serial.println(tofOk ? "VL53L0X ready" : "VL53L0X not found (it is looked for again every 3 s while the car stands still)");
 
   // Servo signals are not started here: each servo starts when it is first commanded (see attachServo).
 
