@@ -20,7 +20,7 @@ saved as a small file, replayed by a player that also drives the approach hand-o
    - *turn*: N degrees on the spot (the car's own closed-loop turn)
    - *wait*: N seconds
    "Add step" captures the current slider angles; steps can be edited, reordered, deleted and test-played; moves are saved to and loaded from
-   a JSON file (`Embedded/moves/<name>.json`) that can also be edited by hand.
+   a JSON file (`Dashboard/moves/<name>.json`) that can also be edited by hand.
 2. **Ball detection in the dashboard**: run the v2.1 paper-ball model (`Training/paper_ball_detector/roboflow-paperball.onnx`) on the camera frames,
    draw the boxes on the camera view, and report the ball's left/right offset and its floor distance (the same method and calibration idea as
    `Embedded/esp32/WifiBridge/scripts/camera_distance.py`).
@@ -70,7 +70,7 @@ hard to correct). **Picked by the owner: key steps.**
 - The controller stops (and says why) on STOP/ABORT, on 1 s without camera frames, when the ball has been lost for several seconds, and when the ultrasonic
   distance is under a safety limit.
 - Steps of a move run one after another (the arm and the car never move at the same time), and the camera is ignored while a move is playing.
-- Moves are plain JSON files in `Embedded/moves/`; a "grab" move is the one the controller replays.
+- Moves are plain JSON files in `Dashboard/moves/`; a "grab" move is the one the controller replays.
 - Distance from the camera uses a short calibration with the ball at known distances (like `camera_distance.py --calibrate`).
 - Thresholds (confidence, hop size, centring tolerance, safety distance) start as constants at the top of the code and are tuned on the real car.
 
@@ -90,7 +90,7 @@ the numbers listed above; what the status line says.
 
 The first piece of Stage 2: run the v2.1 paper-ball model on the live camera picture and show what it finds. No driving yet.
 
-- `Embedded/ball_detector.py`: the model code (picture prepared with the same letterbox as the phone app, the output decoded and
+- `Dashboard/helpers/ball_detector.py`: the model code (picture prepared with the same letterbox as the phone app, the output decoded and
   de-duplicated), a drawing helper and a background worker. The model is `Training/paper_ball_detector/roboflow-paperball.onnx`,
   read with the OpenCV the dashboard already has (about 32 ms a picture on this laptop). The worker takes the newest camera frame,
   skips frames while it is busy, and loads the model only when detection is first switched on.
@@ -100,3 +100,55 @@ The first piece of Stage 2: run the v2.1 paper-ball model on the live camera pic
 - Boxes are drawn in green with their scores, the best one thicker. The model is shared by the live worker and the photo test and
   runs one picture at a time.
 - Not in this stage: distance from the picture, steering the car, saving detections.
+
+## Stage 2b: drive to the ball and pick it up ("Collect")  (revised 2026-11-24, approved with the camera-lines addition)
+
+Tested by the owner on the real car: the ball is still detected by the camera at the spot where the pick move begins, and the
+ultrasonic sensor reads about 16 cm there. The owner's plan, adopted: **the camera decides left or right, and the ultrasonic sensor
+decides when the ball is at the pick distance** (14 to 18 cm). The owner also asked to **combine the ultrasonic sensor with
+distance lines on the camera picture, like a car's reversing camera**, to be more accurate; that is part of this stage.
+
+**What it does.** With a paper ball in view, the car turns until the ball is on its centre line, drives toward it straight (gyro and
+encoder assist) in short hops, stops when the ultrasonic sensor reads the pick range and the camera still sees the ball, then plays
+the chosen move (default `pick_down_up`) and stops.
+
+**Parts**
+1. *Camera distance and distance lines* (`Dashboard/helpers/ball_distance.py`). "Calibrate distance": the owner puts a ball at known distances
+   from the camera (20, 30, 40, 50, 60, 80 cm; at least 3) and records each; the model learns 1/distance = a x (bottom edge of the
+   ball's box) + b, the maths of `camera_distance.py`, and shows the error of each point; saved to `Dashboard/data/ball_calibration.json`.
+   It measures anything that touches the floor at a known picture row, and it is only applied to the paper ball (the detector does not
+   find walls or other objects). "Distance lines" draws horizontal lines on the live camera picture at 20, 30, 40, 60 and 80 cm, red
+   near, yellow in the middle, green far, so a person can read the distance of a wall or any object by where it meets the floor.
+   Calibration is optional: without it Collect works from the ultrasonic sensor alone.
+2. *Grab spot* ("Set grab spot"): the owner puts the ball where the pick move works and presses it. It stores where the ball appears
+   across the picture (the direction the car must face; the camera and the sensor are mounted together) and the ultrasonic reading there
+   (the pick range is that reading plus and minus 2 cm: 16 gives 14 to 18), and the camera's estimate when calibrated.
+   Saved in `Dashboard/data/grab_spot.json`.
+3. *The approach* (`Dashboard/helpers/ball_approach.py`, no tkinter, tested with a fake car, camera and sensor; time passed in like the move
+   player). Wait for a steady detection (3 frames in a row within 15 pixels, nearest ball first). If the ball is more than 3 degrees off
+   the taught direction (field of view 55 degrees, a constant), turn by that angle. Otherwise, with the car standing still for at least
+   0.6 s and only readings and frames taken after it stopped (the sensor updates 10 times a second and takes a median of 3), decide
+   from the ultrasonic reading `r` and, when calibrated, the camera's estimate `c` of the same ball:
+   - `r` in the range: if calibrated and `r` and `c` differ by more than 8 cm (or 25%), stop ("the sensor and the camera disagree");
+     otherwise play the move;
+   - `r` below the range: if `c` says the ball is much farther than `r` (something closer than the ball), stop; otherwise back up to the
+     pick distance, at least 3 cm;
+   - `r` above the range and up to 60 cm: if `r` and `c` agree (or no calibration), hop `r` minus the pick distance; if `r` is smaller
+     than `c`, something is closer than the ball, stop; if `r` is larger than `c` (the beam misses the ball), hop by the camera;
+   - no echo or `r` beyond 60 cm: hop by the camera, `c` minus the pick distance minus 5 cm, when calibrated, otherwise 10 cm.
+   Hops are at least 3 cm and at most 25 cm, the car's own encoder drives with straight assist (gyro and encoders), at 50% under 15 cm
+   and 100% otherwise, and the bearing is checked again after every hop. The camera must see the ball at the moment the move starts.
+4. *The "Collect" window*: calibration (distance to record, Record, the samples and their errors, Fit and save), Set grab spot, the move
+   to play, Collect / STOP, a status line, a log of every decision (bearing, reading, camera estimate, hop), and a marker on the camera
+   picture for the taught direction. Collect switches detection on and refuses to start without a grab spot.
+
+**Stops (anything here ends Collect, stops the car, and says why):** STOP in the window, the dashboard STOP, an arrow key, closing the
+window or the dashboard; no ball seen for 3 s; no new camera frame for 1.5 s; no new distance reading for 2 s; more than 25
+decisions or 90 s; the car refusing a drive or turn, or a drive or turn that failed; the move failing; the sensor and the camera
+disagreeing at the pick range, or something closer than the ball.
+
+**My calls:** nearest ball first (lowest bottom edge in the picture); a ball must be seen in 3 frames in a row; confidence is the
+dashboard slider; one ball per Collect, then stop.
+
+**Not in this stage:** searching for a ball when none is in view, collecting several balls in a row, returning to a start point,
+detecting walls or other objects in the picture, calibrating the field of view.

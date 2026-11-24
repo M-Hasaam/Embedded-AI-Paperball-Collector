@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from moves import (ARM_MARGIN_S, MoveFileError, MovePlayer, arm_duration, arm_step, describe_step,  # noqa: E402
+from helpers.moves import (ARM_MARGIN_S, MoveFileError, MovePlayer, arm_duration, arm_step, describe_step,  # noqa: E402
                    drive_step, load_move, new_move, save_move, sync_speeds, turn_step, validate_move, wait_step)
 
 LIMITS = [(0, 120), (80, 180), (40, 170), (0, 180)]

@@ -87,13 +87,19 @@ All in `Training/paper_ball_detector/`:
 
 ```
 Mobile_app/            Android app (Kotlin, Compose, CameraX, LiteRT); open this folder in Android Studio
-Embedded/
-  dashboard.py         PC dashboard: camera (ESP32 Wi-Fi bridge) + car (ESP32-S3 over Bluetooth LE)
+Embedded/              firmware
   esp32/WifiBridge/    ESP32 camera bridge firmware + PC viewers (camera_yolo, camera_distance, camera_serial)
   esp32-s3/AI_Car/     ESP32-S3 car (BLE, 4 servos): AI_Car.ino and control_car.py
-  moves.py, moves/     recorded arm and car moves (JSON), made in the dashboard's Moves window; tests in tests/
-  ball_detector.py     the trained paper-ball model for the dashboard: boxes on the camera picture, and a test on a photo
   Other/               older Arduino sketches and the ESP32-CAM web server
+Dashboard/             the PC program (python Dashboard/dashboard.py)
+  dashboard.py         PC dashboard: camera (ESP32 Wi-Fi bridge) + car (ESP32-S3 over Bluetooth LE)
+  helpers/             the modules dashboard.py imports: moves.py (record and replay arm and car steps), ball_detector.py
+                       (the trained paper-ball model on the camera picture), paths.py (where everything lives); Collect (drive
+                       to a ball and pick it up): ball_distance.py, grab_spot.py, ball_approach.py
+  data/                what the dashboard writes (the car's address, the servo memory, the runner log, the camera distance
+                       calibration, the grab spot); not kept in git
+  moves/               recorded arm and car moves (JSON), made in the dashboard's Moves window
+  tests/               the automatic tests (python -m unittest discover -s Dashboard/tests)
 Training/
   paper_ball_detector/ dataset, trainer, Colab notebook, evaluation, export, results, trained model
 Web_Demo/              the browser test page (published with GitHub Pages)

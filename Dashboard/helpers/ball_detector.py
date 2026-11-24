@@ -12,7 +12,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-MODEL_PATH = Path(__file__).resolve().parents[1] / "Training" / "paper_ball_detector" / "roboflow-paperball.onnx"
+from helpers.paths import MODEL_PATH       # Training/paper_ball_detector/roboflow-paperball.onnx
+
 MODEL_SIZE = 640
 IOU = 0.45                  # boxes overlapping more than this are one ball
 GREEN = (0, 255, 0)         # RGB
@@ -97,6 +98,9 @@ def summarize(detections, ms):
     return f"{n} paper ball{'s' if n != 1 else ''}, best {detections[0].score * 100:.0f}%, {ms:.0f} ms"
 
 
+DetectionResult = namedtuple("DetectionResult", "frame_id detections ms stamp width height")
+
+
 class DetectorWorker(threading.Thread):
     """Runs the model on the newest camera frame in the background (never on the screen's thread), skipping frames while it is
     busy. The model is loaded the first time it is needed. Set `enabled` and `conf`; read the newest result with latest()."""
@@ -110,6 +114,7 @@ class DetectorWorker(threading.Thread):
         self._lock = threading.Lock()
         self._load_lock = threading.Lock()
         self._result = None                                  # (frame id, [Detection], milliseconds)
+        self._full = None                                    # the same as a DetectionResult
         self._detector = None
         self._last_id = -1
 
@@ -141,8 +146,10 @@ class DetectorWorker(threading.Thread):
             self.error, self.enabled = f"Cannot run the model: {e}", False
             return False
         self._last_id = frame_id
+        height, width = rgb.shape[:2]
         with self._lock:
             self._result = (frame_id, found, ms)
+            self._full = DetectionResult(frame_id, found, ms, time.monotonic(), width, height)
         return True
 
     def run(self):
@@ -152,3 +159,8 @@ class DetectorWorker(threading.Thread):
     def latest(self):
         with self._lock:
             return self._result
+
+    def latest_frame(self):
+        """The newest result with the time the model finished and the size of the frame it ran on; None before the first frame."""
+        with self._lock:
+            return self._full

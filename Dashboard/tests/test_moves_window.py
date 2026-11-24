@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import dashboard  # noqa: E402
-from moves import arm_step, describe_step, drive_step, turn_step, wait_step  # noqa: E402
+from helpers.moves import arm_step, describe_step, drive_step, turn_step, wait_step  # noqa: E402
 from test_moves import FakeCar  # noqa: E402
 
 ROOT = None

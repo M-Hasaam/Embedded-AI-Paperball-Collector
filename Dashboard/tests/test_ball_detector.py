@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ball_detector import (MODEL_PATH, BallDetector, Detection, DetectorWorker, decode, draw_detections,  # noqa: E402
+from helpers.ball_detector import (MODEL_PATH, BallDetector, Detection, DetectorWorker, decode, draw_detections,  # noqa: E402
                            letterbox, summarize)
 
 DATASET = Path(__file__).resolve().parents[2] / "Training" / "paper_ball_detector" / "dataset" / "test" / "test2"
@@ -180,6 +180,21 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(frame_id, 2)
         self.assertEqual(len(dets), 1)
         self.assertGreaterEqual(ms, 0)
+
+    def test_latest_frame_carries_the_frame_size_and_a_time(self):
+        camera, detector, worker = self.make()
+        worker.enabled = True
+        self.assertIsNone(worker.latest_frame())
+        camera.frame, camera.frame_id = np.zeros((10, 20, 3), np.uint8), 7
+        before = time.monotonic()
+        self.assertTrue(worker.step())
+        after = time.monotonic()
+        result = worker.latest_frame()
+        self.assertEqual((result.width, result.height, result.frame_id), (20, 10, 7))
+        self.assertGreaterEqual(result.ms, 0)
+        self.assertEqual(len(result.detections), 1)
+        self.assertTrue(before <= result.stamp <= after)
+        self.assertEqual(worker.latest()[0], 7)                  # the 3-tuple stays as it was
 
     def test_waits_for_the_first_frame(self):
         camera, detector, worker = self.make()

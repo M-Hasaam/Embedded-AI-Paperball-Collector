@@ -14,7 +14,8 @@ import math
 from pathlib import Path
 from typing import Protocol
 
-MOVES_DIR = Path(__file__).with_name("moves")
+from helpers.paths import MOVES_DIR      # the recorded moves: Dashboard/moves/*.json (re-exported here for the dashboard)
+
 ARM_MARGIN_S = 0.3          # the car does not report where the arm is, so a step waits its travel time plus this
 DRIVE_SPEED_PCT = 100       # the default drive speed
 DRIVE_SPEEDS = (50, 100)    # the speeds where the wheel encoders are accurate (measured against a tape)

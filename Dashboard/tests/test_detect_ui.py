@@ -10,7 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dashboard  # noqa: E402
-from ball_detector import Detection  # noqa: E402
+from helpers.ball_detector import Detection  # noqa: E402
 
 
 class Var:

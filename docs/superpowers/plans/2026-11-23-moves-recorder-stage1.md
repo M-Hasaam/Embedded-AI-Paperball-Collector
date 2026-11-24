@@ -4,7 +4,7 @@
 
 **Goal:** A "Moves" window in the dashboard where the owner records key steps (arm poses, drive, turn, wait), saves them as a JSON file, and test-plays them on the car and arm.
 
-**Architecture:** The logic lives in a new pure module `Embedded/moves.py` (step data, validation, file I/O, and a `MovePlayer` state machine that talks to the car through a small `PlayerCar` interface), so it is unit-tested with a fake car and no hardware. `dashboard.py` gets a thin adapter (`DashboardCar`) over the existing command paths (servo `V`/`H` commands, `PathRunner` for drives and turns) and the `MovesWindow` UI.
+**Architecture:** The logic lives in a new pure module `Dashboard/moves.py` (step data, validation, file I/O, and a `MovePlayer` state machine that talks to the car through a small `PlayerCar` interface), so it is unit-tested with a fake car and no hardware. `dashboard.py` gets a thin adapter (`DashboardCar`) over the existing command paths (servo `V`/`H` commands, `PathRunner` for drives and turns) and the `MovesWindow` UI.
 
 **Tech Stack:** Python 3.12 (`C:\Users\HP\AppData\Local\Programs\Python\Python312\python.exe`), tkinter, stdlib `unittest` (pytest is not installed; add no packages).
 
@@ -28,13 +28,13 @@
 
 ## File Structure
 
-- Create `Embedded/moves.py`: step constructors, `validate_move`, `describe_step`, `arm_duration`, `load_move`/`save_move`, `MovePlayer`. No tkinter, no dashboard import.
-- Create `Embedded/moves/example_grab.json`: a documented example of the file format (also a test fixture).
-- Create `Embedded/tests/test_moves.py`, `Embedded/tests/test_dashboard_helpers.py`, `Embedded/tests/test_moves_window.py`.
-- Modify `Embedded/dashboard.py`: helpers `servo_commands`, `remaining_along_heading`; `PathRunner` backward arrival; `Dashboard.send_servo_command`, `drive_by`, `turn_by` return value, `runner_ok`; classes `DashboardCar`, `MovesWindow`; header button; `_send` and `_close` hooks.
+- Create `Dashboard/moves.py`: step constructors, `validate_move`, `describe_step`, `arm_duration`, `load_move`/`save_move`, `MovePlayer`. No tkinter, no dashboard import.
+- Create `Dashboard/moves/example_grab.json`: a documented example of the file format (also a test fixture).
+- Create `Dashboard/tests/test_moves.py`, `Dashboard/tests/test_dashboard_helpers.py`, `Dashboard/tests/test_moves_window.py`.
+- Modify `Dashboard/dashboard.py`: helpers `servo_commands`, `remaining_along_heading`; `PathRunner` backward arrival; `Dashboard.send_servo_command`, `drive_by`, `turn_by` return value, `runner_ok`; classes `DashboardCar`, `MovesWindow`; header button; `_send` and `_close` hooks.
 
 Run all tests from the repo root:
-`& "C:\Users\HP\AppData\Local\Programs\Python\Python312\python.exe" -m unittest discover -s Embedded/tests -p "test_*.py" -v`
+`& "C:\Users\HP\AppData\Local\Programs\Python\Python312\python.exe" -m unittest discover -s Dashboard/tests -p "test_*.py" -v`
 Each test file starts with `sys.path.insert(0, str(Path(__file__).resolve().parents[1]))` so `import moves` / `import dashboard` work.
 
 ---
@@ -42,8 +42,8 @@ Each test file starts with `sys.path.insert(0, str(Path(__file__).resolve().pare
 ### Task 1: Step data, validation, descriptions, file I/O
 
 **Files:**
-- Create: `Embedded/moves.py`, `Embedded/moves/example_grab.json`
-- Test: `Embedded/tests/test_moves.py`
+- Create: `Dashboard/moves.py`, `Dashboard/moves/example_grab.json`
+- Test: `Dashboard/tests/test_moves.py`
 
 **Interfaces:**
 - Produces (all in `moves.py`):
@@ -60,7 +60,7 @@ Each test file starts with `sys.path.insert(0, str(Path(__file__).resolve().pare
 
 Validation ranges (my calls, from the spec's silence): arm angle within `limits[i]`; speed 1..600 deg/s; arm `wait` 0..60 s; drive `0 < |cm| <= 300`; turn `0 < |deg| <= 360`; wait `0 < seconds <= 60`; an arm step needs at least one servo; unknown `type` is an error. Each error names the step number (1-based) and the field.
 
-- [ ] **Step 1: Write the failing tests** in `Embedded/tests/test_moves.py` (class `StepsTest`, `ValidateTest`, `FileTest`). Use `LIMITS = [(0,120),(80,180),(40,170),(0,180)]` and `NAMES = ["Gripper","Elbow","Shoulder","Servo 4"]`:
+- [ ] **Step 1: Write the failing tests** in `Dashboard/tests/test_moves.py` (class `StepsTest`, `ValidateTest`, `FileTest`). Use `LIMITS = [(0,120),(80,180),(40,170),(0,180)]` and `NAMES = ["Gripper","Elbow","Shoulder","Servo 4"]`:
   - `test_arm_step_sorts_servos`: `arm_step({2:(120,30),1:(150,30)})["servos"] == [{"i":1,"angle":150,"speed":30},{"i":2,"angle":120,"speed":30}]`
   - `test_describe_each_type`: arm -> `"Arm: Elbow 150°@30/s, Shoulder 120°@30/s, then wait 0.5 s"`; `drive_step(20)` -> `"Drive: forward 20 cm"`; `drive_step(-10)` -> `"Drive: back 10 cm"`; `turn_step(90)` -> `"Turn: left 90°"`; `turn_step(-90)` -> `"Turn: right 90°"`; `wait_step(1)` -> `"Wait: 1 s"`
   - `test_arm_duration_uses_slowest_servo`: current `{1:120,2:90}`, step moves elbow to 150 at 30/s (1.0 s) and shoulder to 120 at 60/s (0.5 s), wait 0.5 -> `1.0 + ARM_MARGIN_S + 0.5` (use `assertAlmostEqual`)
@@ -72,23 +72,23 @@ Validation ranges (my calls, from the spec's silence): arm angle within `limits[
   - `test_load_rejects_garbage`: a file containing `not json` and a file containing `[1,2]` both raise `MoveFileError`
   - `test_example_file_is_valid`: `load_move(MOVES_DIR / "example_grab.json")` validates with `LIMITS`
 
-- [ ] **Step 2: Run to verify failure.** `... -m unittest discover -s Embedded/tests -p "test_moves.py" -v`. Expected: ImportError (`moves` not found).
+- [ ] **Step 2: Run to verify failure.** `... -m unittest discover -s Dashboard/tests -p "test_moves.py" -v`. Expected: ImportError (`moves` not found).
 
-- [ ] **Step 3: Implement the interface above in `Embedded/moves.py`.** One validation pass collects every error (do not stop at the first); coerce nothing silently: a non-number is an error. `describe_step` shows numbers without a trailing `.0` (`20`, not `20.0`).
+- [ ] **Step 3: Implement the interface above in `Dashboard/moves.py`.** One validation pass collects every error (do not stop at the first); coerce nothing silently: a non-number is an error. `describe_step` shows numbers without a trailing `.0` (`20`, not `20.0`).
 
-- [ ] **Step 4: Create `Embedded/moves/example_grab.json`**: name `"example_grab"`, an arm pose (elbow 150, shoulder 120, speed 30, wait 0.5), `drive 20`, `turn 90`, `wait 1`. It documents the format and is the fixture for `test_example_file_is_valid`.
+- [ ] **Step 4: Create `Dashboard/moves/example_grab.json`**: name `"example_grab"`, an arm pose (elbow 150, shoulder 120, speed 30, wait 0.5), `drive 20`, `turn 90`, `wait 1`. It documents the format and is the fixture for `test_example_file_is_valid`.
 
 - [ ] **Step 5: Run the tests.** Expected: all pass.
 
-- [ ] **Step 6: Commit (only when the owner asks)**: `git add Embedded/moves.py Embedded/moves Embedded/tests/test_moves.py`; message `feat(moves): step data, validation and JSON files for recorded arm and car moves`.
+- [ ] **Step 6: Commit (only when the owner asks)**: `git add Dashboard/moves.py Dashboard/moves Dashboard/tests/test_moves.py`; message `feat(moves): step data, validation and JSON files for recorded arm and car moves`.
 
 ---
 
 ### Task 2: The player state machine
 
 **Files:**
-- Modify: `Embedded/moves.py`
-- Test: `Embedded/tests/test_moves.py` (add `PlayerTest`)
+- Modify: `Dashboard/moves.py`
+- Test: `Dashboard/tests/test_moves.py` (add `PlayerTest`)
 
 **Interfaces:**
 - Consumes: `arm_duration`, `describe_step`, `DRIVE_SPEED_PCT` from Task 1.
@@ -114,15 +114,15 @@ Behaviour: `start` refuses (returns False, sets `status`, calls nothing on the c
 
 - [ ] **Step 4: Run the tests.** Expected: all pass.
 
-- [ ] **Step 5: Commit (only when the owner asks)**: `git add Embedded/moves.py Embedded/tests/test_moves.py`; message `feat(moves): a player that runs recorded steps one after another and stops safely`.
+- [ ] **Step 5: Commit (only when the owner asks)**: `git add Dashboard/moves.py Dashboard/tests/test_moves.py`; message `feat(moves): a player that runs recorded steps one after another and stops safely`.
 
 ---
 
 ### Task 3: Dashboard plumbing (helpers, runner fix, adapter)
 
 **Files:**
-- Modify: `Embedded/dashboard.py` (module level near `return_steps`; `PathRunner.tick` arrival at the `moving` state; `Dashboard` near `_send_servo`, `turn_by`, `_runner_finished`; new class `DashboardCar` before `PulseWindow`)
-- Test: `Embedded/tests/test_dashboard_helpers.py`
+- Modify: `Dashboard/dashboard.py` (module level near `return_steps`; `PathRunner.tick` arrival at the `moving` state; `Dashboard` near `_send_servo`, `turn_by`, `_runner_finished`; new class `DashboardCar` before `PulseWindow`)
+- Test: `Dashboard/tests/test_dashboard_helpers.py`
 
 **Interfaces:**
 - Consumes: `PlayerCar` (Task 2).
@@ -133,7 +133,7 @@ Behaviour: `start` refuses (returns False, sets `status`, calls nothing on the c
   - `Dashboard.drive_by(self, cm: float) -> bool`, `Dashboard.turn_by(self, delta) -> bool` (existing, now returns whether the runner started), `Dashboard.runner_ok: bool` (set in `_runner_finished`)
   - `class DashboardCar(app)` implementing `PlayerCar`
 
-- [ ] **Step 1: Write the failing tests** in `Embedded/tests/test_dashboard_helpers.py` (`import dashboard`; the module has no side effects at import under Python 3.12):
+- [ ] **Step 1: Write the failing tests** in `Dashboard/tests/test_dashboard_helpers.py` (`import dashboard`; the module has no side effects at import under Python 3.12):
   - `test_servo_commands_plain`: `servo_commands(1, 150, 30) == ["V1 150 30"]`
   - `test_servo_commands_first_command_sets_held_angle`: `servo_commands(1, 150, 30, 120) == ["H1 120", "V1 150 30"]`
   - `test_remaining_ahead`: heading 0, car (0,0), target (0,10) -> 10.0; heading 90 (facing left), target (-10,0) -> 10.0; target already passed (0,-2) at heading 0 -> -2.0 (`assertAlmostEqual`)
@@ -149,17 +149,17 @@ Behaviour: `start` refuses (returns False, sets `status`, calls nothing on the c
 
 - [ ] **Step 6: Add `DashboardCar`**: `servo` -> `app.send_servo_command`; `servo_angles` -> `{i: int(app.servo_scales[i].get())}`; `start_drive`/`start_turn` -> `app.drive_by`/`app.turn_by`; `motion_active` -> `app.runner.active`; `motion_ok` -> `app.runner_ok`; `get_straight_speed` -> `int(app.car_speed.get())`; `set_straight_speed(pct)` -> `app.car_speed.set(pct)` then `app._send_speed()`; `stop` -> `app.path_abort()`; `connected` -> `app.connected.is_set()`.
 
-- [ ] **Step 7: Verify nothing regressed.** Run the whole test folder (expected: all pass) and `python -m py_compile Embedded/dashboard.py`. Then, with the car on and the arm disconnected, open the dashboard and check by hand: a slider still moves its servo; "All default" still works; "Return to start" / a ±90° turn button still run.
+- [ ] **Step 7: Verify nothing regressed.** Run the whole test folder (expected: all pass) and `python -m py_compile Dashboard/dashboard.py`. Then, with the car on and the arm disconnected, open the dashboard and check by hand: a slider still moves its servo; "All default" still works; "Return to start" / a ±90° turn button still run.
 
-- [ ] **Step 8: Commit (only when the owner asks)**: `git add Embedded/dashboard.py Embedded/tests/test_dashboard_helpers.py`; message `refactor(dashboard): servo and drive/turn commands the Moves player can call; backward drives stop at their target`.
+- [ ] **Step 8: Commit (only when the owner asks)**: `git add Dashboard/dashboard.py Dashboard/tests/test_dashboard_helpers.py`; message `refactor(dashboard): servo and drive/turn commands the Moves player can call; backward drives stop at their target`.
 
 ---
 
 ### Task 4: The Moves window
 
 **Files:**
-- Modify: `Embedded/dashboard.py` (class `MovesWindow` after `PulseWindow`; `Dashboard.__init__`, header button, `open_moves_window`, `_send` hook, `_close`); `README.md` (one line in the repository layout)
-- Test: `Embedded/tests/test_moves_window.py`
+- Modify: `Dashboard/dashboard.py` (class `MovesWindow` after `PulseWindow`; `Dashboard.__init__`, header button, `open_moves_window`, `_send` hook, `_close`); `README.md` (one line in the repository layout)
+- Test: `Dashboard/tests/test_moves_window.py`
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-3.
@@ -168,7 +168,7 @@ Behaviour: `start` refuses (returns False, sets `status`, calls nothing on the c
 
 Layout (text sketch): a step list on top; rows of buttons `Add arm pose | Add drive (cm) | Add turn (deg) | Add wait (s)`, `Edit | Delete | Up | Down`, `Save... | Open...`, then `Test play | STOP` and a status line. The window polls `player.tick(time.monotonic())` every 50 ms with `win.after`, and its list text is `describe_step(step, SERVO_NAMES)`.
 
-- [ ] **Step 1: Write the failing tests** in `Embedded/tests/test_moves_window.py` (skip the whole class with `unittest.skipIf` when `tk.Tk()` raises `TclError`; build a fake app: `root`, `_button`, four `tk.Scale` objects for `servo_scales` and four for `speed_scales`, `connected`; pass a fake `car` from Task 2's `FakeCar` pattern):
+- [ ] **Step 1: Write the failing tests** in `Dashboard/tests/test_moves_window.py` (skip the whole class with `unittest.skipIf` when `tk.Tk()` raises `TclError`; build a fake app: `root`, `_button`, four `tk.Scale` objects for `servo_scales` and four for `speed_scales`, `connected`; pass a fake `car` from Task 2's `FakeCar` pattern):
   - `test_add_arm_pose_captures_all_sliders`: sliders set to 90, 150, 120, 45 with speeds 30 -> `window.move["steps"][0]` equals `arm_step({0:(90,30),1:(150,30),2:(120,30),3:(45,30)}, wait=0.5)`
   - `test_add_delete_and_reorder`: add drive 20 then turn 90, `move_selected(1)` on the first swaps them, `delete_selected()` removes the selected one
   - `test_save_load_roundtrip`: save to a temp path, clear, load -> the same steps, list text shows each step's description
@@ -185,12 +185,12 @@ Layout (text sketch): a step list on top; rows of buttons `Add arm pose | Add dr
 - [ ] **Step 5: Run all tests and `py_compile`.** Expected: all pass.
 
 - [ ] **Step 6: Check on the real car** (the owner, with a tape measure; take the arm's safe pose first):
-  1. Open the dashboard, connect, click **Moves**. Pose the arm with the sliders, **Add arm pose**; **Add drive** 20; **Add turn** 90; **Add wait** 1. **Save...** as `Embedded/moves/test1.json`, clear, **Open...** it again: the list is back.
+  1. Open the dashboard, connect, click **Moves**. Pose the arm with the sliders, **Add arm pose**; **Add drive** 20; **Add turn** 90; **Add wait** 1. **Save...** as `Dashboard/moves/test1.json`, clear, **Open...** it again: the list is back.
   2. **Test play**: the arm moves to the pose, the car drives 20 cm (within about 1-2 cm of the tape), turns about 90 degrees, waits. Set the straight-speed slider to 50 first: during the drive it goes to 100 and is back at 50 afterwards.
   3. Press **STOP** in the Moves window mid-drive: the car stops and the status says so. Press the dashboard's STOP button or an arrow key mid-drive: the same.
   4. Edit the saved file by hand to set an elbow angle of 200: Open shows the error, **Test play** refuses.
   5. Close the dashboard while playing: the car stops.
 
-- [ ] **Step 7: Add one line to the `README.md` repository layout**: `moves/  recorded arm and car moves (JSON), made in the dashboard's Moves window`, under `Embedded/`.
+- [ ] **Step 7: Add one line to the `README.md` repository layout**: `moves/  recorded arm and car moves (JSON), made in the dashboard's Moves window`, under `Dashboard/`.
 
-- [ ] **Step 8: Commit (only when the owner asks)**: `git add Embedded/dashboard.py Embedded/tests/test_moves_window.py README.md`; message `feat(dashboard): a Moves window to record, save and replay arm and car steps`.
+- [ ] **Step 8: Commit (only when the owner asks)**: `git add Dashboard/dashboard.py Dashboard/tests/test_moves_window.py README.md`; message `feat(dashboard): a Moves window to record, save and replay arm and car steps`.

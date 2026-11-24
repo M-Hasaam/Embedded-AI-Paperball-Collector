@@ -31,7 +31,7 @@ def build_card(parent):
     D = dashboard.Dashboard
     app = types.SimpleNamespace(
         rotate_var=tk.StringVar(master=ROOT, value="none"), run_status_var=tk.StringVar(master=ROOT),
-        detect_var=tk.BooleanVar(master=ROOT), detect_status_var=tk.StringVar(master=ROOT),
+        detect_var=tk.BooleanVar(master=ROOT), lines_var=tk.BooleanVar(master=ROOT), detect_status_var=tk.StringVar(master=ROOT),
         detect_conf_var=tk.StringVar(master=ROOT, value="50%"), camera=types.SimpleNamespace(rotate=None),
         detector=types.SimpleNamespace(conf=0.5), last_frame_id=0)
     for name in ("_card", "_button", "_scale", "_detect_conf_changed"):
@@ -57,6 +57,21 @@ class CameraCardLayoutTest(unittest.TestCase):
         app.detect_status_var.set("yolo_20261108_152427.jpg: 2 paper balls, best 87%, 31 ms")
         ROOT.update()
         self.assertEqual(self.parent.winfo_reqwidth(), before)
+
+    def test_the_card_has_a_distance_lines_checkbox_tied_to_lines_var(self):
+        app, body = build_card(self.parent)
+        boxes = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Checkbutton):
+                    boxes.append(child)
+                walk(child)
+        walk(body)
+        lines = [b for b in boxes if b.cget("text") == "Distance lines"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(str(lines[0].cget("variable")), str(app.lines_var))
+        self.assertFalse(app.lines_var.get())                      # off by default
 
     def test_the_controls_are_not_wider_than_the_rest_of_the_card(self):
         # the Save frame row is the card's width before the detector was added; the new rows must fit in it
