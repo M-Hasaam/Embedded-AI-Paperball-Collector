@@ -82,6 +82,8 @@ class LayoutStableTest(unittest.TestCase):
         app.cam_info.configure(text="640×480  ·  1234 KB/frame  ·  link 1957 KB/s")
         app.detect_status_var.set("yolo_20261108_152427.jpg: 2 paper balls, best 87%, 31 ms")
         app.car_text.set("Connected to AI_Car_with_a_very_long_name (3.5 s)")
+        app.tof_var.set("1200")
+        app.tof_note.set("sensor not found (check the wires)")
         self.assertEqual(self.sizes(), before)
 
 

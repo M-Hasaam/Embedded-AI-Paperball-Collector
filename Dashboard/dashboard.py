@@ -55,6 +55,9 @@ DISTANCE_CHAR_UUID = "11223344-5566-7788-99AA-BBCCDDEEFF00"  # distance cm, "-1"
 MPU_CHAR_UUID = "22334455-6677-8899-AABB-CCDDEEFF0011"       # "yaw,pitch,roll,gx,gy,gz,ax,ay,az"
 ENCODER_CHAR_UUID = "33445566-7788-99AA-BBCC-DDEEFF001122"   # "leftTicks,rightTicks,leftCm,rightCm,leftCm/s,rightCm/s"
 SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233"   # "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState"
+TOF_CHAR_UUID = "55667788-99AA-BBCC-DDEE-FF0011223344"        # gripper VL53L0X: mm, "-1" = nothing in range, "NA" = sensor not found
+TOF_STALE_S = 1.5                 # no gripper reading for this long = show "no new readings" (the car sends about ten a second)
+TOF_NEAR_MM = 60                 # closer than this = something is in the jaws. The VL53L0X reads about 30-50 mm for anything closer than its 30 mm blind zone (a 1 cm object read 40), so 60 still counts that
 # The S3's ADC reads a few percent high, so the displayed servo-supply voltage is multiplied by these (arm, gripper).
 # To set one: meter voltage / voltage the dashboard shows now (gripper: 5.175 / 5.44 = 0.951).
 RAIL_DISPLAY_SCALE = (1.0, 0.951)
@@ -1916,6 +1919,10 @@ class Dashboard:
         self.cam_text = tk.StringVar(value="Starting...")
         self.dist_var = tk.StringVar(value="--")
         self.dist_note = tk.StringVar(value="waiting for sensor")
+        self.tof_var = tk.StringVar(value="--")
+        self.tof_note = tk.StringVar(value="waiting for sensor")
+        self.tof_mm = None             # latest gripper sensor reading in mm, None = nothing in range or no sensor
+        self.tof_stamp = None          # time.monotonic() of the newest reading, None = none since connecting
         self.heading_var = tk.StringVar(value="--")
         self.spin_var = tk.StringVar(value="Turning speed: --")
         self.pitch_var = tk.StringVar(value="Front-back tilt: --")
@@ -2059,6 +2066,20 @@ class Dashboard:
         tk.Label(row, textvariable=self.dist_note, bg=CARD, fg=MUTED, font=(FONT, 10)).pack(side="right")
         self.dist_bar = tk.Canvas(d, height=10, bg=CARD_HI, highlightthickness=0)
         self.dist_bar.pack(fill="x", pady=(6, 0))
+
+        # gripper sensor (VL53L0X), the same layout as the distance above but smaller
+        tk.Frame(d, bg=LINE, height=1).pack(fill="x", pady=(8, 4))
+        trow = tk.Frame(d, bg=CARD)
+        trow.pack(fill="x")
+        tk.Label(trow, text="Gripper (VL53L0X)", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(side="left", anchor="s")
+        tk.Label(trow, textvariable=self.tof_note, bg=CARD, fg=MUTED, font=(FONT, 10)).pack(side="right", anchor="s")
+        trow2 = tk.Frame(d, bg=CARD)
+        trow2.pack(fill="x")
+        self.tof_label = tk.Label(trow2, textvariable=self.tof_var, bg=CARD, fg=MUTED, font=(FONT, 20, "bold"), width=5, anchor="w")
+        self.tof_label.pack(side="left")
+        tk.Label(trow2, text=" mm", bg=CARD, fg=MUTED, font=(FONT, 11)).pack(side="left", pady=(8, 0))
+        self.tof_bar = tk.Canvas(d, height=8, bg=CARD_HI, highlightthickness=0)
+        self.tof_bar.pack(fill="x", pady=(4, 0))
 
         # motion
         imu_card, m = self._card(right, "Motion (MPU-6050)")
@@ -2279,6 +2300,7 @@ class Dashboard:
         self._refresh_camera()
         self._refresh_badges()
         self._path_tick()
+        self._tof_tick(time.monotonic())
         if not self.closing:
             self.root.after(30, self._pump)
 
@@ -2491,6 +2513,55 @@ class Dashboard:
         fill = w * (1 - min(cm, 150) / 150)  # fuller bar = closer
         bar.create_rectangle(0, 0, max(fill, 3), 10, fill=color, outline="")
 
+    def _on_tof(self, _sender, data):
+        text = bytes(data).decode("ascii", errors="ignore").strip()
+        if text == "NA":
+            self._post(self._show_tof_missing)
+            return
+        try:
+            mm = int(text)
+        except ValueError:
+            return
+        self._post(lambda: self._show_tof(mm))
+
+    def _show_tof(self, mm):
+        bar = self.tof_bar
+        bar.delete("all")
+        w = max(bar.winfo_width(), 1)
+        self.tof_mm = None if mm < 0 else mm
+        self.tof_stamp = time.monotonic()
+        if mm < 0:
+            self.tof_var.set("--")
+            self.tof_note.set("nothing in range")
+            self.tof_label.configure(fg=MUTED)
+            return
+        near = mm < TOF_NEAR_MM
+        color = GOOD if near else TEXT
+        self.tof_var.set(str(mm))
+        self.tof_note.set("something in the jaws" if near else "empty")
+        self.tof_label.configure(fg=color)
+        fill = w * (1 - min(mm, 300) / 300)  # fuller bar = closer
+        bar.create_rectangle(0, 0, max(fill, 3), 8, fill=GOOD if near else ACCENT, outline="")
+
+    def _tof_tick(self, now):
+        """The car sends a reading about ten times a second; when they stop (the sensor froze, the car is restarting it) the last value
+        must not stay on screen looking live."""
+        if self.tof_stamp is None or now - self.tof_stamp <= TOF_STALE_S:
+            return
+        self.tof_stamp = None
+        self.tof_mm = None
+        self.tof_bar.delete("all")
+        self.tof_var.set("--")
+        self.tof_note.set("no new readings")
+        self.tof_label.configure(fg=MUTED)
+
+    def _show_tof_missing(self):
+        self.tof_bar.delete("all")
+        self.tof_mm = None
+        self.tof_var.set("--")
+        self.tof_note.set("sensor not found (check the wires)")
+        self.tof_label.configure(fg=MUTED)
+
     def _on_mpu(self, _sender, data):
         text = bytes(data).decode("ascii", errors="ignore").strip()
         if text == "NA":
@@ -2633,6 +2704,11 @@ class Dashboard:
         self.dist_note.set("waiting for sensor")
         self.dist_label.configure(fg=MUTED)
         self.dist_bar.delete("all")
+        self.tof_var.set("--")
+        self.tof_note.set("waiting for sensor")
+        self.tof_label.configure(fg=MUTED)
+        self.tof_bar.delete("all")
+        self.tof_mm = self.tof_stamp = None
         self.heading_var.set("--")
         self.spin_var.set("Turning speed: --")
         self.pitch_var.set("Front-back tilt: --")
@@ -2691,7 +2767,7 @@ class Dashboard:
                 self.write_response = "write" in self.characteristic.properties
                 for uuid, handler in ((DISTANCE_CHAR_UUID, self._on_distance), (MPU_CHAR_UUID, self._on_mpu),
                                       (ENCODER_CHAR_UUID, self._on_encoder),
-                                      (SERVO_STATUS_CHAR_UUID, self._on_servo_status)):
+                                      (SERVO_STATUS_CHAR_UUID, self._on_servo_status), (TOF_CHAR_UUID, self._on_tof)):
                     try:
                         await client.start_notify(uuid, handler)
                     except Exception:

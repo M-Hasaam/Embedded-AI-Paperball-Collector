@@ -16,7 +16,7 @@ class CtrlCTest(unittest.TestCase):
         calls = []
         app = types.SimpleNamespace(interrupted=interrupted, closing=False, ui_queue=queue.Queue(),
                                     _refresh_camera=lambda: calls.append("camera"), _refresh_badges=lambda: None,
-                                    _path_tick=lambda: None, _close=lambda: calls.append("close"), _pump=lambda: None,
+                                    _path_tick=lambda: None, _tof_tick=lambda now: None, _close=lambda: calls.append("close"), _pump=lambda: None,
                                     root=types.SimpleNamespace(after=lambda ms, fn: calls.append("again")))
         dashboard.Dashboard._pump(app)
         return calls
@@ -58,6 +58,91 @@ class DistanceStampTest(unittest.TestCase):
         dashboard.Dashboard._show_distance(app, -1)
         self.assertIsNone(app.dist_cm)
         self.assertGreater(app.dist_stamp, first)
+
+
+class GripperSensorTest(unittest.TestCase):
+    """The gripper's VL53L0X: millimetres as text, "-1" = nothing in range, "NA" = the car cannot find the sensor."""
+
+    def make_app(self):
+        class Bar:
+            def delete(self, *a): pass
+            def winfo_width(self): return 100
+            def create_rectangle(self, *a, **k): pass
+
+        class Var:
+            v = None
+            def set(self, v): self.v = v
+
+        class Label:
+            fg = None
+            def configure(self, **k): self.fg = k.get("fg", self.fg)
+
+        posted = []
+        return types.SimpleNamespace(tof_bar=Bar(), tof_var=Var(), tof_note=Var(), tof_label=Label(), tof_mm=None, tof_stamp=None,
+                                     posted=posted, _post=lambda fn: fn(),
+                                     _show_tof=lambda mm: posted.append(("tof", mm)), _show_tof_missing=lambda: posted.append(("missing",)))
+
+    def test_a_reading_is_shown_and_stamped(self):
+        app = self.make_app()
+        before = time.monotonic()
+        dashboard.Dashboard._show_tof(app, 123)
+        self.assertEqual((app.tof_mm, app.tof_var.v), (123, "123"))
+        self.assertTrue(before <= app.tof_stamp <= time.monotonic())
+
+    def test_close_means_something_is_in_the_jaws(self):
+        app = self.make_app()
+        dashboard.Dashboard._show_tof(app, dashboard.TOF_NEAR_MM - 1)
+        self.assertIn("jaws", app.tof_note.v)
+        dashboard.Dashboard._show_tof(app, dashboard.TOF_NEAR_MM + 1)
+        self.assertNotIn("jaws", app.tof_note.v)
+
+    def test_nothing_in_range_clears_the_value(self):
+        app = self.make_app()
+        dashboard.Dashboard._show_tof(app, 80)
+        dashboard.Dashboard._show_tof(app, -1)
+        self.assertIsNone(app.tof_mm)
+        self.assertEqual(app.tof_var.v, "--")
+
+    def test_sensor_not_found_says_so_and_drops_the_old_reading(self):
+        app = self.make_app()
+        dashboard.Dashboard._show_tof(app, 80)
+        dashboard.Dashboard._show_tof_missing(app)
+        self.assertIsNone(app.tof_mm)
+        self.assertEqual(app.tof_var.v, "--")
+        self.assertIn("not found", app.tof_note.v)
+
+    def test_the_notification_text_is_understood(self):
+        for data, expected in ((b"42", ("tof", 42)), (b"-1", ("tof", -1)), (b"NA", ("missing",))):
+            app = self.make_app()
+            dashboard.Dashboard._on_tof(app, None, bytearray(data))
+            self.assertEqual(app.posted, [expected])
+
+    def test_garbage_is_ignored(self):
+        app = self.make_app()
+        dashboard.Dashboard._on_tof(app, None, bytearray(b"x?"))
+        self.assertEqual(app.posted, [])
+
+    def test_a_value_that_stops_updating_is_not_left_on_screen_as_if_live(self):
+        app = self.make_app()
+        app._show_tof_missing = lambda: dashboard.Dashboard._show_tof_missing(app)
+        dashboard.Dashboard._show_tof(app, 29)
+        now = app.tof_stamp
+        dashboard.Dashboard._tof_tick(app, now + dashboard.TOF_STALE_S - 0.1)      # still fresh: untouched
+        self.assertEqual(app.tof_var.v, "29")
+        dashboard.Dashboard._tof_tick(app, now + dashboard.TOF_STALE_S + 0.1)      # stale: shown as no data
+        self.assertEqual(app.tof_var.v, "--")
+        self.assertIsNone(app.tof_mm)
+        self.assertIn("no new readings", app.tof_note.v)
+
+    def test_no_reading_yet_is_not_called_stale(self):
+        app = self.make_app()
+        app.tof_var.set("--")
+        dashboard.Dashboard._tof_tick(app, 1e9)
+        self.assertEqual(app.tof_var.v, "--")
+        self.assertIsNone(app.tof_note.v)
+
+    def test_the_sensor_is_subscribed_to_with_the_car_s_uuid(self):
+        self.assertEqual(dashboard.TOF_CHAR_UUID, "55667788-99AA-BBCC-DDEE-FF0011223344")
 
 
 class ServoCommandsTest(unittest.TestCase):
