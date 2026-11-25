@@ -105,6 +105,40 @@ class TrackerTest(unittest.TestCase):
             tracker.update(result(i, [held, BOX]))                    # the floor ball is still found
         self.assertEqual(tracker.ball().bottom_y, 340.0)
 
+    def test_a_far_ball_just_below_the_horizon_is_a_floor_ball(self):
+        # a ball ~2 m away has its bottom edge about 34% down a 480 px picture (row 165): it was dropped as "held in the gripper",
+        # so Collect said "lost the ball" while the detector showed it at 91%
+        far = (270, 130, 300, 165)
+        tracker = BallTracker()
+        for i in (1, 2, 3):
+            tracker.update(result(i, [far]))
+        self.assertEqual(tracker.ball().bottom_y, 165.0)
+
+    def test_the_whole_ball_and_its_top_half_flickering_is_still_one_steady_ball(self):
+        # close up the model sometimes boxes the whole ball and sometimes only its upper half: the centre jumps ~90 px
+        whole, half = (500, 280, 650, 365), (515, 180, 655, 278)
+        tracker = BallTracker()
+        for i, box in enumerate((whole, half, whole, half, whole), start=1):
+            tracker.update(result(i, [box], stamp=i * 0.1))
+        self.assertIsNotNone(tracker.ball())
+
+    def test_a_ball_missed_for_a_moment_is_kept_when_the_results_come_fast(self):
+        # a moving car blurs the ball: 4 results in a row without it, but only 0.4 s apart
+        tracker = BallTracker()
+        for i in (1, 2, 3):
+            tracker.update(result(i, [BOX], stamp=i * 0.1))
+        for i in (4, 5, 6, 7):
+            tracker.update(result(i, [], stamp=i * 0.1))
+        self.assertIsNotNone(tracker.ball())
+
+    def test_a_ball_missed_for_over_a_second_is_lost(self):
+        tracker = BallTracker()
+        for i in (1, 2, 3):
+            tracker.update(result(i, [BOX], stamp=i * 0.1))
+        for i in range(4, 20):
+            tracker.update(result(i, [], stamp=i * 0.1))
+        self.assertIsNone(tracker.ball())
+
     def test_counts_the_results_that_showed_a_ball_since_a_time(self):
         tracker = BallTracker()
         tracker.update(result(1, [BOX], stamp=1.0))

@@ -15,11 +15,13 @@ class BallTracker:
     """Picks the nearest ball (the lowest in the picture) from each detector result and calls it steady after `need_frames`
     results in a row whose ball moved no more than `max_jump_px` pixels. One stray box does not make the car turn."""
 
-    HELD_ABOVE_FRAC = 0.35       # a box whose bottom edge is in the top 35% of the picture is the ball in the gripper, not on the floor
+    HELD_ABOVE_FRAC = 0.23       # a box whose bottom edge is in the top 23% of the picture is the ball in the gripper, not on the floor
+    #                              (the floor's far edge is at ~25%, so a ball 2 m away, bottom edge ~34%, is still a floor ball)
 
-    def __init__(self, need_frames=3, max_jump_px=15.0, max_gap=2):
-        # max_gap: results in a row without a ball that are put up with (a hard ball flickers around the confidence threshold)
-        self.need_frames, self.max_jump_px, self.max_gap = need_frames, max_jump_px, max_gap
+    def __init__(self, need_frames=3, max_jump_px=15.0, max_gap=2, hold_s=1.0):
+        # max_gap results in a row without a ball are put up with (a hard ball flickers around the confidence threshold), and so is
+        # any gap shorter than hold_s seconds (a moving car blurs the ball for a few results)
+        self.need_frames, self.max_jump_px, self.max_gap, self.hold_s = need_frames, max_jump_px, max_gap, hold_s
         self.reset()
 
     def reset(self):
@@ -29,6 +31,8 @@ class BallTracker:
         self._centre = None          # the previous result's centre (x, y) in pixels
         self._count = 0
         self._gap = 0                # results in a row without a ball
+        self._size = 0.0             # the ball's box, longest side, in pixels
+        self._last_seen = None       # time of the last result that showed a ball
 
     def update(self, result):
         if result.frame_id == self._last_id:
@@ -37,18 +41,22 @@ class BallTracker:
         floor = [det for det in result.detections if det.y2 >= self.HELD_ABOVE_FRAC * result.height]
         if not floor:
             self._gap += 1
-            if self._gap > self.max_gap:
+            if self._gap > self.max_gap and (self._last_seen is None or result.stamp - self._last_seen > self.hold_s):
                 self._ball, self._centre, self._count = None, None, 0
             return                   # a short gap: the ball is still there, and keeps the time of the picture it was last seen in
         self._gap = 0
         self._seen.append(result.stamp)
+        self._last_seen = result.stamp
         d = max(floor, key=lambda det: det.y2)
         centre = ((d.x1 + d.x2) / 2.0, (d.y1 + d.y2) / 2.0)
-        if self._centre is not None and max(abs(centre[0] - self._centre[0]), abs(centre[1] - self._centre[1])) <= self.max_jump_px:
+        size = float(max(d.x2 - d.x1, d.y2 - d.y1))
+        # a close ball is boxed whole in one result and by its top half in the next: its centre moves about as far as its own size
+        allowed = max(self.max_jump_px, 0.75 * max(size, self._size))
+        if self._centre is not None and max(abs(centre[0] - self._centre[0]), abs(centre[1] - self._centre[1])) <= allowed:
             self._count += 1
         else:
             self._count = 1
-        self._centre = centre
+        self._centre, self._size = centre, size
         self._ball = Ball(centre[0] / result.width, float(d.y2), result.stamp)
 
     def ball(self):
@@ -85,7 +93,7 @@ class Approach:
     (read while the car stands still, on fresh data only) says when the ball is in the pick range; the camera distance cross-checks it.
     Anything unexpected stops the car (abort) instead of guessing."""
 
-    TURN_TOL_DEG = 3.0
+    TURN_TOL_DEG = 2.0
     SETTLE_S = 0.6
     FRAME_AFTER_S = 0.3
     READING_AFTER_S = 0.5
