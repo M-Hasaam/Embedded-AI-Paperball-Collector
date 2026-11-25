@@ -156,6 +156,13 @@ class GripperSensorTest(unittest.TestCase):
         self.assertEqual(list(failed), ["bad"])
         self.assertIn("not found", failed["bad"])
 
+    def test_the_car_is_never_connected_with_windows_saved_services(self):
+        # Windows kept the car's old service list (from before the gripper channel existed) and could not be made to forget it
+        seen = []
+        with mock.patch.object(dashboard, "BleakClient", lambda target, **kw: seen.append((target, kw))):
+            dashboard.make_client("AA:BB", 8)
+        self.assertEqual(seen, [("AA:BB", {"timeout": 8, "winrt": {"use_cached_services": False}})])
+
     def test_a_missing_gripper_channel_is_shown_on_the_card(self):
         app = self.make_app()
         dashboard.Dashboard._show_tof_unavailable(app)

@@ -63,6 +63,12 @@ TOF_CHAR_UUID = "55667788-99AA-BBCC-DDEE-FF0011223344"        # gripper VL53L0X:
 TOF_WAITING = "Gripper: waiting"
 
 
+def make_client(target, timeout):
+    """A BleakClient for the car that reads its services from the car on every connection. Windows otherwise keeps the list it saw
+    the first time, and a channel added to the firmware later (the gripper sensor) is then 'not found' until the car is forgotten."""
+    return BleakClient(target, timeout=timeout, winrt={"use_cached_services": False})
+
+
 async def subscribe_all(client, pairs):
     """Subscribe to each (uuid, handler) of the car; one that fails does not stop the others. Returns {uuid: reason} of the failures."""
     failed = {}
@@ -2867,7 +2873,7 @@ class Dashboard:
         device = await BleakScanner.find_device_by_name(CAR_NAME, timeout=4)
         if device is not None:
             self._post(lambda: self.car_text.set("Connecting..."))
-            client = BleakClient(device, timeout=12)
+            client = make_client(device, 12)
             await client.connect()
             return client
         saved = self._load_car_address()
@@ -2875,7 +2881,7 @@ class Dashboard:
             self._post(lambda: self.car_text.set("AI_Car not found - retrying"))
             return None
         self._post(lambda: self.car_text.set("AI_Car not advertising - trying its saved connection..."))
-        client = BleakClient(saved, timeout=8)
+        client = make_client(saved, 8)
         await client.connect()
         return client
 
