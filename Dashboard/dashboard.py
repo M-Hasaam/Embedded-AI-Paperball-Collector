@@ -61,6 +61,17 @@ ENCODER_CHAR_UUID = "33445566-7788-99AA-BBCC-DDEEFF001122"   # "leftTicks,rightT
 SERVO_STATUS_CHAR_UUID = "44556677-8899-AABB-CCDD-EEFF00112233"   # "armV,gripperV,armSagMv,gripperSagMv,armState,gripperState"
 TOF_CHAR_UUID = "55667788-99AA-BBCC-DDEE-FF0011223344"        # gripper VL53L0X: mm, "-1" = nothing in range, "NA" = sensor not found
 TOF_WAITING = "Gripper: waiting"
+
+
+async def subscribe_all(client, pairs):
+    """Subscribe to each (uuid, handler) of the car; one that fails does not stop the others. Returns {uuid: reason} of the failures."""
+    failed = {}
+    for uuid, handler in pairs:
+        try:
+            await client.start_notify(uuid, handler)
+        except Exception as e:
+            failed[uuid] = str(e) or type(e).__name__
+    return failed
 TOF_STALE_S = 1.5                 # no gripper reading for this long = show "no new readings" (the car sends about ten a second)
 TOF_NEAR_MM = 60                 # closer than this = something is in the jaws. The VL53L0X reads about 30-50 mm for anything closer than its 30 mm blind zone (a 1 cm object read 40), so 60 still counts that
 # The S3's ADC reads a few percent high, so the displayed servo-supply voltage is multiplied by these (arm, gripper).
@@ -2607,6 +2618,12 @@ class Dashboard:
         self.tof_var.set("Gripper: no readings")
         self.tof_label.configure(fg=MUTED)
 
+    def _show_tof_unavailable(self):
+        """The car has no gripper channel for this connection: old firmware, or Windows still holds an old copy of the car's services."""
+        self.tof_mm = self.tof_stamp = None
+        self.tof_var.set("Gripper: car firmware?")
+        self.tof_label.configure(fg=WARN)
+
     def _show_tof_missing(self):
         self.tof_mm = None
         self.tof_var.set("Gripper: not found")
@@ -2813,13 +2830,13 @@ class Dashboard:
                     await asyncio.sleep(2)
                     continue
                 self.write_response = "write" in self.characteristic.properties
-                for uuid, handler in ((DISTANCE_CHAR_UUID, self._on_distance), (MPU_CHAR_UUID, self._on_mpu),
-                                      (ENCODER_CHAR_UUID, self._on_encoder),
-                                      (SERVO_STATUS_CHAR_UUID, self._on_servo_status), (TOF_CHAR_UUID, self._on_tof)):
-                    try:
-                        await client.start_notify(uuid, handler)
-                    except Exception:
-                        pass
+                failed = await subscribe_all(client, ((DISTANCE_CHAR_UUID, self._on_distance), (MPU_CHAR_UUID, self._on_mpu),
+                                                      (ENCODER_CHAR_UUID, self._on_encoder),
+                                                      (SERVO_STATUS_CHAR_UUID, self._on_servo_status), (TOF_CHAR_UUID, self._on_tof)))
+                for uuid, why in failed.items():
+                    print(f"BLE: could not subscribe to {uuid}: {why}", file=sys.stderr)
+                if TOF_CHAR_UUID in failed:
+                    self._post(self._show_tof_unavailable)
                 self.connected.set()
                 self._post(self.servo_commanded.clear)   # the car may have restarted: its servos are idle again
                 self._post(self._send_speed)   # make the car match the sliders after (re)connecting

@@ -138,6 +138,30 @@ class GripperSensorTest(unittest.TestCase):
     def test_the_sensor_is_subscribed_to_with_the_car_s_uuid(self):
         self.assertEqual(dashboard.TOF_CHAR_UUID, "55667788-99AA-BBCC-DDEE-FF0011223344")
 
+    def test_a_channel_the_car_does_not_have_is_reported_not_swallowed(self):
+        # "Gripper: waiting" for ever: the subscription failed (old firmware, or Windows' saved copy of the car's services) and the
+        # error was thrown away
+        import asyncio
+
+        class Client:
+            def __init__(self): self.started = []
+            async def start_notify(self, uuid, handler):
+                if uuid == "bad":
+                    raise RuntimeError("Characteristic bad was not found!")
+                self.started.append(uuid)
+
+        client = Client()
+        failed = asyncio.run(dashboard.subscribe_all(client, (("a", None), ("bad", None), ("b", None))))
+        self.assertEqual(client.started, ["a", "b"])                 # one bad channel does not stop the others
+        self.assertEqual(list(failed), ["bad"])
+        self.assertIn("not found", failed["bad"])
+
+    def test_a_missing_gripper_channel_is_shown_on_the_card(self):
+        app = self.make_app()
+        dashboard.Dashboard._show_tof_unavailable(app)
+        self.assertIn("firmware", app.tof_var.v)
+        self.assertNotEqual(app.tof_var.v, dashboard.TOF_WAITING)
+
 
 class RecordingTest(unittest.TestCase):
     """The Record button: the camera thread hands every frame to a recorder that saves the camera's JPEGs into a folder."""
