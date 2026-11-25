@@ -86,7 +86,6 @@ All in `Training/paper_ball_detector/`:
 ## Repository layout
 
 ```
-Mobile_app/            Android app (Kotlin, Compose, CameraX, LiteRT); open this folder in Android Studio
 Embedded/              firmware
   esp32/WifiBridge/    ESP32 camera bridge firmware + PC viewers (camera_yolo, camera_distance, camera_serial)
   esp32-s3/AI_Car/     ESP32-S3 car (BLE, 4 servos): AI_Car.ino and control_car.py
@@ -107,13 +106,11 @@ docs/
   MeArm-with-MG996R/   robot-arm drawings and datasheets
 ```
 
-## Android app status
+## Android app
 
-The app runs a YOLO model fully on the phone (CameraX + LiteRT, no cloud). It now contains the **paper-ball model v2.1**
-(`Mobile_app/app/src/main/assets/litter_detector.tflite`, float32, plus `labels.txt` with the single class `paper`). The conversion was checked:
-the TFLite file gives the same boxes and scores as the ONNX model on test pictures, and the debug APK builds. It has **not been run on a device yet**
-(only an iPhone was available), so the on-phone speed and camera behaviour are untested. To switch models:
-`python export_model.py --weights <checkpoint>.pt --install` in `Training/paper_ball_detector/` (needs ultralytics 8.3.x and onnx2tf; see the script).
+The Android app (Kotlin, Compose, CameraX, LiteRT; runs the model on the phone) now lives on the **`mobile-app`** branch, in its
+`Mobile_app/` folder, and is no longer part of `master`. Check that branch out and open the folder in Android Studio.
+`export_model.py --install` and `camera_yolo.py` still point at `Mobile_app/app/src/main/assets/` and only work with that branch checked out.
 
 ## Licences
 

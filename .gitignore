@@ -1,6 +1,5 @@
 *.iml
 .gradle
-/Mobile_app/local.properties
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
@@ -8,9 +7,7 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
-/Mobile_app/build
 /build
-/Mobile_app/captures
 .externalNativeBuild
 .cxx
 local.properties
@@ -37,8 +34,6 @@ Training/*/*.onnx.data
 Training/litter_detector/dataset.yaml
 Training/litter_detector/my_dataset.yaml
 # Export staging/backups. The app's litter_detector.tflite and labels.txt are NOT ignored.
-Mobile_app/app/src/main/assets/*.bak
-Mobile_app/app/src/main/assets/*.new
 
 # Arduino/ESP32 build output
 Embedded/**/build/
