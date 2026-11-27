@@ -30,13 +30,13 @@ unsigned long lastUpdate[NUM_SERVOS] = {0, 0, 0, 0};
 
 // ---- Elbow limit that depends on the shoulder angle (the same table as AI_Car.ino; plotted in docs/arm-limits) ----
 // The elbow can break outside this window for the shoulder's angle. Between two rows the TIGHTER of the two is used, and
-// LIMIT_MARGIN keeps the elbow a little inside every limit that is tighter than the servo's own 80..180 range.
+// LIMIT_MARGIN can keep the elbow further inside every limit tighter than the servo's own 80..180 range; it is 0.
 const int ELBOW = 1, SHOULDER = 2;
 const int LIMIT_ROWS = 14;
 const byte LIMIT_SHOULDER[LIMIT_ROWS]  = {  40,  60,  70,  80,  90, 100, 110, 115, 120, 130, 140, 150, 160, 170};
 const byte LIMIT_ELBOW_MIN[LIMIT_ROWS] = { 135, 120, 105, 100, 100, 100, 100, 100,  95,  95,  95,  90, 100, 120};
 const byte LIMIT_ELBOW_MAX[LIMIT_ROWS] = { 180, 180, 180, 180, 180, 180, 180, 180, 180, 170, 170, 160, 150, 145};
-const int LIMIT_MARGIN = 3;       // degrees kept inside the table's limits (servo overshoot and play)
+const int LIMIT_MARGIN = 0;       // extra degrees kept inside the table's limits (was 3)
 const int LIMIT_LOOKAHEAD = 5;    // the elbow moves clear of the next few shoulder degrees ahead of the shoulder
 const int SHOULDER_DEFAULT = 90;  // assumed shoulder angle while the shoulder has not started
 int elbowDesired = 120;           // where the elbow was last asked to go; it is pulled into the window while it moves
