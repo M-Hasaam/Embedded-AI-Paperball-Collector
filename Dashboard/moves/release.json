@@ -1,0 +1,139 @@
+{
+  "name": "release",
+  "version": 1,
+  "steps": [
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 100,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 120,
+          "speed": 28
+        },
+        {
+          "i": 2,
+          "angle": 90,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.5
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 100,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 120,
+          "speed": 28
+        },
+        {
+          "i": 2,
+          "angle": 140,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 100,
+          "speed": 60
+        },
+        {
+          "i": 1,
+          "angle": 110,
+          "speed": 28
+        },
+        {
+          "i": 2,
+          "angle": 140,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 0,
+          "speed": 600
+        },
+        {
+          "i": 1,
+          "angle": 110,
+          "speed": 28
+        },
+        {
+          "i": 2,
+          "angle": 140,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 0.0
+    },
+    {
+      "type": "arm",
+      "servos": [
+        {
+          "i": 0,
+          "angle": 90,
+          "speed": 600
+        },
+        {
+          "i": 1,
+          "angle": 120,
+          "speed": 28
+        },
+        {
+          "i": 2,
+          "angle": 90,
+          "speed": 60
+        },
+        {
+          "i": 3,
+          "angle": 90,
+          "speed": 60
+        }
+      ],
+      "wait": 2
+    }
+  ],
+  "smooth": true,
+  "assist_gyro": true,
+  "assist_encoders": true
+}
