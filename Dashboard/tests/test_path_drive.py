@@ -393,7 +393,7 @@ class PathSettingsWindowTest(unittest.TestCase):
         self.assertEqual(shown, {"stop_closed_cm": "5", "stop_default_cm": "10", "stop_other_cm": "20",
                                  "fast_pct": "100", "slow_within_cm": "20", "slow_pct": "50", "arrive_cm": "3",
                                  "turn_within_deg": "2", "turn_extra_deg": "1", "differ_cm": "4", "differ_pct": "15",
-                                 "trust": "right", "assist": "gyro"})
+                                 "trust": "right", "assist": "gyro", "manual_guard": "on", "hand_slow_cm": "50"})
 
     def test_a_change_is_applied_and_shown_as_kept(self):
         self.window.setting_vars["slow_within_cm"].set("500")

@@ -15,9 +15,10 @@ ASSISTS = ("off", "gyro", "encoders", "both")        # in the order of the car's
 JUMP_CM = 3000.0                     # the counters changed by more than this between two readings: reset or restarted
 
 RANGES = {"stop_closed_cm": (3.0, 100.0), "stop_default_cm": (3.0, 100.0), "stop_other_cm": (3.0, 100.0),
-          "slow_within_cm": (0.0, 200.0), "arrive_cm": (1.0, 15.0), "turn_within_deg": (1.0, 10.0),
+          "slow_within_cm": (0.0, 200.0), "hand_slow_cm": (0.0, 200.0), "arrive_cm": (1.0, 15.0), "turn_within_deg": (1.0, 10.0),
           "turn_extra_deg": (0.0, 3.0), "differ_cm": (1.0, 100.0), "differ_pct": (0.0, 100.0)}
-CHOICES = {"fast_pct": SPEEDS, "slow_pct": SPEEDS, "trust": TRUSTS, "assist": ASSISTS}
+SWITCH = ("on", "off")
+CHOICES = {"fast_pct": SPEEDS, "slow_pct": SPEEDS, "trust": TRUSTS, "assist": ASSISTS, "manual_guard": SWITCH}
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,8 @@ class PathSettings:
     stop_closed_cm: float = 5.0      # stop this far from an obstacle with the arm in the "All closed" pose ...
     stop_default_cm: float = 10.0    # ... in the "All default" pose ...
     stop_other_cm: float = 20.0      # ... and in any other (the arm may stick out further)
+    manual_guard: str = "on"         # driving forward by hand ends at these distances too (the car creeps up to them)
+    hand_slow_cm: float = 50.0       # ... and is slowed to 50% this far before them (0 = not slowed)
 
     def stop_cm(self, pose):
         """The stop distance for an arm pose: "closed", "default" or "other"."""

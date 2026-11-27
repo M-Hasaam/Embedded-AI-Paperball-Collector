@@ -40,7 +40,7 @@ from helpers.elbow_limit import elbow_window
 from helpers.floor import Floor, dot_offset, load_zero, save_zero, tilt_words
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
 from helpers.mpu_log import MpuLog
-from helpers.path_settings import (ASSISTS, SPEEDS, TRUSTS, Odometer, PathSettings, load_settings, save_settings,
+from helpers.path_settings import (ASSISTS, SPEEDS, SWITCH, TRUSTS, Odometer, PathSettings, load_settings, save_settings,
                                    wheels_disagree)
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
@@ -120,7 +120,13 @@ MIN_ROOM_CM = 2.0                 # less room than this in front of the stop dis
 CAR_LENGTH_CM, CAR_WIDTH_CM = 34.0, 16.0     # the car with the arm all closed, as drawn on the path map
 ARM_BEYOND_SENSOR_CM = 3.0                   # the closed arm's tip is this far in front of the distance sensor
 SENSOR_AHEAD_CM = CAR_LENGTH_CM / 2 - ARM_BEYOND_SENSOR_CM      # the sensor, ahead of the point the car turns about
+HAND_BRAKE_CM = 25.0              # driving by hand it brakes this far before the stop distance (it rolls 10-20 cm more) ...
+APPROACH_REACH_CM = 40.0          # ... and then creeps the rest with its own drives, never further than this beyond it
+HAND_BRAKE_SETTLE_S, HAND_PRESS_SETTLE_S = 0.9, 0.4      # the car comes to rest before that reading (after braking / a press)
 DRIVE_OVER_CM = 1.5               # a drive of the car's own ends about this much past what it was asked
+HAND_SLOW_PCT = 50                # further out, hand driving near an obstacle is limited to this speed ...
+HAND_CLEAR_CM = 5.0               # ... which is given back only this much beyond where it was taken
+HAND_FRESH_S = 1.0                           # a distance reading older than this proves nothing
 MIN_FAST_CM = 10.0                # a fast part shorter than this is not worth it: it overshoots (3 cm at 100% went 8)
 WALL_WIDE_CM, WALL_THICK_CM = 14.0, 3.0      # how an obstacle is drawn on the map, across the way and along it
 SAME_OBSTACLE_CM = 10.0           # two sightings this close together are one obstacle
@@ -535,6 +541,7 @@ class PathRunner:
     Steps: ["goto", x, y]          turn towards the point (gyro), then drive until the estimate is there
            ["turn_to", heading]    in-place turn: the car turns itself by the angle (Y command, closed loop on its gyro)
            ["move", cm, x, y]      (made from a goto) the straight drive to the point, in one or more drives
+           ["approach", stop]      creep up to what the front sensor sees, as far as the stop distance (see approach())
     The car stops each drive by itself on its wheel encoders (the M command), so no Bluetooth delay makes it run past: fast
     while far from the point, slow for the last part (see helpers/path_settings.py). tick(now, gz) must be called every ~30 ms.
     car: drive(cm, pct, assist), cancel(), drive_busy(), drive_ok(), drive_why(), wheels(). send(cmd) sends other commands.
@@ -614,6 +621,14 @@ class PathRunner:
             self._log(now, f"arm {self.get_pose()}: stop {self._stop_cm():g} cm from an obstacle")
         return True
 
+    def approach(self, now, rest):
+        """Once the car has rested `rest` seconds: creep up to what the front sensor sees, as far as the stop distance, with
+        the car's own drives. (Hand driving hands over to this near an obstacle.)"""
+        self.start([["approach", self._stop_cm()]], "Approach", now)
+        self._log(now, f"arm {self.get_pose()}: stop {self._stop_cm():g} cm from an obstacle")
+        self.state, self.settle_until = "rest", now + rest
+        self.status = "Creeping up to the obstacle (let go to stop)"
+
     def abort(self, reason):
         if not self.active:
             return
@@ -647,6 +662,8 @@ class PathRunner:
         self._log(now, f"OBSTACLE {distance:.0f} cm ahead (arm {self.get_pose()}, stop distance {self._stop_cm():g} cm), "
                        f"drawn at ({wall[0]:.1f},{wall[1]:.1f})")
         self.abort("obstacle ahead")
+        if self.label == "Approach":                    # not a failure: this is where it was to go
+            self.status = f"Stopped {distance:.0f} cm before the obstacle (limit {self._stop_cm():g} cm)"
 
     def _brake(self, now, distance, why):
         """Stop the running drive and look again: the next drive is planned with the obstacle in mind."""
@@ -666,6 +683,9 @@ class PathRunner:
         left = self._remaining(now)
         ahead = self.get_dist()
         room = None if ahead is None else ahead - self._stop_cm()       # how far the car may still go
+        creeping = self.label == "Approach"
+        if creeping and ahead is None:
+            return self.abort("no distance reading")
         if left > s.arrive_cm and room is not None and room < MIN_ROOM_CM:
             if self.drives:
                 self._log(now, f"no room left to the point ({left:.1f} cm to go)")
@@ -675,7 +695,7 @@ class PathRunner:
         if left < 0:
             self.reversed = True                       # went past: back up once
             kind, cm, pct = "back", left, s.slow_pct
-        elif left - s.slow_within_cm >= max(MIN_FAST_CM, s.arrive_cm):
+        elif left - s.slow_within_cm >= max(MIN_FAST_CM, s.arrive_cm) and not creeping:
             kind, cm, pct = "fast", left - s.slow_within_cm, s.fast_pct
         else:
             kind, cm, pct = "slow", left, s.slow_pct
@@ -764,7 +784,16 @@ class PathRunner:
                 self.steps[self.idx:self.idx + 1] = [["turn_to", bearing], ["move", dist, step[1], step[2]]]
                 self.status = f"{self.label}: leg {self.legs_done}/{self.legs_total}"
                 return
-            if step[0] == "move":
+            if step[0] == "approach":                  # towards what the sensor sees now, but not endlessly far
+                d = self.get_dist()
+                if d is None:
+                    return self.abort("no distance reading")
+                d = min(d, self._stop_cm() + APPROACH_REACH_CM)
+                hr = math.radians(tr.heading_now(now))
+                self.target = (tr.x - math.sin(hr) * d, tr.y + math.cos(hr) * d)
+                self.drives, self.reversed = 0, False
+                self._next_drive(now)
+            elif step[0] == "move":
                 self.target = (step[2], step[3])
                 self.drives, self.reversed = 0, False
                 self._next_drive(now)
@@ -776,6 +805,9 @@ class PathRunner:
                     return
                 self.corrections = 0
                 self._begin_turn(now, step[1])
+        elif self.state == "rest":
+            if now >= self.settle_until:
+                self.state = "next"
         elif self.state == "driving":
             if self.drive_cm > 0:
                 d, stop = self.get_dist(), self._stop_cm()
@@ -854,9 +886,9 @@ class PathWindow:
         win = self.win = tk.Toplevel(app.root)
         win.title("Path map - gyro heading + wheel-encoder distance")
         win.configure(bg=BG)
-        h = min(890, win.winfo_screenheight() - 110)
+        h = min(920, win.winfo_screenheight() - 110)
         win.geometry(f"660x{h}+80+20")
-        win.minsize(580, 670)
+        win.minsize(580, 700)
         win.protocol("WM_DELETE_WINDOW", self.close)
         self.waypoints = []
         self.tf = None
@@ -921,11 +953,12 @@ class PathWindow:
     SETTING_ROWS = (
         ("Stop before an obstacle:", "stop_closed_cm", "cm arm closed,", "stop_default_cm", "cm arm default,",
          "stop_other_cm", "cm else"),
+        ("By hand: slow to 50% when closer than", "hand_slow_cm", "cm beyond the stop distance (0 = never)"),
         ("Drive at", ("fast_pct", SPEEDS), "% until", "slow_within_cm", "cm from a point, then at", ("slow_pct", SPEEDS), "%"),
         ("A point is reached within", "arrive_cm", "cm.  Turn if over", "turn_within_deg", "° off, asking",
          "turn_extra_deg", "° extra"),
         ("Wheels differ by over", "differ_cm", "cm and", "differ_pct", "%: trust the", ("trust", TRUSTS), "wheel"),
-        ("Straight assist", ("assist", ASSISTS), "(gyro is safest while a wheel counter is faulty)"),
+        ("Straight assist", ("assist", ASSISTS), "   Hand driving stops at obstacles", ("manual_guard", SWITCH)),
     )
 
     def _build_settings(self, win):
@@ -2645,6 +2678,8 @@ class Dashboard:
         self.path_settings_file = data_file("path_settings.json")
         self.path_settings = load_settings(self.path_settings_file)
         self.odometer = Odometer()     # the distance along the way from the two wheel counters
+        self.hand_stop = ""            # why driving forward by hand was just slowed, stopped or refused
+        self.hand_slowed = False       # hand driving is limited to HAND_SLOW_PCT because of an obstacle
         self.runner = PathRunner(self.tracker, self._runner_send, lambda: self.dist_cm, RunnerCar(self),
                                  lambda: self.path_settings, self._runner_finished,
                                  self.pose)
@@ -3543,6 +3578,7 @@ class Dashboard:
         self.floor.reset()
         self.level.show(None)
         self.mpu_watch.reset()
+        self.hand_slowed = False
         self.heading_deg = 0.0
         self.dist_cm = None
         self.dist_stamp = None
@@ -3666,9 +3702,64 @@ class Dashboard:
         """The arm's pose by the servo sliders: "closed", "default" or "other"."""
         return arm_pose([int(scale.get()) for scale in self.servo_scales])
 
+    def car_speed_pct(self):
+        return int(self.car_speed.get())
+
+    def _distance_ahead(self, now):
+        """The front sensor's reading if hand driving is guarded and the reading is fresh, else None."""
+        s = getattr(self, "path_settings", None)
+        if s is None or s.manual_guard != "on" or self.dist_cm is None or self.dist_stamp is None:
+            return None
+        return self.dist_cm if now - self.dist_stamp <= HAND_FRESH_S else None
+
+    def _hand_slow(self, d, now):
+        """Limit hand driving to HAND_SLOW_PCT because of an obstacle d cm ahead."""
+        stop, s = self.path_settings.stop_cm(self.pose()), self.path_settings
+        if self.hand_slowed or s.hand_slow_cm <= 0 or d >= stop + s.hand_slow_cm or self.car_speed_pct() <= HAND_SLOW_PCT:
+            return
+        self.hand_slowed = True
+        self._send(f"P{HAND_SLOW_PCT}")
+        self.runner._log(now, f"HAND slow: {HAND_SLOW_PCT}% with an obstacle {d:.0f} cm ahead")
+        self.hand_stop = f"Slowed to {HAND_SLOW_PCT}%: obstacle {d:.0f} cm ahead"
+
+    def _hand_full_speed(self):
+        """Give the speed slider's speed back to the car."""
+        if self.hand_slowed:
+            self.hand_slowed = False
+            self._send(f"P{self.car_speed_pct()}")
+
+    def _obstacle_guard(self, now):
+        """While the car is driven forward by hand: slow it down as an obstacle comes near, then brake and let the car creep up
+        to the stop distance with its own drives, which it ends by itself (a stop sent from here arrives 10 cm late). Letting
+        go of the control ends that. (Paths look after themselves; Collect and Moves drive by distance and are not touched.)"""
+        if not self.connected.is_set() or self.runner.active or self.tracker.cmd != "U":
+            return Dashboard._hand_full_speed(self)
+        d = Dashboard._distance_ahead(self, now)
+        if d is None:
+            return                                      # no echo says nothing: whatever speed it has, it keeps
+        stop = self.path_settings.stop_cm(self.pose())
+        if d > stop + self.path_settings.hand_slow_cm + HAND_CLEAR_CM:
+            Dashboard._hand_full_speed(self)
+        Dashboard._hand_slow(self, d, now)
+        if d > stop + HAND_BRAKE_CM:
+            return
+        self._send("S")
+        self.runner._log(now, f"HAND brake: obstacle {d:.0f} cm ahead (arm {self.pose()}, stop distance {stop:g} cm)")
+        self.runner.approach(now, HAND_BRAKE_SETTLE_S)
+
     def _send(self, message):
         if not self.connected.is_set() or not self.loop or not self.loop.is_running():
             return
+        if message == "U" and not self._runner_sending:
+            now = time.monotonic()
+            d = Dashboard._distance_ahead(self, now)
+            if d is not None and d <= self.path_settings.stop_cm(self.pose()) + HAND_BRAKE_CM:
+                self._send("S")                              # takes over from whatever else was driving the car
+                self.runner._log(now, f"HAND forward with an obstacle {d:.0f} cm ahead: creeping up to it")
+                self.runner.approach(now, HAND_PRESS_SETTLE_S)
+                return
+            if d is not None:                                # from standstill: it never gets faster than the limit
+                Dashboard._hand_slow(self, d, now)
         if message in ("U", "D", "L", "R", "S"):
             if self.runner.active and not self._runner_sending:
                 self.runner.abort("manual control")       # you touched the controls: take over
@@ -3740,7 +3831,10 @@ class Dashboard:
             self.tracker.set_command("S")
             return
         self.tracker.update(dt, int(self.car_speed.get()), now)
-        self.run_status_var.set("" if self.runner.status == "Idle" else self.runner.status)
+        self._obstacle_guard(now)
+        if (self.tracker.cmd != "S" and not self.hand_slowed) or self.runner.active:
+            self.hand_stop = ""                         # the car moves (a stop above set it to S): the message is old
+        self.run_status_var.set(self.hand_stop or ("" if self.runner.status == "Idle" else self.runner.status))
         if self.runner.active:
             self.runner.tick(now, self.gz)
         self.runner.settle_obstacle(now)
@@ -3888,7 +3982,10 @@ class Dashboard:
             self._send_speed_throttled()
 
     def _send_speed(self):
-        self._send(f"P{int(self.car_speed.get())}")
+        pct = int(self.car_speed.get())
+        if self.hand_slowed:                                # near an obstacle the slider cannot go past the limit
+            pct = min(pct, HAND_SLOW_PCT)
+        self._send(f"P{pct}")
 
     def _turn_speed_changed(self, value):
         self.car_turn_var.set(f"{int(float(value))}%")
