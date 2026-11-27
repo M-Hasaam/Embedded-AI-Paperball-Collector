@@ -353,6 +353,21 @@ class RepeatTest(unittest.TestCase):
         self.assertIn("=== run 2 of 3 ===", self.text())
         self.assertIn("=== 3 runs: 3 succeeded, 0 failed ===", self.text())
 
+    def test_the_wait_between_runs_can_be_chosen(self):
+        self.assertTrue(self.player.start(move_of(drive_step(5, 50)), self.now, 3, pause_s=0.5))
+        self.finish_drive()
+        self.assertIn("next run in 0.5 s", self.player.status)
+        self.advance(0.4)
+        self.assertEqual(self.drives(), 1)
+        self.advance(0.1)
+        self.assertEqual(self.drives(), 2)
+
+    def test_no_wait_at_all_starts_the_next_run_at_once(self):
+        self.player.start(move_of(drive_step(5, 50)), self.now, 2, pause_s=0)
+        self.finish_drive()
+        self.advance(0.1)
+        self.assertEqual(self.drives(), 2)
+
     def test_a_failed_run_is_counted_and_the_next_one_still_happens(self):
         self.start(4, drive_step(5, 50), wait_step(0.1))
         for ok in (True, False, False, True):

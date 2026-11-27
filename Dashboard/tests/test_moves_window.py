@@ -209,6 +209,83 @@ class MovesWindowTest(unittest.TestCase):
         self.assertIn("Run 1/3", self.window.status_var.get())
         self.assertIn("=== run 1 of 3 ===", self.log())
 
+    def test_the_wait_box_starts_at_two_seconds_and_is_used(self):
+        self.assertEqual(self.window.wait_var.get(), "2")
+        self.window.add_wait(1)
+        self.window.times_var.set("3")
+        for typed, seconds in (("2", 2.0), ("0.5", 0.5), ("0", 0.0), (" 1,5 ", 1.5)):
+            self.window.wait_var.set(typed)
+            self.assertTrue(self.window.play(), msg=typed)
+            self.assertEqual(self.window.player.pause_s, seconds, msg=typed)
+            self.window.stop()
+
+    def test_the_wait_box_rejects_nonsense(self):
+        self.window.add_wait(1)
+        for bad in ("-1", "61", "abc", "", "nan", "inf"):
+            self.window.wait_var.set(bad)
+            self.assertFalse(self.window.play(), msg=bad)
+            self.assertIn("0 to 60 s", self.window.status_var.get(), msg=bad)
+        self.assertEqual(self.car.calls, [])
+
+    def test_the_test_play_row_fits_in_the_window(self):
+        self.app._button = dashboard.Dashboard._button.__get__(self.app)          # the real buttons, with their real size
+        window = dashboard.MovesWindow(self.app, FakeCar(), log_path=self.log_path)
+        self.addCleanup(window.close)
+        window.win.geometry("800x560+-4000+-4000")
+        window.win.update()
+        row = window.play_row
+        for widget in row.winfo_children():
+            self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth(), widget)       # not squeezed
+            self.assertLessEqual(widget.winfo_x() + widget.winfo_width(), row.winfo_width(), widget)
+
+    # the status text is one to three lines long: nothing above it may move when it changes
+    SHORT = "20 runs: 20 succeeded, 0 failed"
+    LONG = ("Run 100/100 (99 ok, 1 failed) - Step 9/9: Arm: Gripper 100\u00b0@600/s, Elbow 120\u00b0@30/s, Shoulder 90\u00b0@60/s, "
+            "Servo 4 90\u00b0@60/s, then wait 0.5 s")
+    FAILED = ("Stopped: the drive did not finish normally: the car gave up (a wheel's counter did not advance for 1.5 s, or the "
+              "drive was slower than 4 cm/s)")
+
+    def shown_window(self, width, height=560):
+        self.app._button = dashboard.Dashboard._button.__get__(self.app)
+        window = dashboard.MovesWindow(self.app, FakeCar(), log_path=self.log_path)
+        self.addCleanup(window.close)
+        window.win.geometry(f"{width}x{height}+-4000+-4000")
+        window.win.update()
+        return window
+
+    def test_the_buttons_stay_put_when_the_status_text_changes(self):
+        for width in (640, 800, 1100):
+            window = self.shown_window(width)
+            places = set()
+            for text in (self.SHORT, self.LONG, "Idle", self.FAILED):
+                window.status_var.set(text)
+                window.win.update()
+                places.add((window.play_row.winfo_y(), window.listbox.winfo_height(), window.status_label.winfo_height()))
+            self.assertEqual(len(places), 1, (width, places))
+
+    def test_the_longest_status_texts_are_shown_whole(self):
+        for width in (640, 800, 1100):
+            window = self.shown_window(width)
+            label = window.status_label
+            for text in (self.LONG, self.FAILED):
+                window.status_var.set(text)
+                window.win.update()
+                whole = dashboard.tk.Label(window.win, text=text, font=label.cget("font"), wraplength=label.cget("wraplength"),
+                                           justify="left")
+                self.assertLessEqual(whole.winfo_reqheight(), label.winfo_height(), (width, text))
+                self.assertLessEqual(whole.winfo_reqwidth(), label.winfo_width(), (width, text))
+                whole.destroy()
+            self.assertGreaterEqual(label.winfo_y() + label.winfo_height(), 0)
+            self.assertLessEqual(label.winfo_y() + label.winfo_height(), window.win.winfo_height(), width)
+
+    def test_nothing_is_cut_off_in_the_smallest_window(self):
+        window = self.shown_window(640, 440)
+        window.status_var.set(self.LONG)
+        window.win.update()
+        for widget in window.win.winfo_children():
+            self.assertGreaterEqual(widget.winfo_height(), min(widget.winfo_reqheight(), 80), widget)      # the list may shrink
+            self.assertLessEqual(widget.winfo_y() + widget.winfo_height(), window.win.winfo_height(), widget)
+
     def test_the_times_box_starts_at_one_and_rejects_nonsense(self):
         self.assertEqual(self.window.times_var.get(), "1")
         self.window.add_wait(1)

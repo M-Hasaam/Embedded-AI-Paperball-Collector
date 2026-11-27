@@ -39,9 +39,9 @@ from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, 
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
-from helpers.moves import (MAX_DRIVE_CM, MAX_REPEATS, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, LogTail, MoveFileError, MovePlayer,
-                   Readings, RepeatPlayer, arm_step, describe_step, drive_step, front_text, load_move, new_move, save_move, turn_step,
-                   validate_move, wait_step)
+from helpers.moves import (MAX_DRIVE_CM, MAX_REPEATS, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, REPEAT_PAUSE_S, LogTail, MoveFileError,
+                   MovePlayer, Readings, RepeatPlayer, arm_step, describe_step, drive_step, front_text, load_move, new_move,
+                   save_move, turn_step, validate_move, wait_step)
 
 # ---------------------------------------------------------------- settings
 # Camera (ESP32 WiFi bridge)
@@ -1431,13 +1431,14 @@ class MovesWindow:
         self.assist_gyro_var = tk.BooleanVar(master=win, value=True)
         self.assist_enc_var = tk.BooleanVar(master=win, value=True)
         self.times_var = tk.StringVar(master=win, value="1")        # how many times Test play runs the move
+        self.wait_var = tk.StringVar(master=win, value=f"{REPEAT_PAUSE_S:g}")      # seconds between two of those runs
 
         tk.Label(win, text="Pose the arm with the sliders in the dashboard, then Add arm pose. Steps run one after another, "
                            "top to bottom. Drives run at 100% or 50% speed and are counted by the car's wheel encoders.",
                  bg=BG, fg=MUTED, font=(FONT, 9), wraplength=760,
                  justify="left").pack(anchor="w", padx=12, pady=(10, 4))
         self.listbox = tk.Listbox(win, bg=CARD, fg=TEXT, selectbackground=ACCENT, selectforeground="#ffffff", activestyle="none",
-                                  highlightthickness=1, highlightbackground=LINE, relief="flat", font=(FONT, 10), height=12,
+                                  highlightthickness=1, highlightbackground=LINE, relief="flat", font=(FONT, 10), height=5,
                                   exportselection=False)
         self.listbox.pack(fill="both", expand=True, padx=12, pady=4)
 
@@ -1453,18 +1454,28 @@ class MovesWindow:
              ("Add turn (°)", self._add_turn_dialog, {}), ("Add wait (s)", self._add_wait_dialog, {})])
         row([("Edit", self._edit_dialog, {}), ("Delete", self.delete_selected, {}), ("Up", lambda: self.move_selected(-1), {}),
              ("Down", lambda: self.move_selected(1), {}), ("Save...", self._save_dialog, {}), ("Open...", self._open_dialog, {})])
-        play_row = row([("Test play", self._play_dialog, {}), ("STOP", self.stop, {"danger": True})], pady=(10, 0))
+        play_row = self.play_row = row([("Test play", self._play_dialog, {}), ("STOP", self.stop, {"danger": True})], pady=(10, 0))
         times = tk.Frame(play_row, bg=BG)
         times.pack(side="left", padx=(0, 6), after=play_row.winfo_children()[0])
-        tk.Spinbox(times, from_=1, to=MAX_REPEATS, textvariable=self.times_var, width=4, bg=CARD, fg=TEXT, insertbackground=TEXT,
-                   buttonbackground=CARD_HI, relief="flat", font=(FONT, 10)).pack(side="left")
-        self.times_var.set("1")                                     # the Spinbox puts its own start value in
-        tk.Label(times, text="times", bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(4, 0))
+
+        def number(variable, low, high, step):
+            start = variable.get()
+            tk.Spinbox(times, from_=low, to=high, increment=step, textvariable=variable, width=4, bg=CARD, fg=TEXT,
+                       insertbackground=TEXT, buttonbackground=CARD_HI, relief="flat", font=(FONT, 10)).pack(side="left")
+            variable.set(start)                                     # the Spinbox puts its own lowest value in
+
+        def word(text):
+            tk.Label(times, text=text, bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=4)
+
+        number(self.times_var, 1, MAX_REPEATS, 1)
+        word("times, wait")
+        number(self.wait_var, 0, MAX_WAIT_S, 0.5)
+        word("s")
         tk.Checkbutton(
             play_row, text="Smooth arm moves (arrive together, no stops between arm steps)", variable=self.smooth_var,
             command=lambda: self.set_smooth(self.smooth_var.get()), bg=BG, fg=TEXT, selectcolor=CARD_HI, activebackground=BG,
             activeforeground=TEXT, highlightthickness=0, bd=0, takefocus=0, anchor="w", font=(FONT, 9), cursor="hand2",
-        ).pack(side="left", padx=(14, 0))
+        ).pack(side="left", padx=(8, 0))
         assist_row = tk.Frame(win, bg=BG)
         assist_row.pack(fill="x", padx=12, pady=(6, 0))
         tk.Label(assist_row, text="Drives steer straight with:", bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
@@ -1475,8 +1486,11 @@ class MovesWindow:
                 command=lambda: self.set_assist(self.assist_gyro_var.get(), self.assist_enc_var.get()),
             ).pack(side="left", padx=(10, 0))
         self.status_var = tk.StringVar(value="Add some steps, then Test play.")
-        tk.Label(win, textvariable=self.status_var, bg=BG, fg=TEXT, font=(FONT, 10), wraplength=600, justify="left",
-                 anchor="w").pack(fill="x", padx=12, pady=(8, 12))
+        # always three lines tall: with a height that followed the text, the buttons above jumped up and down during a run
+        status = self.status_label = tk.Label(win, textvariable=self.status_var, bg=BG, fg=TEXT, font=(FONT, 10), height=3,
+                                              wraplength=600, justify="left", anchor="nw")
+        status.pack(side="bottom", fill="x", padx=12, pady=(6, 8), before=self.listbox)
+        status.bind("<Configure>", lambda e: status.configure(wraplength=max(200, e.width - 8)))
         win.after(50, self._loop)
 
     # ---- editing ------------------------------------------------------
@@ -1599,7 +1613,11 @@ class MovesWindow:
         if times is None:
             self._status(f"Times must be a whole number from 1 to {MAX_REPEATS}")
             return False
-        started = self.player.start(self.move, time.monotonic(), times)
+        wait = self.wait()
+        if wait is None:
+            self._status(f"The wait between runs must be a number from 0 to {MAX_WAIT_S} s")
+            return False
+        started = self.player.start(self.move, time.monotonic(), times, wait)
         self._status(self.player.status)
         self._write_log()
         return started
@@ -1608,6 +1626,14 @@ class MovesWindow:
         """The number in the times box; None if it is not a whole number from 1 to MAX_REPEATS."""
         text = self.times_var.get().strip()
         return int(text) if text.isdigit() and 1 <= int(text) <= MAX_REPEATS else None
+
+    def wait(self):
+        """The seconds in the wait box (0.5 or 0,5); None if it is not a number from 0 to MAX_WAIT_S."""
+        try:
+            seconds = float(self.wait_var.get().strip().replace(",", "."))
+        except ValueError:
+            return None
+        return seconds if 0 <= seconds <= MAX_WAIT_S else None
 
     def _write_log(self):
         for line in self._tail.new(self.player.log):

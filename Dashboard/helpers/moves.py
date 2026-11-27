@@ -25,7 +25,7 @@ MAX_WAIT_S = 60
 SPEED_RANGE = (1, 600)      # deg/s, like the dashboard's servo speed slider
 SAMPLE_S = 0.5              # while a drive or turn runs, the log gets a line this often
 MAX_REPEATS = 100
-REPEAT_PAUSE_S = 2.0        # between two runs of a repeated move: the car comes to rest (and there is time to press STOP)
+REPEAT_PAUSE_S = 2.0        # the usual wait between two runs of a repeated move: the car comes to rest, time to press STOP
 
 
 class MoveFileError(Exception):
@@ -412,10 +412,12 @@ class RepeatPlayer:
         self.one = MovePlayer(car, names)
         self.active, self.ok, self.status, self.log = False, None, "Idle", []
         self.times, self.run, self.passed, self.failures = 1, 0, 0, []
+        self.pause_s = REPEAT_PAUSE_S
         self._move, self._tail, self._next_at = None, LogTail(), 0.0
         self._busy = False           # inside the single player: an abort arriving now is the echo of its own stop
 
-    def start(self, move, now, times=1):
+    def start(self, move, now, times=1, pause_s=REPEAT_PAUSE_S):
+        """Play `move` `times` times, waiting `pause_s` seconds between two runs."""
         if self.active:
             return False
         if not move.get("steps"):
@@ -425,7 +427,7 @@ class RepeatPlayer:
             self.status = "Car not connected"
             return False
         self._move, self.times, self.run, self.passed, self.failures = copy.deepcopy(move), times, 0, 0, []
-        self.active, self.ok, self.log = True, None, []
+        self.active, self.ok, self.log, self.pause_s = True, None, [], pause_s
         self._begin_run(now)
         return True
 
@@ -437,7 +439,7 @@ class RepeatPlayer:
             self._follow(now)
         elif not self.car.connected():
             self.abort("car disconnected")
-        elif now >= self._next_at:
+        elif now >= self._next_at - 1e-9:
             self._begin_run(now)
 
     def abort(self, reason):
@@ -495,8 +497,8 @@ class RepeatPlayer:
             self.log.append(f"=== {self.status} ===")
             self._log_failures()
         else:
-            self._next_at = now + REPEAT_PAUSE_S
-            self.status = f"Run {self.run}/{self.times} done ({self._count()}) - next run in {REPEAT_PAUSE_S:g} s"
+            self._next_at = now + self.pause_s
+            self.status = f"Run {self.run}/{self.times} done ({self._count()}) - next run in {self.pause_s:g} s"
 
     # -- the summary --
     def _count(self):
