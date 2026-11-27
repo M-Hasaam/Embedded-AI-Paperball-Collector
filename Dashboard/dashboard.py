@@ -36,6 +36,7 @@ from helpers.ball_detector import DetectorWorker, draw_detections, summarize
 from helpers.ball_approach import Approach, BallTracker, Reading, Telemetry
 from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, draw_guides, draw_spot_marker, load_model,
                                    save_model)
+from helpers.elbow_limit import elbow_window
 from helpers.floor import Floor, dot_offset, load_zero, save_zero, tilt_words
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
 from helpers.mpu_log import MpuLog
@@ -95,6 +96,7 @@ SERVO_MAX_ANGLES = [120, 180, 170, 180]
 SERVO_RANGE_DEFAULT = [(0, 100), (80, 180), (40, 170), (0, 180)]   # each servo slider's range at start-up; adjustable in the UI
 SERVO_RANGE_GAP = 5                       # the two ends of the range slider stay at least this far apart
 SERVO_DEFAULT_ANGLES = [90, 120, 90, 90]   # keep in sync with SERVO_DEFAULTS in AI_Car.ino (elbow at 90 hits the ultrasonic sensor)
+SERVO_CLOSED_ANGLES = [100, 135, 40, 90]    # the "All closed" button: gripper shut, shoulder at 40, elbow as low as it may there
 SERVO_SPEED = 60                  # default deg/s
 SERVO_MEMORY_FILE = data_file("servo_last_angles.json")   # where each servo was left (so a restart starts from there)
 CAR_SPEED_DEFAULT = 100           # wheel speed in percent for driving straight (forward / backward)
@@ -2495,7 +2497,6 @@ class Dashboard:
         servo_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(6, 8))
         self.servo_scales, self.speed_scales, self.servo_values = [], [], []
         self.dragging, self.last_servo_send, self.pending_servo_send = set(), {}, {}
-        self.actual_markers = []
         self.servo_commanded = set()      # servos that have been sent a command (an idle one must not be woken by a speed change)
         self.last_angles = self._load_servo_memory()
         self.memory_save_job = None
@@ -2511,9 +2512,6 @@ class Dashboard:
             tk.Label(top, textvariable=val, bg=CARD, fg=ACCENT, font=(FONT, 10, "bold")).pack(side="right")
             scale = self._scale(col, SERVO_RANGE_DEFAULT[i][0], SERVO_RANGE_DEFAULT[i][1], SERVO_DEFAULT_ANGLES[i], lambda v, idx=i: self._slider_changed(idx, v))
             scale.pack(fill="x")
-            # red marker (only the elbow's is ever shown): the angle a limit is holding the elbow at, while one is acting
-            marker = tk.Frame(scale, bg=BAD, width=6)
-            self.actual_markers.append(marker)
             scale.bind("<ButtonPress-1>", lambda e, idx=i: self.dragging.add(idx))
             scale.bind("<ButtonRelease-1>", lambda e, idx=i: self._servo_released(idx))
             self.servo_scales.append(scale)
@@ -2533,9 +2531,12 @@ class Dashboard:
             tk.Label(rg, textvariable=rng_var, bg=CARD, fg=MUTED, font=(FONT, 8)).pack(side="right")
             RangeSlider(rg, SERVO_MIN_ANGLES[i], SERVO_MAX_ANGLES[i], *SERVO_RANGE_DEFAULT[i],
                         lambda lo, hi, idx=i, var=rng_var: self._range_changed(idx, lo, hi, var)).pack(side="left", fill="x", expand=True, padx=6)
+        self.limit_zones = self._make_elbow_zones(self.servo_scales[1])
+        self.servo_scales[1].bind("<Configure>", lambda e: self._draw_elbow_zones(), add="+")
         presets = tk.Frame(s, bg=CARD)
         presets.grid(row=1, column=0, columnspan=len(SERVO_NAMES), sticky="w", pady=(6, 0))
         self._button(presets, "All default", self._set_default_servos).pack(side="left")
+        self._button(presets, "All closed", self._set_closed_servos).pack(side="left", padx=(8, 0))
         self.idle_note = tk.Label(presets, text="Servos stay idle after power-up until you first move a slider or press All default.",
                                   bg=CARD, fg=MUTED, font=(FONT, 9))
         self.idle_note.pack(side="left", padx=14)
@@ -2996,23 +2997,32 @@ class Dashboard:
         if len(vals) < 6:
             return
         arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state = vals[:6]
-        if len(vals) >= 11:
-            self._post(lambda a=int(vals[10]): self._show_held_angle(a))
         arm_noise, grip_noise = (vals[6], vals[7]) if len(vals) >= 8 else (0.0, 0.0)
         arm_base, grip_base = (vals[8], vals[9]) if len(vals) >= 10 else (-1.0, -1.0)
         self._post(lambda: self._show_servo_status(arm_v, grip_v, arm_sag, grip_sag, int(arm_state), int(grip_state),
                                                    arm_noise, grip_noise, arm_base, grip_base))
 
-    def _show_held_angle(self, angle):
-        """Red, non-draggable marker on the elbow slider at the angle the car's limit is holding the elbow at (the blue handle
-        stays where you put it). The car sends -1 while no limit is acting, and then the marker is hidden."""
-        scale, marker = self.servo_scales[1], self.actual_markers[1]
-        if angle < 0:
-            marker.place_forget()
+    def _make_elbow_zones(self, scale):
+        """The two red strips of the elbow slider: below the lowest and above the highest angle the car allows."""
+        return tk.Frame(scale, bg=BAD), tk.Frame(scale, bg=BAD)
+
+    def _draw_elbow_zones(self):
+        """Mark on the elbow slider where the elbow may not go with the shoulder at its slider's angle. Always shown, also with
+        the limit bypassed; they lie along the bottom of the track, so the handle stays in sight."""
+        scale = self.servo_scales[1]
+        if scale.winfo_width() <= 1:                                      # not on screen yet
             return
-        lo, hi = float(scale.cget("from")), float(scale.cget("to"))
-        x, _ = scale.coords(min(max(angle, lo), hi))
-        marker.place(x=x - 3, y=0, width=6, relheight=1.0)
+        low, high = elbow_window(int(self.servo_scales[2].get()))
+        first, last = float(scale.cget("from")), float(scale.cget("to"))
+        half = int(scale.cget("sliderlength")) // 2
+        x = lambda angle: scale.coords(min(max(angle, first), last))[0]
+        spans = ((x(first) - half, x(low) + (half if low > last else 0)) if low > first else None,
+                 (x(high) - (half if high < first else 0), x(last) + half) if high < last else None)
+        for zone, span in zip(self.limit_zones, spans):
+            if span is None:
+                zone.place_forget()
+            else:
+                zone.place(x=span[0], rely=1.0, anchor="sw", width=max(1, span[1] - span[0]), height=5)
 
     def _show_limit_message(self, message):
         if message:
@@ -3129,8 +3139,6 @@ class Dashboard:
         self.rail_text.set("Servo supply: waiting for data")
         self.rail_alert.set("")
         self._show_limit_message("")
-        for marker in self.actual_markers:
-            marker.place_forget()
         self.tracker.enc_last = None   # the car may have rebooted: its encoder counters start from 0 again
         self._yaw_resync = True        # the car may have rebooted: its yaw starts from 0 again
         self._draw_dial()
@@ -3536,6 +3544,8 @@ class Dashboard:
     # ---- servos -------------------------------------------------------
     def _slider_changed(self, index, value):
         self.servo_values[index].set(f"{int(float(value))}°")
+        if index == 2:
+            self._draw_elbow_zones()                  # the elbow's limits depend on the shoulder
         if index in self.dragging:
             self._send_servo_throttled(index)
 
@@ -3547,6 +3557,8 @@ class Dashboard:
         if value < lo or value > hi:          # the servo was outside the new range: bring it to the nearest end
             scale.set(min(max(value, lo), hi))
             self._send_servo(index)
+        if index in (1, 2):
+            self.root.after_idle(self._draw_elbow_zones)  # once the slider has taken its new ends
 
     def _send_servo_throttled(self, index):
         if index in self.pending_servo_send:
@@ -3620,8 +3632,15 @@ class Dashboard:
             pass
 
     def _set_default_servos(self):
+        self._set_pose(SERVO_DEFAULT_ANGLES)
+
+    def _set_closed_servos(self):
+        self._set_pose(SERVO_CLOSED_ANGLES)
+
+    def _set_pose(self, angles):
+        """Move the sliders, and with them the servos, to these angles at the speeds the speed sliders show."""
         for index, scale in enumerate(self.servo_scales):
-            scale.set(SERVO_DEFAULT_ANGLES[index])
+            scale.set(angles[index])
             self._send_servo(index)
 
     # ---- keyboard / shutdown -----------------------------------------
