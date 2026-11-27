@@ -7,6 +7,7 @@
 #include <VL53L0X.h>   // Arduino library "VL53L0X" by Pololu (Library Manager)
 #include <math.h>
 #include "gyro_still.h" // decides from the readings whether the car really stands still (for the gyro's zero point)
+#include "drive_wheels.h" // how far a straight drive has gone when the two wheel counts differ
 
 // HC-SR04 ultrasonic sensor pins.
 // The sensor is powered from the S3's 3V3 pin (on the converter's 5V it sent the S3 into a brownout restart loop
@@ -498,6 +499,10 @@ float driveCoastSec[4] = {0.20f, 0.15f, 0.28f, 0.22f};   // how long the car rol
 // until restart). Short drives get their own values because the speed the car measures lags behind while it is still speeding up,
 // which makes it stop a little late: a 5 cm drive needs a longer allowance than a 30 cm drive at the same power.
 
+// Which wheel counter decides a drive when the two differ a lot (command W<trust> <cm> <percent>; the dashboard sends its
+// setting on connecting). The right one by default: in the logged drives with a disagreement it was the right one 12 of 15 times.
+WheelRule wheelRule = {WHEEL_RIGHT, 4.0f, 15.0f};
+
 void driveWheelCm(float &left, float &right) {     // distance each wheel covered in the direction of the drive
   noInterrupts();
   long l = encoderLeftTicks, r = encoderRightTicks;
@@ -561,10 +566,11 @@ void updateDrive() {
   }
   float dl, dr;
   driveWheelCm(dl, dr);
-  float done = (dl + dr) / 2.0f;                   // how far the car went (both wheels averaged)
-  // Speed and arrival are judged from the SLOWER wheel: an encoder that chatters on a slot edge while the motors start to
-  // hum adds ticks without the wheel moving, and one such wheel must not make a short drive look finished.
-  float sure = dl < dr ? dl : dr;
+  // While the wheels agree: speed and arrival are judged from the SLOWER one (an encoder that chatters on a slot edge while
+  // the motors start to hum adds ticks without the wheel moving, and must not make a short drive look finished), and the
+  // distance covered is their mean. When they differ a lot, the trusted wheel decides both (see drive_wheels.h).
+  float done = coveredCm(dl, dr, wheelRule);
+  float sure = reachedCm(dl, dr, wheelRule);
   if (now - driveSampleMs >= 100) {                // speed along the drive, smoothed, from the last 100 ms
     float inst = (sure - driveLastCm) / ((now - driveSampleMs) / 1000.0f);
     driveSpeedCmS = 0.5f * driveSpeedCmS + 0.5f * inst;
@@ -606,7 +612,9 @@ void updateDrive() {
       float step = constrain(0.6f * over / driveStopSpeed, -0.05f, 0.05f);
       driveCoastSec[driveCls] = constrain(driveCoastSec[driveCls] + step, 0.03f, 0.8f);
     }
-    Serial.printf("Drive done: asked %.1f cm, covered %.1f cm (%+.1f), coast class %d now %.2f s\n", fabsf(driveTargetCm), done, over, driveCls, driveCoastSec[driveCls]);
+    Serial.printf("Drive done: asked %.1f cm, covered %.1f cm (%+.1f), left %.1f right %.1f%s, coast class %d now %.2f s\n",
+                  fabsf(driveTargetCm), done, over, dl, dr, wheelsDisagree(dl, dr, wheelRule) ? " (wheels disagree)" : "",
+                  driveCls, driveCoastSec[driveCls]);
     endDrive(0);
   }
 }
@@ -668,6 +676,20 @@ void handleCommand(String message) {
       startDrive(cm, pct, got == 3 ? mode : -1);
     } else {
       Serial.printf("Bad drive command: %s\n", message.c_str());
+    }
+    return;
+  }
+
+  // Wheel trust: W<trust> <cm> <percent>: trust 0 = always the lower count, 1 = right, 2 = left; the wheels disagree when they
+  // are more than <cm> apart and more than <percent> of the larger count.
+  if (message.charAt(0) == 'W') {
+    int trust = -1, cm = -1, pct = -1;
+    if (sscanf(message.c_str(), "W%d %d %d", &trust, &cm, &pct) == 3 && trust >= WHEEL_LOWER && trust <= WHEEL_LEFT &&
+        cm >= 1 && cm <= 100 && pct >= 0 && pct <= 100) {
+      wheelRule = {trust, (float)cm, (float)pct};
+      Serial.printf("Wheel rule: trust %d (0 lower, 1 right, 2 left), disagree beyond %d cm and %d%%\n", trust, cm, pct);
+    } else {
+      Serial.println("Invalid wheel command. Use: W1 4 15");
     }
     return;
   }
