@@ -82,7 +82,7 @@ class PathDriveTest(unittest.TestCase):
         self.settings = PathSettings()
         self.finished = []
         self.runner = dashboard.PathRunner(self.tracker, self.car.send, lambda: self.car.sense(), self.car,
-                                           lambda: self.settings, self.finished.append)
+                                           lambda: self.settings, self.finished.append, lambda: self.car.pose)
         self.runner.log_file = Path(self.tmp.name) / "path_runner_log.txt"
 
     def run_path(self, points, seconds=120.0, path=True, label="Run path"):
@@ -202,6 +202,110 @@ class PathDriveTest(unittest.TestCase):
         self.assertIn("THE WHEELS DISAGREE", self.log())
 
 
+class StopDistanceTest(unittest.TestCase):
+    """How close to an obstacle a path stops depends on how the arm stands; near one the car creeps up instead of reacting."""
+    setUp, run_path, log = PathDriveTest.setUp, PathDriveTest.run_path, PathDriveTest.log
+
+    def gap(self):
+        return self.car.wall_y - self.tracker.y
+
+    def test_each_arm_pose_has_its_own_stop_distance(self):
+        for pose, stop in (("closed", 5.0), ("default", 10.0), ("other", 20.0)):
+            self.setUp()
+            self.car.pose, self.car.wall_y = pose, 50.0
+            self.run_path([(0.0, 80.0)])
+            self.assertEqual(self.finished, [False], pose)
+            self.assertIn("obstacle ahead", self.runner.status)
+            self.assertTrue(stop - 0.5 <= self.gap() <= stop + 2.5, (pose, self.gap()))
+            self.assertEqual(len(self.tracker.obstacles), 1)
+
+    def test_the_distances_can_be_changed(self):
+        self.settings = PathSettings().changed(stop_closed_cm=12)
+        self.car.pose, self.car.wall_y = "closed", 60.0
+        self.run_path([(0.0, 80.0)])
+        self.assertTrue(11.5 <= self.gap() <= 14.5, self.gap())
+
+    def test_towards_an_obstacle_it_only_drives_slowly_and_never_further_than_the_room(self):
+        self.car.pose, self.car.wall_y = "closed", 40.0
+        self.run_path([(0.0, 80.0)])
+        self.assertTrue(self.car.drives)
+        for cm, pct, _ in self.car.drives:
+            self.assertEqual(pct, 50, self.car.drives)
+            self.assertLessEqual(cm, 35.0)
+
+    def test_it_ends_at_the_stop_distance_although_the_cars_drives_run_a_little_past(self):
+        # seen on the car: asked for 16 cm up to the obstacle it drove 17.6 and stood 2 cm from it instead of 5
+        for pose, stop, wall in (("closed", 5.0, 21.0), ("default", 10.0, 70.0), ("closed", 5.0, 140.0)):
+            self.setUp()
+            self.car.pose, self.car.wall_y, self.car.over = pose, wall, 1.5
+            self.run_path([(0.0, 150.0)])
+            self.assertTrue(stop - 0.5 <= self.gap() <= stop + 2.0, (pose, wall, self.gap(), self.car.drives))
+
+    def test_a_far_obstacle_changes_nothing_and_the_point_is_reached(self):
+        self.car.wall_y = 200.0
+        self.run_path([(0.0, 80.0)])
+        self.assertEqual(self.car.drives, [(60.0, 100, 1), (20.0, 50, 1)])
+        self.assertEqual(self.finished, [True])
+
+    def test_an_obstacle_just_behind_the_point_means_a_slow_drive_to_the_point(self):
+        self.car.pose, self.car.wall_y = "closed", 48.0
+        self.run_path([(0.0, 40.0)])
+        self.assertEqual(self.car.drives, [(40.0, 50, 1)])
+        self.assertEqual(self.finished, [True])
+
+    def start_and_wait_for_a_drive(self, point, pose="closed"):
+        self.car.pose = pose
+        self.runner.start(dashboard.plan_steps([point]), "Run path", self.car.now, path=True)
+        for _ in range(100):
+            self.car.now = round(self.car.now + 0.05, 2)
+            self.runner.tick(self.car.now, 0.0)
+            if self.runner.state == "driving":
+                return
+        self.fail("it never drove")
+
+    def one_tick(self):
+        self.car.now = round(self.car.now + 0.05, 2)
+        self.runner.tick(self.car.now, 0.0)
+
+    def test_something_appearing_during_a_fast_drive_slows_the_car_down_first(self):
+        self.start_and_wait_for_a_drive((0.0, 80.0))
+        self.assertEqual(self.car.drives[-1][1], 100)
+        self.car.distance = 20.0                                      # closer than 5 + the braking room
+        self.one_tick()
+        self.assertEqual(self.car.cancelled, 1)
+        self.assertIn("S", self.car.sent)
+        self.assertTrue(self.runner.active)                           # not given up: it creeps up to it
+        for _ in range(30):
+            self.one_tick()
+        self.assertEqual(self.car.drives[-1][1], 50)
+        self.assertAlmostEqual(self.car.drives[-1][0], 13.5, delta=0.5)      # 15 cm of room, less what a drive runs past
+
+    def test_something_appearing_during_a_slow_drive(self):
+        self.start_and_wait_for_a_drive((0.0, 20.0))
+        self.car.distance = 9.0                                       # new, and near the stop distance: look again
+        self.one_tick()
+        self.assertTrue(self.runner.active)
+        self.assertEqual(self.car.cancelled, 1)
+        self.setUp()
+        self.start_and_wait_for_a_drive((0.0, 20.0))
+        self.car.distance = 3.0                                       # already closer than allowed: stop at once
+        self.one_tick()
+        self.assertFalse(self.runner.active)
+        self.assertIn("obstacle ahead", self.runner.status)
+
+    def test_the_log_says_which_pose_and_distance_count(self):
+        self.car.pose, self.car.wall_y = "closed", 30.0
+        self.run_path([(0.0, 80.0)])
+        self.assertIn("arm closed: stop 5 cm from an obstacle", self.log())
+
+
+class ArmPoseTest(unittest.TestCase):
+    def test_the_pose_is_told_from_the_servo_sliders(self):
+        for angles, pose in (([100, 135, 40, 90], "closed"), ([99, 137, 42, 90], "closed"), ([90, 120, 90, 90], "default"),
+                             ([100, 120, 90, 90], "other"), ([100, 135, 60, 90], "other")):
+            self.assertEqual(dashboard.arm_pose(angles), pose, angles)
+
+
 class DashboardPathTest(unittest.TestCase):
     def test_the_runner_may_drive_while_it_is_active(self):
         sent = []
@@ -286,7 +390,8 @@ class PathSettingsWindowTest(unittest.TestCase):
 
     def test_the_boxes_show_the_settings(self):
         shown = {name: var.get() for name, var in self.window.setting_vars.items()}
-        self.assertEqual(shown, {"fast_pct": "100", "slow_within_cm": "20", "slow_pct": "50", "arrive_cm": "3",
+        self.assertEqual(shown, {"stop_closed_cm": "5", "stop_default_cm": "10", "stop_other_cm": "20",
+                                 "fast_pct": "100", "slow_within_cm": "20", "slow_pct": "50", "arrive_cm": "3",
                                  "turn_within_deg": "2", "turn_extra_deg": "1", "differ_cm": "4", "differ_pct": "15",
                                  "trust": "right", "assist": "gyro"})
 

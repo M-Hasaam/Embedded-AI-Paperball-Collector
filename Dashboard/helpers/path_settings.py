@@ -14,7 +14,8 @@ TRUSTS = ("lower", "right", "left")  # in the order of the car's numbers 0, 1, 2
 ASSISTS = ("off", "gyro", "encoders", "both")        # in the order of the car's numbers 0..3
 JUMP_CM = 3000.0                     # the counters changed by more than this between two readings: reset or restarted
 
-RANGES = {"slow_within_cm": (0.0, 200.0), "arrive_cm": (1.0, 15.0), "turn_within_deg": (1.0, 10.0),
+RANGES = {"stop_closed_cm": (3.0, 100.0), "stop_default_cm": (3.0, 100.0), "stop_other_cm": (3.0, 100.0),
+          "slow_within_cm": (0.0, 200.0), "arrive_cm": (1.0, 15.0), "turn_within_deg": (1.0, 10.0),
           "turn_extra_deg": (0.0, 3.0), "differ_cm": (1.0, 100.0), "differ_pct": (0.0, 100.0)}
 CHOICES = {"fast_pct": SPEEDS, "slow_pct": SPEEDS, "trust": TRUSTS, "assist": ASSISTS}
 
@@ -31,6 +32,14 @@ class PathSettings:
     differ_cm: float = 4.0           # "a lot": more than this many cm apart ...
     differ_pct: float = 15.0         # ... and more than this share of the larger count
     assist: str = "gyro"             # straight-drive assist; the encoder assist would follow a faulty counter
+    stop_closed_cm: float = 5.0      # stop this far from an obstacle with the arm in the "All closed" pose ...
+    stop_default_cm: float = 10.0    # ... in the "All default" pose ...
+    stop_other_cm: float = 20.0      # ... and in any other (the arm may stick out further)
+
+    def stop_cm(self, pose):
+        """The stop distance for an arm pose: "closed", "default" or "other"."""
+        return {"closed": self.stop_closed_cm, "default": self.stop_default_cm}.get(pose, self.stop_other_cm)
+
     def changed(self, **values):
         """A copy with these values, each kept within what works; one that is not understood keeps the old value."""
         good = {}

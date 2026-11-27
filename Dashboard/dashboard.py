@@ -112,7 +112,20 @@ ENCODER_LIVE_S = 1.0              # encoder data older than this is treated as m
 ENCODER_MAX_JUMP_CM = 1000.0      # sanity limit only: a car reboot disconnects BLE, which already resets the baseline.
                                   # (60 cm used to drop real driving when BLE notifications were delayed for ~1 s)
                                   # (if the wheels only hum, the dashboard raises these by itself - stall detection)
+ARM_POSE_TOL_DEG = 3              # the servo sliders this close to a pose's angles count as that pose
+APPROACH_SLOW_CM = 25.0           # an obstacle nearer than the stop distance, this and the drive: drive slowly, and not further
+FAST_BRAKE_CM = 18.0              # during a fast drive, brake when something is nearer than the stop distance and this
+SLOW_BRAKE_CM = 6.0               # during a slow drive, look again when something new is nearer than the stop distance and this
+MIN_ROOM_CM = 2.0                 # less room than this in front of the stop distance: the car is at the obstacle
+CAR_LENGTH_CM, CAR_WIDTH_CM = 34.0, 16.0     # the car with the arm all closed, as drawn on the path map
+ARM_BEYOND_SENSOR_CM = 3.0                   # the closed arm's tip is this far in front of the distance sensor
+SENSOR_AHEAD_CM = CAR_LENGTH_CM / 2 - ARM_BEYOND_SENSOR_CM      # the sensor, ahead of the point the car turns about
+DRIVE_OVER_CM = 1.5               # a drive of the car's own ends about this much past what it was asked
 MIN_FAST_CM = 10.0                # a fast part shorter than this is not worth it: it overshoots (3 cm at 100% went 8)
+WALL_WIDE_CM, WALL_THICK_CM = 14.0, 3.0      # how an obstacle is drawn on the map, across the way and along it
+SAME_OBSTACLE_CM = 10.0           # two sightings this close together are one obstacle
+OBSTACLE_SETTLE_S = 1.0           # after stopping for one, its place is taken again once the car has come to rest
+OBSTACLE_SEEN_CM = 60.0           # ... if the sensor still sees something this close
 BACK_SPEED_RATIO = 1.0            # reverse speed / forward speed (measure it: a 10% gap = ~5% error on the way home)
 TEST_DRIVE_S = 3.0                # length of the calibration drive
 SERVO_SEND_INTERVAL = 0.06        # seconds between live commands while dragging
@@ -360,6 +373,7 @@ class PathTracker:
         self.total_cm = 0.0
         self.points = [(0.0, 0.0, "out")]
         self.corners = [(0.0, 0.0)]
+        self.obstacles = []            # [x, y, heading it was seen at] of what stopped a path: the near side of each
         self.phase = "out"             # "out" while exploring, "back" while returning
         self.cmd = "S"
         self._moving, self._val = False, 0.0
@@ -376,6 +390,18 @@ class PathTracker:
         self._last_wrapped = wrapped
         self.gz = gz
         self.yaw_time = time.monotonic() if now is None else now
+
+    def add_obstacle(self, distance_cm):
+        """The front sensor sees something `distance_cm` away: note where that is on the map. Returns the entry."""
+        h = math.radians(self.heading)
+        away = SENSOR_AHEAD_CM + distance_cm
+        wall = [self.x - math.sin(h) * away, self.y + math.cos(h) * away, self.heading]
+        for old in self.obstacles:
+            if math.hypot(old[0] - wall[0], old[1] - wall[1]) <= SAME_OBSTACLE_CM:
+                old[:] = wall                      # seen again: the newest sighting counts
+                return old
+        self.obstacles.append(wall)
+        return wall
 
     def set_command(self, cmd):
         """Call whenever a drive command (U D L R S) is sent to the car."""
@@ -486,6 +512,14 @@ def remaining_along_heading(x, y, heading_deg, tx, ty):
     return (tx - x) * -math.sin(h) + (ty - y) * math.cos(h)
 
 
+def arm_pose(angles):
+    """Which pose the arm stands in, from the four servo sliders: "closed", "default" or "other"."""
+    for pose, wanted in (("closed", SERVO_CLOSED_ANGLES), ("default", SERVO_DEFAULT_ANGLES)):
+        if all(abs(a - b) <= ARM_POSE_TOL_DEG for a, b in zip(angles, wanted)):
+            return pose
+    return "other"
+
+
 def servo_commands(index, angle, speed, last_angle=None):
     """The commands that move one servo: V<i> <angle> <speed>. For the first command since the car started (its servos are
     idle) pass the angle the arm was left at: the car is told with H<i> first and then glides from there instead of snapping."""
@@ -504,6 +538,8 @@ class PathRunner:
     The car stops each drive by itself on its wheel encoders (the M command), so no Bluetooth delay makes it run past: fast
     while far from the point, slow for the last part (see helpers/path_settings.py). tick(now, gz) must be called every ~30 ms.
     car: drive(cm, pct, assist), cancel(), drive_busy(), drive_ok(), drive_why(), wheels(). send(cmd) sends other commands.
+    Near an obstacle it does not rely on reacting (the car rolls on after a stop sent over Bluetooth): it drives slowly and
+    only as far as the room in front of the stop distance, which depends on the arm's pose (get_pose).
     """
     TURN_TOL_DEG = 2.0          # for a single turn (the buttons, Collect, Moves); a path takes its tolerance from the settings
     SETTLE_S = 0.45             # wait for the car to stop before judging a turn
@@ -514,9 +550,12 @@ class PathRunner:
     TURN_MOVING_DPS = 10.0      # the car counts as turning faster than this ...
     TURN_QUIET_S = 0.35         # ... and as done once it has been slower than that for this long
     SAMPLE_S = 0.5              # while a drive runs, the log gets a line this often
+    BRAKE_SETTLE_S = 0.9        # after braking for an obstacle: the car needs longer to come to rest
 
-    def __init__(self, tracker, send, get_dist, car=None, get_settings=PathSettings, on_finish=None):
+    def __init__(self, tracker, send, get_dist, car=None, get_settings=PathSettings, on_finish=None, get_pose=lambda: "other"):
         self.tracker, self.send, self.get_dist = tracker, send, get_dist
+        self.get_pose = get_pose
+        self.drive_fast, self.drive_clear = False, None      # the running drive: fast? and the room expected at its end
         self.car, self.get_settings = car, get_settings
         self.on_finish = on_finish
         self.active = False
@@ -531,6 +570,7 @@ class PathRunner:
         self.target = None               # the point the car is driving to
         self.drives, self.reversed = 0, False
         self.drive_cm, self.drive_from = 0.0, None
+        self.wall = None                 # (time to look again, the obstacle that stopped the car)
         self.log_file = data_file("path_runner_log.txt")   # everything a path did, to see where it goes wrong
 
     def _log(self, now, text):
@@ -564,12 +604,14 @@ class PathRunner:
         self.idx, self.label, self.state, self.path = 0, label, "next", path
         self.legs_done, self.legs_total = 0, sum(1 for s in steps if s[0] == "goto")
         self.last_turn_error, self.target, self.started = None, None, now
+        self.wall = None
         self.active = True
         self.status = f"{label}: starting"
         self._log(now, f"START {label}: " + ", ".join(
             "goto(%.0f,%.0f)" % (s[1], s[2]) if s[0] == "goto" else "%s(%.0f)" % (s[0], s[1]) for s in steps))
         if path:
             self._log(now, f"SETTINGS {self.get_settings().describe()}")
+            self._log(now, f"arm {self.get_pose()}: stop {self._stop_cm():g} cm from an obstacle")
         return True
 
     def abort(self, reason):
@@ -595,6 +637,24 @@ class PathRunner:
         if self.on_finish:
             self.on_finish(True)
 
+    # -- obstacles --
+    def _stop_cm(self):
+        return self.get_settings().stop_cm(self.get_pose())
+
+    def _stop_for_obstacle(self, now, distance):
+        wall = self.tracker.add_obstacle(distance)
+        self.wall = (now + OBSTACLE_SETTLE_S, wall)
+        self._log(now, f"OBSTACLE {distance:.0f} cm ahead (arm {self.get_pose()}, stop distance {self._stop_cm():g} cm), "
+                       f"drawn at ({wall[0]:.1f},{wall[1]:.1f})")
+        self.abort("obstacle ahead")
+
+    def _brake(self, now, distance, why):
+        """Stop the running drive and look again: the next drive is planned with the obstacle in mind."""
+        self.send("S")
+        self.car.cancel()
+        self._log(now, f"BRAKE: {why}, {distance:.0f} cm ahead")
+        self.state, self.settle_until = "drive_settle", now + self.BRAKE_SETTLE_S
+
     # -- driving to a point --
     def _remaining(self, now):
         tr = self.tracker
@@ -604,6 +664,12 @@ class PathRunner:
         """The next straight drive towards the point, or the end of this leg."""
         s = self.get_settings()
         left = self._remaining(now)
+        ahead = self.get_dist()
+        room = None if ahead is None else ahead - self._stop_cm()       # how far the car may still go
+        if left > s.arrive_cm and room is not None and room < MIN_ROOM_CM:
+            if self.drives:
+                self._log(now, f"no room left to the point ({left:.1f} cm to go)")
+            return self._stop_for_obstacle(now, ahead)
         if abs(left) <= s.arrive_cm or (left < 0 and self.reversed) or self.drives >= self.MAX_DRIVES:
             return self._end_leg(now, left)
         if left < 0:
@@ -613,6 +679,12 @@ class PathRunner:
             kind, cm, pct = "fast", left - s.slow_within_cm, s.fast_pct
         else:
             kind, cm, pct = "slow", left, s.slow_pct
+        if cm > 0 and room is not None and room < cm + APPROACH_SLOW_CM:
+            # something stands within reach of this drive: creep, and never further than the room there is
+            kind, pct = ("up to the obstacle" if room < left else "slow"), s.slow_pct
+            cm = min(left, max(room - DRIVE_OVER_CM, 0.5))
+        self.drive_fast = kind == "fast"
+        self.drive_clear = None if ahead is None or cm < 0 else ahead - cm
         if self.drives == 0:
             self.tracker.set_command("U")              # the map: one straight stretch, its end becomes a corner
         self.drive_cm, self.drive_from = cm, self.car.wheels()
@@ -656,6 +728,19 @@ class PathRunner:
         self.idx += 1
         self.state = "next"
 
+    def settle_obstacle(self, now):
+        """Once the car that stopped for an obstacle has come to rest, take the obstacle's place again: distance and position
+        then belong to the same moment. Call this also while nothing is running."""
+        if self.wall is None or now < self.wall[0]:
+            return
+        (_, wall), self.wall = self.wall, None
+        d = self.get_dist()
+        if d is None or d > OBSTACLE_SEEN_CM or wall not in self.tracker.obstacles:
+            return
+        self.tracker.obstacles.remove(wall)
+        wall = self.tracker.add_obstacle(d)
+        self._log(now, f"OBSTACLE after stopping: {d:.0f} cm ahead, drawn at ({wall[0]:.1f},{wall[1]:.1f})")
+
     def tick(self, now, gz):
         if not self.active:
             return
@@ -693,10 +778,16 @@ class PathRunner:
                 self._begin_turn(now, step[1])
         elif self.state == "driving":
             if self.drive_cm > 0:
-                d = self.get_dist()
-                if d is not None and d < DIST_STOP_CM:
-                    self._log_drive_end(now)
-                    return self.abort("obstacle ahead")
+                d, stop = self.get_dist(), self._stop_cm()
+                if d is not None:
+                    if self.drive_fast:
+                        if d < stop + FAST_BRAKE_CM:
+                            return self._brake(now, d, "something close during a fast drive")
+                    elif d < stop - 1.0:
+                        self._log_drive_end(now)
+                        return self._stop_for_obstacle(now, d)
+                    elif d < stop + SLOW_BRAKE_CM and (self.drive_clear is None or self.drive_clear > stop + 2 * SLOW_BRAKE_CM):
+                        return self._brake(now, d, "something new during a slow drive")
             if self.car.drive_busy():
                 if now >= self.sample_at:
                     self.sample_at = now + self.SAMPLE_S
@@ -828,6 +919,8 @@ class PathWindow:
 
     # -- how paths are driven (see helpers/path_settings.py) --
     SETTING_ROWS = (
+        ("Stop before an obstacle:", "stop_closed_cm", "cm arm closed,", "stop_default_cm", "cm arm default,",
+         "stop_other_cm", "cm else"),
         ("Drive at", ("fast_pct", SPEEDS), "% until", "slow_within_cm", "cm from a point, then at", ("slow_pct", SPEEDS), "%"),
         ("A point is reached within", "arrive_cm", "cm.  Turn if over", "turn_within_deg", "° off, asking",
          "turn_extra_deg", "° extra"),
@@ -1026,8 +1119,9 @@ class PathWindow:
         tr, c = self.app.tracker, self.canvas
         w, h = max(c.winfo_width(), 50), max(c.winfo_height(), 50)
         pts = tr.points
-        xs = [p[0] for p in pts] + [x for x, _ in self.waypoints] + [tr.x]
-        ys = [p[1] for p in pts] + [y for _, y in self.waypoints] + [tr.y]
+        reach = CAR_LENGTH_CM / 2                 # the whole car stays in view, not just its middle
+        xs = [p[0] for p in pts] + [x for x, _ in self.waypoints] + [tr.x - reach, tr.x + reach] + [w_[0] for w_ in tr.obstacles]
+        ys = [p[1] for p in pts] + [y for _, y in self.waypoints] + [tr.y - reach, tr.y + reach] + [w_[1] for w_ in tr.obstacles]
         cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
         half = max((max(max(xs) - min(xs), max(ys) - min(ys))) / 2 * 1.2, 60.0)
         if self.view is not None:                        # zoomed or dragged: it stays where it was put
@@ -1074,22 +1168,44 @@ class PathWindow:
             run += list(px(x, y))
         if len(run) >= 4:
             c.create_line(*run, fill=colour, width=3, capstyle="round", joinstyle="round")
+        # obstacles that stopped a path: a red wall across the way, its near side where the sensor saw it
+        for wx, wy, heading in tr.obstacles:
+            h_ = math.radians(heading)
+            along = (-math.sin(h_), math.cos(h_))
+            across = (math.cos(h_), math.sin(h_))
+            corners = [px(wx + across[0] * side * WALL_WIDE_CM / 2 + along[0] * deep,
+                          wy + across[1] * side * WALL_WIDE_CM / 2 + along[1] * deep)
+                       for side, deep in ((-1, 0.0), (1, 0.0), (1, WALL_THICK_CM), (-1, WALL_THICK_CM))]
+            c.create_polygon(*[v for corner in corners for v in corner], fill=BAD, outline="#ffb4ae", width=1, tags=("obstacle",))
+            tx, ty = px(wx + along[0] * (WALL_THICK_CM + 4), wy + along[1] * (WALL_THICK_CM + 4))
+            c.create_text(tx, ty, text="obstacle", fill=BAD, font=(FONT, 8, "bold"), tags=("obstacle",))
         # start marker
         sx, sy = px(0, 0)
         c.create_oval(sx - 6, sy - 6, sx + 6, sy + 6, outline=TEXT, width=2)
         c.create_text(sx + 10, sy + 10, text="start", anchor="nw", fill=TEXT, font=(FONT, 8))
-        # the car (triangle pointing the way it faces; heading + = left / counter-clockwise)
+        # the car, to scale: its outline about the point it turns around, a nose at the front, the sensor as a dot
+        # (heading + = left / counter-clockwise)
         hr = math.radians(tr.heading)
-        fx, fy = -math.sin(hr), -math.cos(hr)      # forward, in pixels
-        rx, ry = math.cos(hr), -math.sin(hr)       # right, in pixels
+        ahead, side = (-math.sin(hr), math.cos(hr)), (math.cos(hr), math.sin(hr))       # forward and right, in map cm
+
+        def on_car(forward, right):
+            return px(tr.x + ahead[0] * forward + side[0] * right, tr.y + ahead[1] * forward + side[1] * right)
+
+        half_long, half_wide = CAR_LENGTH_CM / 2, CAR_WIDTH_CM / 2
+        colour = WARN if self.app.runner.active else "#f0f6fc"
+        body = [on_car(f, r) for f, r in ((half_long, -half_wide), (half_long, half_wide), (-half_long, half_wide),
+                                          (-half_long, -half_wide))]
+        c.create_polygon(*[v for point in body for v in point], fill="", outline=colour, width=2, tags=("car",))
+        nose = [on_car(half_long, 0), on_car(half_long - 9, -half_wide * 0.6), on_car(half_long - 9, half_wide * 0.6)]
+        c.create_polygon(*[v for point in nose for v in point], fill=colour, outline="", tags=("car_nose",))
+        c.create_line(*on_car(SENSOR_AHEAD_CM, -half_wide), *on_car(SENSOR_AHEAD_CM, half_wide), fill=BAD, width=2,
+                      tags=("car_sensor",))                                              # the distance sensor
         X, Y = px(tr.x, tr.y)
-        tip = (X + fx * 14, Y + fy * 14)
-        bl = (X - fx * 8 - rx * 8, Y - fy * 8 - ry * 8)
-        br = (X - fx * 8 + rx * 8, Y - fy * 8 + ry * 8)
-        c.create_polygon(*tip, *bl, *br, fill=WARN if self.app.runner.active else "#f0f6fc", outline="")
+        c.create_oval(X - 3, Y - 3, X + 3, Y + 3, fill=colour, outline="")               # the point the map follows
 
         self.pos_var.set(f"Position  x {tr.x:+.0f} cm   y {tr.y:+.0f} cm      Heading {wrap180(tr.heading):+.0f}°\n"
-                         f"Driven {tr.total_cm:.0f} cm in total      Corners recorded: {len(straighten(tr.corners)) - 1}")
+                         f"Driven {tr.total_cm:.0f} cm in total      Corners recorded: {len(straighten(tr.corners)) - 1}"
+                         + (f"      Obstacles seen: {len(tr.obstacles)}" if tr.obstacles else ""))
         self.status_var.set(self.app.runner.status)
 
 
@@ -2530,7 +2646,8 @@ class Dashboard:
         self.path_settings = load_settings(self.path_settings_file)
         self.odometer = Odometer()     # the distance along the way from the two wheel counters
         self.runner = PathRunner(self.tracker, self._runner_send, lambda: self.dist_cm, RunnerCar(self),
-                                 lambda: self.path_settings, self._runner_finished)
+                                 lambda: self.path_settings, self._runner_finished,
+                                 self.pose)
         self.runner_ok = True          # how the last drive/turn run ended (the Moves player reads this)
         # the car's own encoder drive (command M<cm> <speed>): it reports a state number with every encoder reading
         self.encoder_seq = 0           # encoder readings received so far
@@ -3545,6 +3662,10 @@ class Dashboard:
         if client and client.is_connected and char:
             await client.write_gatt_char(char, message.encode("ascii"), response=self.write_response)
 
+    def pose(self):
+        """The arm's pose by the servo sliders: "closed", "default" or "other"."""
+        return arm_pose([int(scale.get()) for scale in self.servo_scales])
+
     def _send(self, message):
         if not self.connected.is_set() or not self.loop or not self.loop.is_running():
             return
@@ -3622,6 +3743,7 @@ class Dashboard:
         self.run_status_var.set("" if self.runner.status == "Idle" else self.runner.status)
         if self.runner.active:
             self.runner.tick(now, self.gz)
+        self.runner.settle_obstacle(now)
         if self.path_window is not None:
             self.path_window.refresh()
 

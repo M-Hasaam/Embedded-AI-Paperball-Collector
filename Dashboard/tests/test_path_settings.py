@@ -14,6 +14,9 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual((s.slow_within_cm, s.fast_pct, s.slow_pct, s.trust, s.differ_cm, s.differ_pct, s.assist),
                          (20.0, 100, 50, "right", 4.0, 15.0, "gyro"))
         self.assertEqual((s.arrive_cm, s.turn_within_deg, s.turn_extra_deg), (3.0, 2.0, 1.0))
+        self.assertEqual((s.stop_closed_cm, s.stop_default_cm, s.stop_other_cm), (5.0, 10.0, 20.0))
+        self.assertEqual([s.stop_cm(p) for p in ("closed", "default", "other")], [5.0, 10.0, 20.0])
+        self.assertEqual(s.changed(stop_closed_cm=0).stop_closed_cm, 3.0)       # the sensor cannot see closer
 
     def test_the_commands_for_the_car(self):
         self.assertEqual(PathSettings().wheel_command(), "W1 4 15")
