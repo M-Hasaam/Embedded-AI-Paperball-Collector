@@ -979,6 +979,60 @@ def _nice_step(span, target=8):
 
 
 DRIVE_START_S = 4.0     # a drive command the car has not begun after this long is given up
+BADGE_MIN_PX = 60       # a connection message in the top bar is never shortened below this width
+
+
+def elide(text, measure, max_px):
+    """`text`, or as much of its start as fits into `max_px` with dots after it. measure(text) gives a width in pixels."""
+    if measure(text) <= max_px:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if measure(text[:middle].rstrip() + "\u2026") <= max_px:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip() + "\u2026"
+
+
+def share_width(total, first, second, minimum=BADGE_MIN_PX):
+    """Widths for two texts needing `first` and `second` pixels in a space of `total`: a short one gets all it needs and leaves
+    the rest to the long one; two long ones get half each."""
+    if first + second <= total:
+        return first, second
+    half = total // 2
+    if first <= half:
+        return first, max(minimum, total - first)
+    if second <= half:
+        return max(minimum, total - second), second
+    return max(minimum, half), max(minimum, half)
+
+
+class HoverText:
+    """The whole of a shortened message, shown under its badge while the mouse is on it."""
+
+    def __init__(self, badge, widgets):
+        self.badge, self.tip = badge, None
+        for widget in widgets:
+            widget.bind("<Enter>", self.show, add="+")
+            widget.bind("<Leave>", self.hide, add="+")
+
+    def show(self, _event=None):
+        if self.tip is not None or self.badge.shown.get() == self.badge.full.get():
+            return
+        tip = self.tip = tk.Toplevel(self.badge)
+        tip.wm_overrideredirect(True)
+        tk.Label(tip, textvariable=self.badge.full, bg=CARD_HI, fg=TEXT, font=(FONT, 10), wraplength=420, justify="left",
+                 padx=10, pady=6).pack()
+        tip.update_idletasks()
+        x = self.badge.winfo_rootx() + self.badge.winfo_width() - tip.winfo_reqwidth()
+        tip.wm_geometry(f"+{max(0, x)}+{self.badge.winfo_rooty() + self.badge.winfo_height() + 4}")
+
+    def hide(self, _event=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
 
 
 def gripper_text(app):
@@ -2134,9 +2188,13 @@ class Dashboard:
         dot = tk.Canvas(f, width=12, height=12, bg=CARD, highlightthickness=0)
         dot.pack(side="left", padx=(10, 4), pady=8)
         oval = dot.create_oval(2, 2, 10, 10, fill=MUTED, outline="")
-        tk.Label(f, text=label, bg=CARD, fg=MUTED, font=(FONT, 9, "bold")).pack(side="left")
-        tk.Label(f, textvariable=var, bg=CARD, fg=TEXT, font=(FONT, 10)).pack(side="left", padx=(6, 12))
-        f.dot, f.oval = dot, oval
+        title = tk.Label(f, text=label, bg=CARD, fg=MUTED, font=(FONT, 9, "bold"))
+        title.pack(side="left")
+        shown = tk.StringVar(master=f, value=var.get())             # the message as it fits (see _fit_badges)
+        text = tk.Label(f, textvariable=shown, bg=CARD, fg=TEXT, font=(FONT, 10))
+        text.pack(side="left", padx=(6, 12))
+        f.dot, f.oval, f.title, f.text, f.full, f.shown = dot, oval, title, text, var, shown
+        f.hover = HoverText(f, (f, dot, title, text))
         return f
 
     def _build_ui(self):
@@ -2148,6 +2206,18 @@ class Dashboard:
         # header
         header = tk.Frame(root, bg=BG)
         header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(8, 4))
+        self._build_header(header)
+
+        # camera column
+        left = tk.Frame(root, bg=BG)
+        left.grid(row=1, column=0, sticky="nsew", padx=(16, 8))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self._build_camera_card(left)
+        self._build_right_column(root)
+
+    def _build_header(self, header):
+        """The top bar: the title, the window buttons and the two connection messages."""
         tk.Label(header, text="LitterVision", bg=BG, fg=TEXT, font=(FONT, 20, "bold")).pack(side="left")
         tk.Label(header, text="  car dashboard", bg=BG, fg=MUTED, font=(FONT, 12)).pack(side="left", pady=(7, 0))
         self.car_badge = self._badge(header, "CAR (BLE)", self.car_text)
@@ -2158,14 +2228,29 @@ class Dashboard:
         self._button(header, "Pulse chart", self.open_pulse_window).pack(side="right", padx=(0, 8))
         self._button(header, "Moves", self.open_moves_window).pack(side="right", padx=(0, 8))
         self._button(header, "Collect", self.open_collect_window).pack(side="right", padx=(0, 8))
+        self.header, self._badge_fit = header, None
+        self._badge_font = tkfont.Font(font=self.cam_badge.text.cget("font"))
+        header.bind("<Configure>", lambda e: self._fit_badges())
+        for badge in (self.cam_badge, self.car_badge):
+            badge.full.trace_add("write", lambda *_: self._fit_badges())
 
-        # camera column
-        left = tk.Frame(root, bg=BG)
-        left.grid(row=1, column=0, sticky="nsew", padx=(16, 8))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
-        self._build_camera_card(left)
+    def _fit_badges(self):
+        """Shorten the connection messages to the room the title and the buttons leave: a long one must never push them out."""
+        width = self.header.winfo_width()
+        badges = (self.cam_badge, self.car_badge)
+        texts = tuple(badge.full.get() for badge in badges)
+        if width <= 1 or self._badge_fit == (width, texts):         # not on screen yet, or nothing changed
+            return
+        self._badge_fit = (width, texts)
+        others = [w for w in self.header.winfo_children() if w not in badges]
+        gaps = 8 * (len(others) + 1) + 8                             # the space between the things in the bar, and a little air
+        chrome = sum(b.dot.winfo_reqwidth() + 14 + b.title.winfo_reqwidth() + 18 + 2 + 6 for b in badges)
+        room = width - sum(w.winfo_reqwidth() for w in others) - gaps - chrome
+        widths = share_width(room, *(self._badge_font.measure(text) for text in texts))
+        for badge, text, max_px in zip(badges, texts, widths):
+            badge.shown.set(elide(text, self._badge_font.measure, max_px))
 
+    def _build_right_column(self, root):
         # right column
         right = tk.Frame(root, bg=BG)
         right.grid(row=1, column=1, sticky="nsew", padx=(8, 16))
