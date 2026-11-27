@@ -337,6 +337,51 @@ class DashboardCarTest(unittest.TestCase):
         self.assertFalse(car.motion_ok())                             # runner_ok is False
 
 
+class MoveReadingsTest(unittest.TestCase):
+    """What the car tells the move log: its sensors, and why a drive or turn did not finish."""
+
+    def app(self, **changes):
+        values = dict(dist_cm=12.5, dist_stamp=1.0, tof_mm=38, tof_stamp=1.0, wheel_cm=(10.0, 11.0),
+                      tracker=types.SimpleNamespace(heading=-3.5), rail_watch=None,
+                      runner=types.SimpleNamespace(status="Turn +9: turn timed out"), drive_fail_reason="")
+        values.update(changes)
+        return types.SimpleNamespace(**values)
+
+    def test_readings(self):
+        readings = dashboard.DashboardCar(self.app()).readings()
+        self.assertEqual(readings.sensors, "front 12.5 cm, gripper 38 mm")
+        self.assertEqual((readings.heading, readings.left_cm, readings.right_cm), (-3.5, 10.0, 11.0))
+
+    def test_readings_without_any_sensor(self):
+        app = self.app(dist_stamp=None, tof_stamp=None, wheel_cm=None)
+        readings = dashboard.DashboardCar(app).readings()
+        self.assertEqual(readings.sensors, "front: no reading, gripper no readings")
+        self.assertIsNone(readings.left_cm)
+
+    def test_the_servo_supply_shows_the_worst_since_the_last_look(self):
+        watch = dashboard.watch_rails(None, 5.80, 5.90, 30.0, 40.0, 0, 0)
+        watch = dashboard.watch_rails(watch, 5.78, 5.50, 20.0, 420.0, 0, 2)
+        watch = dashboard.watch_rails(watch, 5.79, 5.88, 10.0, 15.0, 0, 0)
+        app = self.app(rail_watch=watch)
+        car = dashboard.DashboardCar(app)
+        self.assertIn("supply arm 5.79 V dip 30 mV, gripper 5.88 V dip 420 mV STOPPED by the guard", car.readings().sensors)
+        self.assertNotIn("supply", car.readings().sensors)                # told once: the next line starts afresh
+
+    def test_a_supply_without_a_voltage_wire(self):
+        app = self.app(rail_watch=dashboard.watch_rails(None, -1.0, 5.0, 0.0, 300.0, 0, 1))
+        self.assertIn("supply arm no sensor, gripper 5.00 V dip 300 mV slowed by the guard",
+                      dashboard.DashboardCar(app).readings().sensors)
+
+    def test_why_a_motion_failed(self):
+        app = self.app(drive_fail_reason="the car gave up", drive_encoder=lambda cm, pct, assist: True,
+                       turn_by=lambda deg: True, _runner_sending=False)
+        car = dashboard.DashboardCar(app)
+        car.start_drive(5, 50, 3)
+        self.assertEqual(car.failure(), "the car gave up")
+        car.start_turn(9)
+        self.assertEqual(car.failure(), "Turn +9: turn timed out")
+
+
 class EncoderDriveTest(unittest.TestCase):
     """Dashboard side of the car's M<cm> <speed> drive: the car counts its own encoders and reports a drive state
     (0 idle, 1 driving, 2 stopping, 3 failed) as a 7th number of every encoder reading."""
@@ -391,6 +436,16 @@ class EncoderDriveTest(unittest.TestCase):
         self.note(app, 0)
         self.assertTrue(app.drive_failed)
         self.assertFalse(dashboard.Dashboard.drive_busy(app))
+        self.assertIn("the car gave up", app.drive_fail_reason)
+
+    def test_a_car_that_never_reports_finishing_is_explained(self):
+        app = self.app()
+        dashboard.Dashboard.drive_encoder(app, 30, 100)
+        self.note(app, 1)
+        app.drive_deadline = 0.0
+        self.assertFalse(dashboard.Dashboard.drive_busy(app))
+        self.assertTrue(app.drive_failed)
+        self.assertIn("did not report the drive finished in time (last state 1, 1 readings", app.drive_fail_reason)
 
     def test_abort_ends_the_wait(self):
         app = self.app()

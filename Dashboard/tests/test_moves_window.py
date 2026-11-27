@@ -41,7 +41,10 @@ class MovesWindowTest(unittest.TestCase):
     def setUp(self):
         self.app = make_app()
         self.car = FakeCar()
-        self.window = dashboard.MovesWindow(self.app, self.car)
+        logs = tempfile.TemporaryDirectory()                       # test runs must not write into the real log
+        self.addCleanup(logs.cleanup)
+        self.log_path = Path(logs.name) / "moves_log.txt"
+        self.window = dashboard.MovesWindow(self.app, self.car, log_path=self.log_path)
         self.addCleanup(self.window.close)
 
     def set_pose(self, angles, speed=30):
@@ -169,6 +172,34 @@ class MovesWindowTest(unittest.TestCase):
         first = self.car.kinds().count("servo")
         self.assertFalse(self.window.play())
         self.assertEqual(self.car.kinds().count("servo"), first)
+
+    def log(self):
+        return self.log_path.read_text(encoding="utf-8")
+
+    def test_every_test_play_is_written_to_a_log_file(self):
+        self.window.add_drive(5, 50)
+        self.window.play()
+        self.assertIn("step 1/1: Drive: forward 5 cm at 50%", self.log())
+        self.car.motion_result, self.car.why = False, "the car gave up"
+        self.car.finish_motion()
+        self.window.tick()
+        self.assertIn("the drive did not finish normally: the car gave up", self.log())
+        self.assertEqual(self.log().count("step 1/1"), 1)
+        self.assertRegex(self.log().splitlines()[0], r"^\d\d:\d\d:\d\d move ")
+
+    def test_stop_and_close_are_logged(self):
+        self.window.move["steps"].append(wait_step(5))
+        self.window.play()
+        self.window.stop()
+        self.assertIn("stopped by you", self.log())
+        self.window.play()
+        self.window.close()
+        self.assertIn("window closed", self.log())
+
+    def test_a_log_file_that_cannot_be_written_does_not_stop_the_move(self):
+        self.window.log_path = self.log_path / "no" / "such.txt"
+        self.window.move["steps"].append(wait_step(5))
+        self.assertTrue(self.window.play())
 
     def test_play_refused_when_move_is_empty(self):
         self.assertFalse(self.window.play())

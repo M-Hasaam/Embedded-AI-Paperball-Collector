@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from helpers.moves import LogTail, Readings  # noqa: E402
 from helpers.moves import (ARM_MARGIN_S, MoveFileError, MovePlayer, arm_duration, arm_step, describe_step,  # noqa: E402
                    drive_step, load_move, new_move, save_move, sync_speeds, turn_step, validate_move, wait_step)
 
@@ -169,6 +170,13 @@ class FakeCar:
         self.motion_result = True
         self.start_result = True
         self.busy = False
+        self.sensors, self.heading, self.wheels, self.why = "front 20.0 cm, gripper 90 mm", 0.0, (0.0, 0.0), ""
+
+    def readings(self):
+        return Readings(self.sensors, self.heading, *self.wheels)
+
+    def failure(self):
+        return self.why
 
     def servo(self, index, angle, speed):
         self.calls.append(("servo", index, angle, speed))
@@ -215,6 +223,90 @@ def move_of(*steps):
     move = new_move("t")
     move["steps"] = list(steps)
     return move
+
+
+class MoveLogTest(unittest.TestCase):
+    def played(self, *steps, at=0.0):
+        car = FakeCar()
+        player = player_for(car)
+        player.start(move_of(*steps), at)
+        return car, player
+
+    @staticmethod
+    def text(player):
+        return "\n".join(player.log)
+
+    def test_it_names_the_move_and_each_step_with_what_the_sensors_say(self):
+        _, player = self.played(drive_step(20))
+        for part in ("move 't': 1 steps, smooth off, drives steered by gyro and encoders", "step 1/1: Drive: forward 20 cm at 100%",
+                     "before : front 20.0 cm, gripper 90 mm, heading +0.0, wheels L 0.0 R 0.0 cm"):
+            self.assertIn(part, self.text(player))
+
+    def test_a_running_drive_is_sampled_twice_a_second(self):
+        car, player = self.played(drive_step(20))
+        for tick in range(1, 13):                                     # 1.2 s, the right wheel never counts
+            car.wheels = (tick * 1.0, 0.0)
+            player.tick(tick / 10)
+        samples = [line for line in player.log if "moving :" in line]
+        self.assertEqual(len(samples), 2)
+        self.assertIn("moving : 0.5 s, wheels L +5.0 R +0.0 cm", samples[0])
+
+    def test_the_result_of_a_drive(self):
+        car, player = self.played(drive_step(20))
+        car.wheels, car.heading, car.sensors = (19.5, 20.2), 0.4, "front 4.2 cm, gripper 30 mm"
+        car.finish_motion()
+        player.tick(1.5)
+        self.assertIn("result : took 1.5 s; asked +20 cm; wheels L +19.5 R +20.2 cm; heading moved left 0.4 deg; "
+                      "front 4.2 cm, gripper 30 mm", self.text(player))
+        self.assertIn("done after 1.5 s", self.text(player))
+
+    def test_the_result_of_a_turn(self):
+        car, player = self.played(turn_step(90))
+        car.heading, car.wheels = 88.5, (-8.0, 8.5)
+        car.finish_motion()
+        player.tick(2.0)
+        self.assertIn("result : took 2.0 s; turned left 88.5 deg (asked left 90); wheels L -8.0 R +8.5 cm", self.text(player))
+
+    def test_a_failed_drive_says_why_and_where_things_stood(self):
+        car, player = self.played(drive_step(5, 50), wait_step(1))
+        car.motion_result, car.why = False, "the car gave up"
+        car.wheels = (3.0, 0.0)
+        car.finish_motion()
+        player.tick(1.5)
+        reason = "the drive did not finish normally: the car gave up"
+        self.assertEqual(player.status, f"Stopped: {reason}")
+        text = self.text(player)
+        for part in ("result : took 1.5 s; asked +5 cm; wheels L +3.0 R +0.0 cm", "at the stop: front 20.0 cm",
+                     f"stopped after 1.5 s: {reason}"):
+            self.assertIn(part, text)
+        self.assertEqual(text.count("result :"), 1)
+        self.assertNotIn("step 2/2", text)
+
+    def test_stopping_it_by_hand_logs_the_motion_so_far(self):
+        car, player = self.played(drive_step(20))
+        player.tick(0.2)
+        car.wheels = (4.0, 4.0)
+        player.abort("stopped by you")
+        self.assertIn("wheels L +4.0 R +4.0 cm", self.text(player))
+        self.assertIn("stopped after 0.2 s: stopped by you", self.text(player))
+
+    def test_arm_steps_are_logged_too(self):
+        _, player = self.played(arm_step({1: (150, 30)}, wait=0), wait_step(1))
+        player.tick(5.0)
+        self.assertIn("step 1/2: Arm: Elbow 150", self.text(player))
+        self.assertIn("step 2/2: Wait: 1 s", self.text(player))
+        self.assertEqual(self.text(player).count("before :"), 2)
+
+    def test_each_run_starts_a_new_log_and_a_tail_hands_out_only_new_lines(self):
+        car, player = self.played(wait_step(1))
+        tail = LogTail()
+        self.assertEqual(tail.new(player.log), player.log)
+        self.assertEqual(tail.new(player.log), [])
+        player.tick(1.1)
+        self.assertIn("done after", "\n".join(tail.new(player.log)))
+        player.start(move_of(wait_step(1)), 2.0)
+        self.assertEqual(tail.new(player.log), player.log)
+        self.assertNotIn("done after", self.text(player))
 
 
 class PlayerTest(unittest.TestCase):

@@ -12,7 +12,7 @@ import copy
 import json
 import math
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Optional, Protocol
 
 from helpers.paths import MOVES_DIR      # the recorded moves: Dashboard/moves/*.json (re-exported here for the dashboard)
 
@@ -23,6 +23,7 @@ MAX_DRIVE_CM = 300
 MAX_TURN_DEG = 360
 MAX_WAIT_S = 60
 SPEED_RANGE = (1, 600)      # deg/s, like the dashboard's servo speed slider
+SAMPLE_S = 0.5              # while a drive or turn runs, the log gets a line this often
 
 
 class MoveFileError(Exception):
@@ -189,6 +190,38 @@ def save_move(path, move):
 
 
 # ---------------------------------------------------------------- playing
+class Readings(NamedTuple):
+    sensors: str = ""                    # front and gripper sensors (and the servo supply), in words
+    heading: Optional[float] = None      # the gyro's heading in degrees, + = left
+    left_cm: Optional[float] = None      # how far each wheel's encoder has counted
+    right_cm: Optional[float] = None
+
+
+def front_text(reading):
+    """The front distance sensor in words; `reading` has .cm (None = nothing in range), or is None before the first one."""
+    if reading is None:
+        return "front: no reading"
+    return "front: nothing in range" if reading.cm is None else f"front {reading.cm:.1f} cm"
+
+
+class LogTail:
+    """Hands out the lines added to a log since the last look. A new run starts a new list, which is read from its top."""
+
+    def __init__(self):
+        self._lines, self._read = None, 0
+
+    def new(self, lines):
+        if lines is not self._lines:
+            self._lines, self._read = lines, 0
+        fresh = lines[self._read:]
+        self._read = len(lines)
+        return fresh
+
+
+def _side(degrees):
+    return "left" if degrees > 0 else "right"
+
+
 class PlayerCar(Protocol):
     """What the player needs from the car (the dashboard adapts its own commands to this)."""
 
@@ -201,6 +234,8 @@ class PlayerCar(Protocol):
     def motion_ok(self) -> bool: ...                     # the last drive or turn ended normally
     def stop(self) -> None: ...
     def connected(self) -> bool: ...
+    def readings(self) -> Readings: ...                  # what the sensors say now, for the log
+    def failure(self) -> str: ...                        # why the last drive or turn did not finish normally
 
 
 class MovePlayer:
@@ -216,6 +251,10 @@ class MovePlayer:
         self._state = "idle"         # "timed" (arm or wait step), "motion" (drive or turn) or "idle"
         self._until = 0.0
         self._current = {}           # servo index -> angle the arm should be at (from the car, then from the steps)
+        self.log = []                # what happened in this run, line by line
+        self._now = self._began = 0.0
+        self._motion = None          # (step, readings at its start, time it started) while a drive or turn runs
+        self._sample_at = 0.0
 
     def start(self, move, now):
         """False (and nothing sent) when already playing, nothing to play, or the car is not connected."""
@@ -230,33 +269,91 @@ class MovePlayer:
         self._move, self.index = copy.deepcopy(move), -1      # edits made in the window while it plays must not shift the steps
         self._current = dict(self.car.servo_angles())
         self.active, self.ok = True, None
+        self._now = self._began = now
+        self._motion = None
+        steered = [name for name, key in (("gyro", "assist_gyro"), ("encoders", "assist_encoders")) if move.get(key, True)]
+        self.log = [f"move '{move.get('name', 'untitled')}': {len(move['steps'])} steps, smooth {'on' if move.get('smooth') else 'off'}, "
+                    f"drives steered by {' and '.join(steered) or 'nothing'}"]
         self._next(now)
         return self.active
 
     def tick(self, now):
         if not self.active:
             return
+        self._now = now
         if not self.car.connected():
             self.abort("car disconnected")
         elif self._state == "timed":
             if now >= self._until:
                 self._next(now)
-        elif self._state == "motion" and not self.car.motion_active():
-            if self.car.motion_ok():
+        elif self._state == "motion":
+            if self.car.motion_active():
+                if now >= self._sample_at - 1e-9:
+                    self._sample_at += SAMPLE_S
+                    self._log_motion("moving", now)
+                return
+            ok, kind = self.car.motion_ok(), self._motion[0]["type"]
+            why = "" if ok else self.car.failure()
+            self._end_motion(now)
+            if ok:
                 self._next(now)
             else:
-                self.abort("the drive or turn did not finish normally")
+                self.abort(f"the {kind} did not finish normally" + (f": {why}" if why else ""))
 
     def abort(self, reason):
         if not self.active:
             return
         self.active, self.ok, self._state = False, False, "idle"      # inactive first: a stop hook may call abort again
         self.status = f"Stopped: {reason}"
+        self._end_motion(self._now)
+        self.log.append(f"  at the stop: {self._describe(self.car.readings())}")
+        self.log.append(f"stopped after {self._now - self._began:.1f} s: {reason}")
         self.car.stop()
 
     def _finish(self):
         self.active, self.ok, self._state = False, True, "idle"
         self.status = "Done"
+        self.log.append(f"  at the end: {self._describe(self.car.readings())}")
+        self.log.append(f"done after {self._now - self._began:.1f} s")
+
+    # -- the log --
+    @staticmethod
+    def _describe(r):
+        parts = [r.sensors] if r.sensors else []
+        if r.heading is not None:
+            parts.append(f"heading {r.heading:+.1f}")
+        if r.left_cm is not None:
+            parts.append(f"wheels L {r.left_cm:.1f} R {r.right_cm:.1f} cm")
+        return ", ".join(parts)
+
+    def _log_motion(self, label, now):
+        """How far the running (or just ended) drive or turn has got, by the wheel encoders and the gyro."""
+        step, before, started = self._motion
+        after = self.car.readings()
+        turned = None if before.heading is None or after.heading is None else after.heading - before.heading
+        wheels = None
+        if before.left_cm is not None and after.left_cm is not None:
+            wheels = f"wheels L {after.left_cm - before.left_cm:+.1f} R {after.right_cm - before.right_cm:+.1f} cm"
+        taken = f"{now - started:.1f} s"
+        parts = [f"took {taken}" if label == "result" else taken]
+        if step["type"] == "drive":
+            if label == "result":
+                parts.append(f"asked {step['cm']:+g} cm")
+            heading = None if turned is None else f"heading moved {_side(turned)} {abs(turned):.1f} deg"
+            parts += [wheels, heading]
+        else:
+            turn = None if turned is None else f"turned {_side(turned)} {abs(turned):.1f} deg"
+            if turn and label == "result":
+                turn += f" (asked {_side(step['deg'])} {abs(step['deg']):g})"
+            parts += [turn, wheels]
+        parts.append(after.sensors)                  # asking for the readings uses up the supply dips, so they are written here
+        separator = "; " if label == "result" else ", "
+        self.log.append(f"  {label} : {separator.join(part for part in parts if part)}")
+
+    def _end_motion(self, now):
+        if self._motion is not None:
+            self._log_motion("result", now)
+            self._motion = None
 
     def _next(self, now):
         self.index += 1
@@ -266,7 +363,12 @@ class MovePlayer:
             return
         step = steps[self.index]
         self.status = f"Step {self.index + 1}/{len(steps)}: {describe_step(step, self.names)}"
+        before = self.car.readings()
+        self.log.append(f"step {self.index + 1}/{len(steps)}: {describe_step(step, self.names)}")
+        self.log.append(f"  before : {self._describe(before)}")
         kind = step["type"]
+        if kind in ("drive", "turn"):
+            self._motion, self._sample_at = (step, before, now), now + SAMPLE_S
         if kind == "arm":
             # "smooth" moves: the servos arrive together, and a following arm step starts as soon as this one is done (no
             # safety margin: a servo that is still moving just takes the new target). The margin stays before a drive or turn.
@@ -289,9 +391,11 @@ class MovePlayer:
             if self.car.start_drive(step["cm"], step.get("speed", DRIVE_SPEED_PCT), assist):
                 self._state = "motion"
             else:
+                self._motion = None
                 self.abort("could not start the drive")
         elif kind == "turn":
             if self.car.start_turn(step["deg"]):
                 self._state = "motion"
             else:
+                self._motion = None
                 self.abort("could not start the turn")

@@ -39,8 +39,8 @@ from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, 
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
-from helpers.moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, MoveFileError, MovePlayer, arm_step, describe_step,
-                   drive_step, load_move, new_move, save_move, turn_step, validate_move, wait_step)
+from helpers.moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, LogTail, MoveFileError, MovePlayer, Readings,
+                   arm_step, describe_step, drive_step, front_text, load_move, new_move, save_move, turn_step, validate_move, wait_step)
 
 # ---------------------------------------------------------------- settings
 # Camera (ESP32 WiFi bridge)
@@ -977,6 +977,41 @@ def _nice_step(span, target=8):
     return 100
 
 
+def gripper_text(app):
+    """The sensor in the gripper, in words."""
+    if app.tof_stamp is None:
+        return "no readings"
+    return "out of range" if app.tof_mm is None else f"{app.tof_mm} mm"
+
+
+def watch_rails(previous, arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state):
+    """The two servo supplies since the log last looked: the newest voltages, the deepest dips and the worst guard states."""
+    watch = (arm_v, grip_v, max(arm_sag, 0.0), max(grip_sag, 0.0), arm_state, grip_state)
+    if previous is not None:
+        watch = watch[:2] + tuple(max(a, b) for a, b in zip(watch[2:], previous[2:]))
+    return watch
+
+
+def supply_text(watch):
+    parts = []
+    for name, volts, sag, state in (("arm", watch[0], watch[2], watch[4]), ("gripper", watch[1], watch[3], watch[5])):
+        if volts < 0:
+            parts.append(f"{name} no sensor")
+            continue
+        guard = {1: " slowed by the guard", 2: " STOPPED by the guard"}.get(state, "")
+        parts.append(f"{name} {volts:.2f} V dip {sag:.0f} mV{guard}")
+    return "supply " + ", ".join(parts)
+
+
+def append_log(path, line):
+    """Add a line with the time to a run log. A log that cannot be written never gets in the way of the car."""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {line}\n")
+    except OSError:
+        pass
+
+
 class DashboardCar:
     """The Moves player's view of the car (see moves.PlayerCar): its commands, mapped onto what the dashboard already does."""
 
@@ -1017,6 +1052,19 @@ class DashboardCar:
 
     def connected(self):
         return self.app.connected.is_set()
+
+    def readings(self):
+        app = self.app
+        front = None if app.dist_stamp is None else Reading(app.dist_cm, app.dist_stamp)
+        sensors = f"{front_text(front)}, gripper {gripper_text(app)}"
+        if app.rail_watch is not None:
+            sensors += f", {supply_text(app.rail_watch)}"
+            app.rail_watch = None                            # told: the next look starts afresh
+        left, right = app.wheel_cm or (None, None)
+        return Readings(sensors, app.tracker.heading, left, right)
+
+    def failure(self):
+        return self.app.drive_fail_reason if self._driving else self.app.runner.status
 
 
 class PulseWindow:
@@ -1304,9 +1352,11 @@ class MovesWindow:
     """Record, edit, save and replay arm and car steps (see moves.py). 'Add arm pose' captures the four servo sliders and
     their speeds; drive, turn and wait steps ask for a number. Steps run one after another, top to bottom."""
 
-    def __init__(self, app, car=None):
+    def __init__(self, app, car=None, log_path=None):
         self.app = app
         self.car = car or DashboardCar(app)
+        self.log_path = Path(log_path) if log_path else data_file("moves_log.txt")        # every test play is written here
+        self._tail = LogTail()
         self.move = new_move("untitled")
         self.move["smooth"] = True          # new moves start smooth; a file without the setting (older ones) plays as before
         self.move["assist_gyro"] = True     # drives steer straight by the gyro heading and the wheel encoders (both on by default)
@@ -1362,7 +1412,7 @@ class MovesWindow:
         self.status_var = tk.StringVar(value="Add some steps, then Test play.")
         tk.Label(win, textvariable=self.status_var, bg=BG, fg=TEXT, font=(FONT, 10), wraplength=600, justify="left",
                  anchor="w").pack(fill="x", padx=12, pady=(8, 12))
-        win.after(50, self._tick)
+        win.after(50, self._loop)
 
     # ---- editing ------------------------------------------------------
     def _status(self, text):
@@ -1482,7 +1532,12 @@ class MovesWindow:
             return False
         started = self.player.start(self.move, time.monotonic())
         self._status(self.player.status)
+        self._write_log()
         return started
+
+    def _write_log(self):
+        for line in self._tail.new(self.player.log):
+            append_log(self.log_path, line)
 
     def stop(self):
         was_playing = self.player.active
@@ -1490,20 +1545,26 @@ class MovesWindow:
         if not was_playing:
             self.car.stop()
         self._status(self.player.status if was_playing else "Stopped")
+        self._write_log()
 
-    def _tick(self):
-        if self.win is None:
-            return
+    def tick(self):
         self.player.tick(time.monotonic())
         if self.player.active or self._was_active:
             self._status(self.player.status)
         self._was_active = self.player.active
-        self.win.after(50, self._tick)
+        self._write_log()
+
+    def _loop(self):
+        if self.win is None:
+            return
+        self.tick()
+        self.win.after(50, self._loop)
 
     def close(self):
         if self.win is None:
             return
         self.player.abort("window closed")
+        self._write_log()
         self.app.moves_window = None
         win, self.win = self.win, None
         try:
@@ -1607,11 +1668,7 @@ class DashboardWorld:
         """The gyro's heading, the wheel encoders' distances and the gripper sensor, for the Collect log."""
         app = self.app
         left, right = app.wheel_cm or (None, None)
-        if app.tof_stamp is None:
-            gripper = "no readings"
-        else:
-            gripper = "out of range" if app.tof_mm is None else f"{app.tof_mm} mm"
-        return Telemetry(app.tracker.heading, left, right, gripper)
+        return Telemetry(app.tracker.heading, left, right, gripper_text(app))
 
 
 class CollectWindow:
@@ -1625,7 +1682,7 @@ class CollectWindow:
         self.car = car or DashboardCar(app)
         self.moves_dir = Path(moves_dir)
         self.log_path = Path(log_path) if log_path else data_file("collect_log.txt")     # every run is written here
-        self._logged, self._end_logged, self._player_status = 0, True, ""
+        self._logged, self._end_logged, self._move_tail = 0, True, LogTail()
         self.tracker = BallTracker()
         self.world = DashboardWorld(app, self.tracker)
         self.approach = None
@@ -1686,11 +1743,7 @@ class CollectWindow:
 
     def _log(self, text):
         """Append a line to the run log (what it decided, which move step it was on, why it stopped). Never breaks Collect."""
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
-        except OSError:
-            pass
+        append_log(self.log_path, text)
 
     def _log_progress(self):
         """Write what is new since the last call: decision lines, the move step in progress, and how the run ended."""
@@ -1700,9 +1753,8 @@ class CollectWindow:
         for line in approach.log[self._logged:]:
             self._log(line)
         self._logged = len(approach.log)
-        if approach.player.active and approach.player.status != self._player_status:
-            self._player_status = approach.player.status
-            self._log(f"  move: {self._player_status}  [{approach.sensors_text()}]")
+        for line in self._move_tail.new(approach.player.log):
+            self._log(f"  move: {line}")
         if not approach.active and not self._end_logged:
             self._end_logged = True
             self._log(approach.status)
@@ -1822,7 +1874,7 @@ class CollectWindow:
         if not self.approach.start(time.monotonic() if now is None else now):
             self._status("Could not start.")
             return False
-        self._logged, self._end_logged, self._player_status = 0, False, ""
+        self._logged, self._end_logged, self._move_tail = 0, False, LogTail()
         self._log(f"Collect started: move '{self.move_var.get()}' ({len(self.move['steps'])} steps, smooth={self.move.get('smooth')}), "
                   f"grab spot {self.app.grab_spot.x_ratio:.3f} across / sensor {self.app.grab_spot.ultrasonic_cm:.1f} cm")
         self._status(self.approach.status)
@@ -1967,6 +2019,8 @@ class Dashboard:
         self.tof_var = tk.StringVar(value=TOF_WAITING)          # the whole text of the gripper line in the Distance card's title row
         self.tof_mm = None             # latest gripper sensor reading in mm, None = nothing in range or no sensor
         self.wheel_cm = None           # latest (left, right) distance counted by the wheel encoders, in cm
+        self.rail_watch = None         # the servo supplies since the move log last looked (see watch_rails)
+        self.drive_fail_reason = ""    # why the last drive by encoder distance did not finish
         self.tof_stamp = None          # time.monotonic() of the newest reading, None = none since connecting
         self.heading_var = tk.StringVar(value="--")
         self.spin_var = tk.StringVar(value="Turning speed: --")
@@ -2730,6 +2784,7 @@ class Dashboard:
                 k = ka if name == "arm" else kg
                 levels.append(f"{name}: slows below {base - slow * k / 1000.0:.2f} V, stops below {base - stop * k / 1000.0:.2f} V")
         self.guard_levels_var.set("   ·   ".join(levels))
+        self.rail_watch = watch_rails(self.rail_watch, arm_v, grip_v, arm_sag, grip_sag, arm_state, grip_state)
         self.sag_peak[0] = max(self.sag_peak[0], arm_sag)
         self.sag_peak[1] = max(self.sag_peak[1], grip_sag)
 
@@ -3039,6 +3094,8 @@ class Dashboard:
         self.encoder_seq += 1
         if state == 3:
             self.drive_failed = True
+            self.drive_fail_reason = ("the car gave up (a wheel's counter did not advance for 1.5 s, or the drive was slower than "
+                                      "4 cm/s)")
 
     def drive_busy(self):
         """True from the drive command until the car has reported idle. It has to report at least twice after the command, so a
@@ -3046,6 +3103,8 @@ class Dashboard:
         if self.drive_wait_seq is None:
             return False
         if time.monotonic() > self.drive_deadline:
+            self.drive_fail_reason = (f"the car did not report the drive finished in time (last state {self.drive_state}, "
+                                      f"{self.encoder_seq - self.drive_wait_seq} readings since the command)")
             self.drive_failed, self.drive_wait_seq = True, None          # no word from the car: give up waiting
             return False
         if self.drive_state != 0 or self.encoder_seq < self.drive_wait_seq + 2:

@@ -86,6 +86,7 @@ class BallTracker:
 from typing import NamedTuple, Optional, Protocol          # noqa: E402
 
 from helpers.ball_distance import ball_angle_deg, turn_to_ball   # noqa: E402
+from helpers.moves import front_text                          # noqa: E402
 
 
 class Reading(NamedTuple):
@@ -415,16 +416,6 @@ class Approach:
     def _side(deg):
         return "left" if deg > 0 else "right"
 
-    @staticmethod
-    def _front(reading):
-        if reading is None:
-            return "front: no reading"
-        return "front: nothing in range" if reading.cm is None else f"front {reading.cm:.1f} cm"
-
-    def sensors_text(self):
-        """The front and gripper sensors in a few words (the window adds this to every step of the pick-up move)."""
-        return f"{self._front(self.world.reading())}, gripper {self.world.telemetry().gripper}"
-
     def _camera_text(self, now, ball):
         if ball is None:
             last = self._last_ball
@@ -450,7 +441,7 @@ class Approach:
     def _log_scene(self, now, ball, reading):
         self.log.append(f"  camera : {self._camera_text(now, ball)}")
         t = self.world.telemetry()
-        parts = [self._front(reading), f"gripper {t.gripper}"]
+        parts = [front_text(reading), f"gripper {t.gripper}"]
         estimate = None if ball is None else self.world.camera_cm(ball)
         if estimate is not None:
             parts.insert(1, f"camera estimate {estimate:.1f} cm")

@@ -240,7 +240,7 @@ class CollectWindowTest(unittest.TestCase):
         self.assertEqual(self.window.world.telemetry().gripper, "38 mm")
 
     def test_move_steps_are_logged_with_the_front_and_gripper_readings(self):
-        self.app.tof_mm, self.app.tof_stamp = 38, self.now
+        self.car.sensors = "front 16.0 cm, gripper 38 mm"
         self.ready_to_collect()
         self.window.collect(self.now)
         for _ in range(100):
@@ -250,9 +250,9 @@ class CollectWindowTest(unittest.TestCase):
             self.feed(boxes=() if judging else (BOX,))
             if not self.window.approach.active:
                 break
-        moves = [line for line in self.log_path.read_text(encoding="utf-8").splitlines() if " move: " in line]
-        self.assertTrue(moves)
-        self.assertIn("[front 16.0 cm, gripper 38 mm]", moves[0])
+        moves = "\n".join(line for line in self.log_path.read_text(encoding="utf-8").splitlines() if " move: " in line)
+        for part in ("step 1/1: Wait: 0.1 s", "before : front 16.0 cm, gripper 38 mm", "done after"):
+            self.assertIn(part, moves)
 
     def test_long_log_lines_are_wrapped_in_the_window(self):
         self.app.tracker.heading, self.app.wheel_cm = -1234.5, (1010.0, 990.5)
