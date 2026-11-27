@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from helpers.moves import LogTail, Readings  # noqa: E402
+from helpers.moves import LogTail, Readings, RepeatPlayer  # noqa: E402
 from helpers.moves import (ARM_MARGIN_S, MoveFileError, MovePlayer, arm_duration, arm_step, describe_step,  # noqa: E402
                    drive_step, load_move, new_move, save_move, sync_speeds, turn_step, validate_move, wait_step)
 
@@ -204,6 +204,7 @@ class FakeCar:
     def stop(self):
         self.calls.append(("stop",))
         self.busy = False
+        getattr(self, "on_stop", lambda: None)()
 
     def connected(self):
         return self.connected_flag
@@ -307,6 +308,129 @@ class MoveLogTest(unittest.TestCase):
         player.start(move_of(wait_step(1)), 2.0)
         self.assertEqual(tail.new(player.log), player.log)
         self.assertNotIn("done after", self.text(player))
+
+
+class RepeatTest(unittest.TestCase):
+    """Playing a move many times over and counting how many runs failed."""
+
+    def setUp(self):
+        self.car = FakeCar()
+        self.player = RepeatPlayer(self.car, NAMES)
+        self.now = 0.0
+
+    def start(self, times, *steps):
+        return self.player.start(move_of(*(steps or (drive_step(5, 50),))), self.now, times)
+
+    def advance(self, seconds):
+        for _ in range(int(round(seconds * 10))):
+            self.now = round(self.now + 0.1, 1)
+            self.player.tick(self.now)
+
+    def finish_drive(self, ok=True, why=""):
+        self.car.motion_result, self.car.why = ok, why
+        self.car.finish_motion()
+        self.advance(0.1)
+
+    def drives(self):
+        return self.car.kinds().count("start_drive")
+
+    def text(self):
+        return "\n".join(self.player.log)
+
+    def test_it_plays_the_move_the_asked_number_of_times_with_a_pause_between(self):
+        self.assertTrue(self.start(3))
+        for run in (1, 2, 3):
+            self.assertEqual(self.drives(), run)
+            self.finish_drive()
+            if run < 3:
+                self.assertTrue(self.player.active)
+                self.advance(1.5)
+                self.assertEqual(self.drives(), run)                  # still pausing
+                self.advance(0.7)
+        self.assertFalse(self.player.active)
+        self.assertIs(self.player.ok, True)
+        self.assertEqual(self.player.status, "3 runs: 3 succeeded, 0 failed")
+        self.assertIn("=== run 2 of 3 ===", self.text())
+        self.assertIn("=== 3 runs: 3 succeeded, 0 failed ===", self.text())
+
+    def test_a_failed_run_is_counted_and_the_next_one_still_happens(self):
+        self.start(4, drive_step(5, 50), wait_step(0.1))
+        for ok in (True, False, False, True):
+            self.finish_drive(ok, "" if ok else "the car gave up")
+            self.advance(2.5)
+        self.assertFalse(self.player.active)
+        self.assertIs(self.player.ok, False)
+        self.assertEqual(self.player.status, "4 runs: 2 succeeded, 2 failed")
+        self.assertIn("  failed 2 x at step 1/2 (Drive: forward 5 cm at 50%): the drive did not finish normally: the car gave up "
+                      "(runs 2, 3)", self.text())
+
+    def test_the_car_stopping_itself_after_a_failure_does_not_end_the_repeats(self):
+        # on the dashboard, the stop a failing run sends looks like "you touched the controls" and calls abort again
+        self.car.on_stop = lambda: self.player.abort("manual control")
+        self.start(2)
+        self.finish_drive(False, "the car gave up")
+        self.assertTrue(self.player.active, self.player.status)
+        self.advance(2.5)
+        self.assertEqual(self.drives(), 2)
+
+    def test_a_first_step_that_cannot_start_fails_that_run_only(self):
+        self.car.on_stop = lambda: self.player.abort("manual control")
+        self.car.start_result = False
+        self.assertTrue(self.start(2))
+        self.advance(2.5)
+        self.assertFalse(self.player.active)
+        self.assertEqual(self.player.status, "2 runs: 0 succeeded, 2 failed")
+
+    def test_stop_ends_all_the_runs_also_during_the_pause(self):
+        for during_pause in (False, True):
+            self.setUp()
+            self.start(5)
+            self.finish_drive()
+            self.advance(0.5 if during_pause else 2.2)
+            self.player.abort("stopped by you")
+            self.assertFalse(self.player.active)
+            self.assertIn("stop", self.car.kinds())
+            before = self.drives()
+            self.advance(5.0)
+            self.assertEqual(self.drives(), before)
+            self.assertIn("stopped by you", self.player.status)
+            self.assertIn("1 succeeded, 0 failed", self.player.status)
+            self.assertIn("of 5 runs", self.text())
+
+    def test_a_disconnected_car_ends_the_runs(self):
+        self.start(5)
+        self.car.connected_flag = False
+        self.advance(0.2)
+        self.assertFalse(self.player.active)
+        self.assertIn("car disconnected", self.player.status)
+
+    def test_one_run_behaves_as_before(self):
+        self.start(1)
+        self.finish_drive()
+        self.assertEqual((self.player.active, self.player.ok, self.player.status), (False, True, "Done"))
+        self.assertNotIn("===", self.text())
+        self.setUp()
+        self.start(1)
+        self.finish_drive(False, "the car gave up")
+        self.assertEqual(self.player.status, "Stopped: the drive did not finish normally: the car gave up")
+
+    def test_while_it_runs_the_status_shows_the_count(self):
+        self.start(10)
+        self.assertEqual(self.player.status, "Run 1/10 (0 ok, 0 failed) - Step 1/1: Drive: forward 5 cm at 50%")
+        self.finish_drive()
+        self.assertEqual(self.player.status, "Run 1/10 done (1 ok, 0 failed) - next run in 2 s")
+
+    def test_refused_when_there_is_nothing_to_play_or_no_car(self):
+        self.assertFalse(self.player.start(move_of(), 0.0, 3))
+        self.assertEqual(self.player.status, "Nothing to play")
+        self.car.connected_flag = False
+        self.assertFalse(self.start(3))
+        self.assertEqual(self.player.status, "Car not connected")
+
+    def test_refused_while_already_running(self):
+        self.start(3)
+        self.assertFalse(self.start(3))
+        self.assertEqual(self.drives(), 1)
 
 
 class PlayerTest(unittest.TestCase):

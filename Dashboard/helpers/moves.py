@@ -24,6 +24,8 @@ MAX_TURN_DEG = 360
 MAX_WAIT_S = 60
 SPEED_RANGE = (1, 600)      # deg/s, like the dashboard's servo speed slider
 SAMPLE_S = 0.5              # while a drive or turn runs, the log gets a line this often
+MAX_REPEATS = 100
+REPEAT_PAUSE_S = 2.0        # between two runs of a repeated move: the car comes to rest (and there is time to press STOP)
 
 
 class MoveFileError(Exception):
@@ -399,3 +401,118 @@ class MovePlayer:
             else:
                 self._motion = None
                 self.abort("could not start the turn")
+
+
+class RepeatPlayer:
+    """Plays a move a number of times and counts the runs that failed. A run that fails does not end the repeats; STOP (abort)
+    or a disconnected car does. With one run it behaves like MovePlayer. Same interface, plus `times` for start()."""
+
+    def __init__(self, car, names):
+        self.car, self.names = car, names
+        self.one = MovePlayer(car, names)
+        self.active, self.ok, self.status, self.log = False, None, "Idle", []
+        self.times, self.run, self.passed, self.failures = 1, 0, 0, []
+        self._move, self._tail, self._next_at = None, LogTail(), 0.0
+        self._busy = False           # inside the single player: an abort arriving now is the echo of its own stop
+
+    def start(self, move, now, times=1):
+        if self.active:
+            return False
+        if not move.get("steps"):
+            self.status = "Nothing to play"
+            return False
+        if not self.car.connected():
+            self.status = "Car not connected"
+            return False
+        self._move, self.times, self.run, self.passed, self.failures = copy.deepcopy(move), times, 0, 0, []
+        self.active, self.ok, self.log = True, None, []
+        self._begin_run(now)
+        return True
+
+    def tick(self, now):
+        if not self.active:
+            return
+        if self.one.active:
+            self._in_one(self.one.tick, now)
+            self._follow(now)
+        elif not self.car.connected():
+            self.abort("car disconnected")
+        elif now >= self._next_at:
+            self._begin_run(now)
+
+    def abort(self, reason):
+        if not self.active or self._busy:
+            return
+        self.active, self.ok = False, False
+        if self.one.active:
+            self._in_one(self.one.abort, reason)
+            self._copy_log()
+        else:
+            self._in_one(lambda _: self.car.stop(), reason)
+        if self.times == 1:
+            self.status = self.one.status
+        else:
+            self._end_early(reason)
+
+    # -- one run --
+    def _in_one(self, call, value):
+        self._busy = True
+        try:
+            call(value)
+        finally:
+            self._busy = False
+
+    def _begin_run(self, now):
+        self.run += 1
+        if self.times > 1:
+            self.log.append(f"=== run {self.run} of {self.times} ===")
+        self._in_one(lambda t: self.one.start(self._move, t), now)
+        self._follow(now)
+
+    def _copy_log(self):
+        self.log.extend(self._tail.new(self.one.log))
+
+    def _follow(self, now):
+        """After the single player has done something: take over its log and status, and see whether its run has ended."""
+        self._copy_log()
+        if self.one.active:
+            self.status = self.one.status if self.times == 1 else f"Run {self.run}/{self.times} ({self._count()}) - {self.one.status}"
+            return
+        if self.one.ok:
+            self.passed += 1
+        else:
+            step = self.one.index
+            what = f"step {step + 1}/{len(self._move['steps'])} ({describe_step(self._move['steps'][step], self.names)})"
+            self.failures.append((self.run, what, self.one.status.replace("Stopped: ", "", 1)))
+        if self.times == 1:
+            self.active, self.ok, self.status = False, self.one.ok, self.one.status
+        elif not self.car.connected():
+            self.active, self.ok = False, False
+            self._end_early("car disconnected")
+        elif self.run >= self.times:
+            self.active, self.ok = False, not self.failures
+            self.status = f"{self.times} runs: {self.passed} succeeded, {len(self.failures)} failed"
+            self.log.append(f"=== {self.status} ===")
+            self._log_failures()
+        else:
+            self._next_at = now + REPEAT_PAUSE_S
+            self.status = f"Run {self.run}/{self.times} done ({self._count()}) - next run in {REPEAT_PAUSE_S:g} s"
+
+    # -- the summary --
+    def _count(self):
+        return f"{self.passed} ok, {len(self.failures)} failed"
+
+    def _end_early(self, reason):
+        done = self.passed + len(self.failures)
+        self.status = (f"Stopped ({reason}) after {done} of {self.times} runs: {self.passed} succeeded, "
+                       f"{len(self.failures)} failed")
+        self.log.append(f"=== {self.status} ===")
+        self._log_failures()
+
+    def _log_failures(self):
+        """One line for each kind of failure: how often, where, why, and in which runs."""
+        grouped = {}
+        for run, what, why in self.failures:
+            grouped.setdefault((what, why), []).append(run)
+        for (what, why), runs in sorted(grouped.items(), key=lambda item: -len(item[1])):
+            self.log.append(f"  failed {len(runs)} x at {what}: {why} (runs {', '.join(str(r) for r in runs)})")

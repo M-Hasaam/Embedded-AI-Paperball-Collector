@@ -201,6 +201,23 @@ class MovesWindowTest(unittest.TestCase):
         self.window.move["steps"].append(wait_step(5))
         self.assertTrue(self.window.play())
 
+    def test_the_move_is_repeated_as_often_as_asked(self):
+        self.window.add_drive(5, 50)
+        self.window.times_var.set("3")
+        self.assertTrue(self.window.play())
+        self.assertEqual(self.window.player.times, 3)
+        self.assertIn("Run 1/3", self.window.status_var.get())
+        self.assertIn("=== run 1 of 3 ===", self.log())
+
+    def test_the_times_box_starts_at_one_and_rejects_nonsense(self):
+        self.assertEqual(self.window.times_var.get(), "1")
+        self.window.add_wait(1)
+        for bad in ("0", "101", "abc", "", "2.5"):
+            self.window.times_var.set(bad)
+            self.assertFalse(self.window.play(), msg=bad)
+            self.assertIn("1 to 100", self.window.status_var.get(), msg=bad)
+        self.assertEqual(self.car.calls, [])
+
     def test_play_refused_when_move_is_empty(self):
         self.assertFalse(self.window.play())
         self.assertEqual(self.car.calls, [])

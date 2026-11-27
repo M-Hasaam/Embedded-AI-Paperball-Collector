@@ -39,8 +39,9 @@ from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, 
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
-from helpers.moves import (MAX_DRIVE_CM, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, LogTail, MoveFileError, MovePlayer, Readings,
-                   arm_step, describe_step, drive_step, front_text, load_move, new_move, save_move, turn_step, validate_move, wait_step)
+from helpers.moves import (MAX_DRIVE_CM, MAX_REPEATS, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, LogTail, MoveFileError, MovePlayer,
+                   Readings, RepeatPlayer, arm_step, describe_step, drive_step, front_text, load_move, new_move, save_move, turn_step,
+                   validate_move, wait_step)
 
 # ---------------------------------------------------------------- settings
 # Camera (ESP32 WiFi bridge)
@@ -1364,7 +1365,7 @@ class MovesWindow:
         self.move["smooth"] = True          # new moves start smooth; a file without the setting (older ones) plays as before
         self.move["assist_gyro"] = True     # drives steer straight by the gyro heading and the wheel encoders (both on by default)
         self.move["assist_encoders"] = True
-        self.player = MovePlayer(self.car, SERVO_NAMES)
+        self.player = RepeatPlayer(self.car, SERVO_NAMES)
         self._was_active = False
         win = self.win = tk.Toplevel(app.root)
         win.title("Moves - record and replay arm and car steps")
@@ -1375,6 +1376,7 @@ class MovesWindow:
         self.smooth_var = tk.BooleanVar(master=win, value=True)
         self.assist_gyro_var = tk.BooleanVar(master=win, value=True)
         self.assist_enc_var = tk.BooleanVar(master=win, value=True)
+        self.times_var = tk.StringVar(master=win, value="1")        # how many times Test play runs the move
 
         tk.Label(win, text="Pose the arm with the sliders in the dashboard, then Add arm pose. Steps run one after another, "
                            "top to bottom. Drives run at 100% or 50% speed and are counted by the car's wheel encoders.",
@@ -1398,6 +1400,12 @@ class MovesWindow:
         row([("Edit", self._edit_dialog, {}), ("Delete", self.delete_selected, {}), ("Up", lambda: self.move_selected(-1), {}),
              ("Down", lambda: self.move_selected(1), {}), ("Save...", self._save_dialog, {}), ("Open...", self._open_dialog, {})])
         play_row = row([("Test play", self._play_dialog, {}), ("STOP", self.stop, {"danger": True})], pady=(10, 0))
+        times = tk.Frame(play_row, bg=BG)
+        times.pack(side="left", padx=(0, 6), after=play_row.winfo_children()[0])
+        tk.Spinbox(times, from_=1, to=MAX_REPEATS, textvariable=self.times_var, width=4, bg=CARD, fg=TEXT, insertbackground=TEXT,
+                   buttonbackground=CARD_HI, relief="flat", font=(FONT, 10)).pack(side="left")
+        self.times_var.set("1")                                     # the Spinbox puts its own start value in
+        tk.Label(times, text="times", bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(4, 0))
         tk.Checkbutton(
             play_row, text="Smooth arm moves (arrive together, no stops between arm steps)", variable=self.smooth_var,
             command=lambda: self.set_smooth(self.smooth_var.get()), bg=BG, fg=TEXT, selectcolor=CARD_HI, activebackground=BG,
@@ -1533,10 +1541,19 @@ class MovesWindow:
             return False
         if self.player.active:
             return False
-        started = self.player.start(self.move, time.monotonic())
+        times = self.times()
+        if times is None:
+            self._status(f"Times must be a whole number from 1 to {MAX_REPEATS}")
+            return False
+        started = self.player.start(self.move, time.monotonic(), times)
         self._status(self.player.status)
         self._write_log()
         return started
+
+    def times(self):
+        """The number in the times box; None if it is not a whole number from 1 to MAX_REPEATS."""
+        text = self.times_var.get().strip()
+        return int(text) if text.isdigit() and 1 <= int(text) <= MAX_REPEATS else None
 
     def _write_log(self):
         for line in self._tail.new(self.player.log):
@@ -1616,7 +1633,8 @@ class MovesWindow:
                 self.edit_selected_value(value)
 
     def _play_dialog(self):
-        if messagebox.askokcancel("Play moves", "The arm and the car will move. Is the area clear?", parent=self.win):
+        often = "" if self.times() in (None, 1) else f" The move runs {self.times()} times."
+        if messagebox.askokcancel("Play moves", f"The arm and the car will move.{often} Is the area clear?", parent=self.win):
             self.play()
 
     def _save_dialog(self):
