@@ -977,6 +977,9 @@ def _nice_step(span, target=8):
     return 100
 
 
+DRIVE_START_S = 4.0     # a drive command the car has not begun after this long is given up
+
+
 def gripper_text(app):
     """The sensor in the gripper, in words."""
     if app.tof_stamp is None:
@@ -2068,6 +2071,8 @@ class Dashboard:
         self.drive_state = 0           # 0 idle, 1 driving, 2 stopping, 3 failed (stalled or too slow)
         self.drive_failed = False
         self.drive_wait_seq = None     # encoder_seq when the drive command was sent; None = no drive is being waited for
+        self.drive_seen = False        # the car has reported driving since that command
+        self.drive_start_by = 0.0      # ... which it has to do before this time
         self.drive_deadline = 0.0
         self._applying_servo = False   # True while send_servo_command moves the sliders itself (their callbacks must not send)
         self.path_window = None
@@ -3084,6 +3089,8 @@ class Dashboard:
             return False
         self.drive_failed = False
         self.drive_wait_seq = self.encoder_seq
+        self.drive_seen = False
+        self.drive_start_by = time.monotonic() + DRIVE_START_S
         self.drive_deadline = time.monotonic() + 5.0 + abs(cm) / 3.0    # slower than 3 cm/s overall: something is wrong
         self._send(f"M{cm:g} {pct} {assist}")
         return True
@@ -3092,14 +3099,17 @@ class Dashboard:
         """Every encoder reading carries the car's drive state (0 idle, 1 driving, 2 stopping, 3 failed)."""
         self.drive_state = state
         self.encoder_seq += 1
+        if state != 0 and self.drive_wait_seq is not None:
+            self.drive_seen = True
         if state == 3:
             self.drive_failed = True
             self.drive_fail_reason = ("the car gave up (a wheel's counter did not advance for 1.5 s, or the drive was slower than "
                                       "4 cm/s)")
 
     def drive_busy(self):
-        """True from the drive command until the car has reported idle. It has to report at least twice after the command, so a
-        short drive that is already over by the first reading is not mistaken for one that never started."""
+        """True from the drive command until the car has reported driving and then idle again. Idle readings alone prove
+        nothing: some were already on their way when the command went out. (Even the shortest drive reports itself for over half
+        a second, so several readings show it.)"""
         if self.drive_wait_seq is None:
             return False
         if time.monotonic() > self.drive_deadline:
@@ -3107,10 +3117,15 @@ class Dashboard:
                                       f"{self.encoder_seq - self.drive_wait_seq} readings since the command)")
             self.drive_failed, self.drive_wait_seq = True, None          # no word from the car: give up waiting
             return False
-        if self.drive_state != 0 or self.encoder_seq < self.drive_wait_seq + 2:
-            return True
-        self.drive_wait_seq = None
-        return False
+        if self.drive_seen and self.drive_state == 0:
+            self.drive_wait_seq = None
+            return False
+        if not self.drive_seen and time.monotonic() > self.drive_start_by:
+            self.drive_fail_reason = (f"the car never reported that it started the drive ({self.encoder_seq - self.drive_wait_seq} "
+                                      f"readings since the command, all idle)")
+            self.drive_failed, self.drive_wait_seq = True, None
+            return False
+        return True
 
     def path_run_plan(self, waypoints):
         """Drive from here through the waypoints clicked on the map (recorded, so it can be returned along)."""

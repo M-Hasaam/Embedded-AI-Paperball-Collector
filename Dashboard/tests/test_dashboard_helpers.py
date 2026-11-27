@@ -391,7 +391,7 @@ class EncoderDriveTest(unittest.TestCase):
         return types.SimpleNamespace(
             sent=sent, _send=sent.append, connected=types.SimpleNamespace(is_set=lambda: connected),
             runner=types.SimpleNamespace(active=runner_active, abort=lambda reason: None), encoder_seq=5, drive_state=0,
-            drive_failed=True, drive_wait_seq=None, drive_deadline=0.0)
+            drive_failed=True, drive_wait_seq=None, drive_deadline=0.0, drive_seen=False, drive_start_by=0.0)
 
     def note(self, app, state):
         dashboard.Dashboard._note_drive_state(app, state)
@@ -410,14 +410,41 @@ class EncoderDriveTest(unittest.TestCase):
             self.assertFalse(dashboard.Dashboard.drive_encoder(app, 20, 100))
             self.assertEqual(app.sent, [])
 
-    def test_a_short_drive_that_is_already_over_is_not_missed(self):
+    def test_idle_readings_from_before_the_car_started_do_not_finish_the_drive(self):
+        # seen on the car: readings already on their way (or a slow command) said "idle" twice, the dashboard called the 5 cm
+        # drive finished, and the gripper closed while the car was still moving
         app = self.app()
-        dashboard.Dashboard.drive_encoder(app, 5, 100)
-        self.note(app, 0)                                             # the first reading after the command: not enough yet
-        self.assertTrue(dashboard.Dashboard.drive_busy(app))
-        self.note(app, 0)                                             # the second, still idle: it really is over
+        dashboard.Dashboard.drive_encoder(app, 5, 50)
+        for _ in range(5):
+            self.note(app, 0)
+            self.assertTrue(dashboard.Dashboard.drive_busy(app))
+        for state in (1, 1, 2, 2):                                    # now the car takes the command and drives
+            self.note(app, state)
+            self.assertTrue(dashboard.Dashboard.drive_busy(app))
+        self.note(app, 0)
         self.assertFalse(dashboard.Dashboard.drive_busy(app))
         self.assertFalse(app.drive_failed)
+
+    def test_a_drive_that_never_starts_is_a_failure_not_a_success(self):
+        app = self.app()
+        dashboard.Dashboard.drive_encoder(app, 5, 50)
+        self.note(app, 0)
+        self.note(app, 0)
+        app.drive_start_by = 0.0                                      # the time it had to start in has passed
+        self.assertFalse(dashboard.Dashboard.drive_busy(app))
+        self.assertTrue(app.drive_failed)
+        self.assertIn("never reported that it started", app.drive_fail_reason)
+
+    def test_the_next_drive_has_to_be_seen_starting_again(self):
+        app = self.app()
+        dashboard.Dashboard.drive_encoder(app, 5, 50)
+        for state in (1, 0):
+            self.note(app, state)
+        self.assertFalse(dashboard.Dashboard.drive_busy(app))
+        dashboard.Dashboard.drive_encoder(app, -5, 50)
+        self.note(app, 0)
+        self.note(app, 0)
+        self.assertTrue(dashboard.Dashboard.drive_busy(app))
 
     def test_busy_while_the_car_reports_driving_or_stopping(self):
         app = self.app()
