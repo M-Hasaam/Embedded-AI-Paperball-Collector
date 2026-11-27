@@ -6,6 +6,7 @@
 #include <Wire.h>
 #include <VL53L0X.h>   // Arduino library "VL53L0X" by Pololu (Library Manager)
 #include <math.h>
+#include "gyro_still.h" // decides from the readings whether the car really stands still (for the gyro's zero point)
 
 // HC-SR04 ultrasonic sensor pins.
 // The sensor is powered from the S3's 3V3 pin (on the converter's 5V it sent the S3 into a brownout restart loop
@@ -40,6 +41,10 @@ const float MPU_FILTER_ALPHA = 0.98f;             // complementary filter: gyro 
 const float MPU_GYRO_LSB_PER_DPS = 65.5f;         // gyro range +-500 deg/s
 const float MPU_YAW_DEADBAND_DPS = 0.3f;          // ignore tiny gyro noise so heading doesn't creep
 const int MPU_CAL_SAMPLES = 200;                  // gyro offset calibration (keep the car still)
+// A calibration made while the car moves is refused. And with the motors off and the wheels not turning, every window of
+// MPU_STILL_WINDOW readings that is steady (see gyro_still.h) shows the true zero: if the stored one is missing or more than a
+// degree per second off, it is replaced. So a bad start corrects itself once the car is left alone.
+const int MPU_STILL_WINDOW = 100;                 // readings (2 s at 50 Hz)
 // The gyro's zero point drifts as the chip warms up, so a heading calibrated at power-on creeps while the car stands still
 // (a few degrees a minute). While the car is certainly still (no motor command, no turn, wheels not turning, gyro quiet) the
 // heading is frozen and the zero point is re-learned slowly. A real rotation (> MPU_STILL_DPS) always counts.
@@ -92,6 +97,8 @@ bool mpuOk = false;
 float mpuPitch = 0, mpuRoll = 0;                  // degrees
 float mpuYaw = 0;                                 // heading change in degrees, + = counter-clockwise from above
 float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0; // deg/s measured while still
+bool gyroZeroKnown = false;                       // false until a calibration from a still car has been accepted
+GyroStill stillWatch;                             // the readings since the car was last driven or its wheels turned
 volatile bool mpuCalRequested = false;
 volatile bool mpuYawResetRequested = false;
 float mpuAx = 0, mpuAy = 0, mpuAz = 0;            // g
@@ -1021,32 +1028,41 @@ void updateBuzzer() {
   }
 }
 
-// Averages the gyro while the car is still to find its zero offset. Takes ~1 s.
+// Stores the zero point a still window shows.
+void takeGyroZero(const GyroStill& window) {
+  gyroBiasX = window.mean[0];
+  gyroBiasY = window.mean[1];
+  gyroBiasZ = window.mean[2];
+}
+
+// Averages the gyro while the car is still to find its zero offset. Takes ~1 s. If the readings show that the car moved,
+// nothing is taken: updateMpu() calibrates as soon as the car stands still.
 void calibrateGyro() {
-  float sx = 0, sy = 0, sz = 0;
-  int n = 0;
+  GyroStill window;
   for (int i = 0; i < MPU_CAL_SAMPLES; i++) {
     Wire.beginTransmission(MPU_ADDR);
-    Wire.write(0x43);  // GYRO_XOUT_H
-    if (Wire.endTransmission(false) == 0 && Wire.requestFrom(MPU_ADDR, (uint8_t)6) == 6) {
-      int16_t g[3];
-      for (int k = 0; k < 3; k++) {
+    Wire.write(0x3B);  // ACCEL_XOUT_H: accelerometer, temperature, gyro
+    if (Wire.endTransmission(false) == 0 && Wire.requestFrom(MPU_ADDR, (uint8_t)14) == 14) {
+      int16_t raw[7];
+      for (int k = 0; k < 7; k++) {
         uint8_t hi = Wire.read();
         uint8_t lo = Wire.read();
-        g[k] = (int16_t)((hi << 8) | lo);
+        raw[k] = (int16_t)((hi << 8) | lo);
       }
-      sx += g[0]; sy += g[1]; sz += g[2];
-      n++;
+      window.add(raw[4] / MPU_GYRO_LSB_PER_DPS, raw[5] / MPU_GYRO_LSB_PER_DPS, raw[6] / MPU_GYRO_LSB_PER_DPS,
+                 raw[0] / 16384.0f, raw[1] / 16384.0f, raw[2] / 16384.0f);
     }
     delay(5);
   }
-  if (n > 0) {
-    gyroBiasX = sx / n / MPU_GYRO_LSB_PER_DPS;
-    gyroBiasY = sy / n / MPU_GYRO_LSB_PER_DPS;
-    gyroBiasZ = sz / n / MPU_GYRO_LSB_PER_DPS;
-  }
+  gyroZeroKnown = window.still(MPU_CAL_SAMPLES / 2);
   mpuYaw = 0;
-  Serial.printf("Gyro bias: %.2f %.2f %.2f deg/s\n", gyroBiasX, gyroBiasY, gyroBiasZ);
+  stillWatch.reset();
+  if (gyroZeroKnown) {
+    takeGyroZero(window);
+    Serial.printf("Gyro bias: %.2f %.2f %.2f deg/s\n", gyroBiasX, gyroBiasY, gyroBiasZ);
+  } else {
+    Serial.println("Gyro calibration refused: the car moved. It calibrates by itself once the car stands still.");
+  }
 }
 
 bool mpuInit() {
@@ -1158,6 +1174,22 @@ void updateMpu() {
       lastTicksL = ticksL;
       lastTicksR = ticksR;
       bool driving = motorState[0] || motorState[1] || motorState[2] || motorState[3] || turnActive;
+      if (driving || wheelsMoved) {
+        stillWatch.reset();
+      } else {
+        stillWatch.add(raw[4] / MPU_GYRO_LSB_PER_DPS, raw[5] / MPU_GYRO_LSB_PER_DPS, raw[6] / MPU_GYRO_LSB_PER_DPS,
+                       mpuAx, mpuAy, mpuAz);
+        if (stillWatch.n >= MPU_STILL_WINDOW) {
+          const float zero[3] = {gyroBiasX, gyroBiasY, gyroBiasZ};
+          if (stillWatch.still(MPU_STILL_WINDOW) && gyroZeroIsWrong(stillWatch, zero, gyroZeroKnown)) {
+            takeGyroZero(stillWatch);
+            if (!gyroZeroKnown) mpuYaw = 0;       // the heading counted without a zero point means nothing
+            gyroZeroKnown = true;
+            Serial.printf("Gyro zero set while standing still: %.2f %.2f %.2f deg/s\n", gyroBiasX, gyroBiasY, gyroBiasZ);
+          }
+          stillWatch.reset();
+        }
+      }
       if (driving || wheelsMoved || fabsf(mpuGz) > MPU_STILL_DPS) stillSince = 0;
       else if (stillSince == 0) stillSince = now;
       bool still = stillSince != 0 && now - stillSince >= MPU_STILL_MS;
