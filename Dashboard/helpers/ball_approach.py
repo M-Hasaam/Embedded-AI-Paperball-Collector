@@ -133,7 +133,10 @@ class Approach:
     FAR_CM = 60.0
     HOP_MIN_CM = 3.0
     HOP_MAX_CM = 25.0
-    BLIND_HOP_CM = 10.0
+    NEAR_HOP_MAX_CM = 15.0          # once the sensor has the ball, no hop is longer than this
+    BLIND_HOP_CM = 10.0             # beyond the sensor: the shortest hop, and the one used when nothing says how far the ball is
+    SIZE_CM_PX = 3000.0             # a ball's box this many pixels wide would be 1 cm away: distance >= this / width. The logged ball
+    #                                 gives about 4000, so a smaller ball (down to three quarters of it) is still not driven past
     SLOW_BELOW_CM = 15.0
     APPROACH_FRACTION = 0.7         # near the ball a hop covers this much of what is left (the car overshoots), until ...
     CREEP_CM = 8.0                  # ... this little is left, which is driven in one small step
@@ -370,7 +373,7 @@ class Approach:
             return "stop", "something is closer than the ball", 0, ""
         if r is not None and r <= self.FAR_CM:
             if agree:
-                cm = hop(step(r - pick))
+                cm = min(self.NEAR_HOP_MAX_CM, hop(step(r - pick)))
             elif r < c:
                 return "stop", "something is closer than the ball", 0, ""
             else:
@@ -379,7 +382,13 @@ class Approach:
         if c is not None:
             cm = hop(c - pick - self.CAMERA_MARGIN_CM)
             return "drive", cm, speed(cm, c), "beyond the sensor: by the camera estimate"
-        return "drive", self.BLIND_HOP_CM, 50, "beyond the sensor: a short blind hop"
+        size = max(ball.width, ball.height)
+        if not size:
+            return "drive", self.BLIND_HOP_CM, 50, "beyond the sensor: a short blind hop"
+        least = self.SIZE_CM_PX / size                # the ball is at least this far, by how small it looks
+        cm = round(min(self.HOP_MAX_CM, max(self.BLIND_HOP_CM, (least - pick) * self.APPROACH_FRACTION)), 1)
+        why = f"beyond the sensor: the ball is {size:.0f} px wide, so at least {least:.0f} cm away"
+        return "drive", cm, speed(cm, least), why
 
     def _act(self, now, action, value, speed, why):
         if action == "stop":

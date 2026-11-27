@@ -309,7 +309,7 @@ class ApproachTest(unittest.TestCase):
         self.assertEqual(len(self.drives()), 1)
 
     def test_hops_from_the_sensor(self):
-        for r, cm, speed in ((40, 16.8, 50), (25, 6.3, 50), (19, 3.0, 50), (59, 25.0, 50)):
+        for r, cm, speed in ((40, 15.0, 50), (25, 6.3, 50), (19, 3.0, 50), (59, 15.0, 50)):
             self.setUp()
             self.go(r)
             self.assertEqual(self.drives(), [("start_drive", cm, speed, 3)], msg=f"reading {r}")
@@ -464,6 +464,38 @@ class ApproachTest(unittest.TestCase):
     def test_a_far_ball_by_the_camera_is_still_approached_fast(self):
         self.go(None, camera=90)
         self.assertEqual(self.drives(), [("start_drive", 25.0, 100, 3)])
+
+    # -- far hops are long and fast, near hops short and slow (it was the other way round: 10 cm hops far away) --
+    def go_seeing(self, r, size):
+        self.see(r)
+        self.world.ball_value = replace(self.world.ball_value, width=float(size), height=float(size) * 0.85)
+        self.approach.start(self.now)
+        self.advance(1.0)
+
+    def test_a_ball_that_looks_far_is_approached_in_long_fast_hops(self):
+        for r in (150, None):
+            self.setUp()
+            self.go_seeing(r, 35)                                     # 35 px wide: at least 85 cm away
+            self.assertEqual(self.drives(), [("start_drive", 25.0, 100, 3)], msg=f"reading {r}")
+
+    def test_the_hop_shrinks_and_slows_as_the_ball_looks_nearer(self):
+        for size, cm, speed in ((35, 25.0, 100), (60, 23.8, 50), (80, 15.0, 50), (100, 10.0, 50), (250, 10.0, 50)):
+            self.setUp()
+            self.go_seeing(150, size)
+            self.assertEqual(self.drives(), [("start_drive", cm, speed, 3)], msg=f"{size} px")
+
+    def test_a_near_hop_is_never_longer_or_faster_than_a_far_one(self):
+        hops = []
+        for r, size in ((150, 35), (100, 50), (59, 68), (45, 90), (30, 135), (22, 180)):
+            self.setUp()
+            self.go_seeing(r, size)
+            (_, cm, speed, _), = self.drives()
+            hops.append((cm, speed))
+        self.assertEqual(hops, sorted(hops, reverse=True), hops)
+
+    def test_the_log_says_why_the_far_hop_is_that_long(self):
+        self.go_seeing(150, 35)
+        self.assertIn("beyond the sensor: the ball is 35 px wide, so at least 86 cm away", self.text())
 
     # -- too close to be seen: back up and look again instead of giving up --
     def hop_then_lose_the_ball(self, reading):
@@ -717,7 +749,7 @@ class ApproachTest(unittest.TestCase):
         self.advance(1.0)
         for part in ("step 1", "attempt 1", "52% across", "2% right of the grab line", "box 40x30 px", "62% down", "sure 82%",
                      "2 balls in view", "9 pictures: 51-53%", "front 40.0 cm", "gripper 143 mm", "heading +12.0",
-                     "wheels L 5.0 R 6.0 cm", "decided: drive forward 16.8 cm at 50%"):
+                     "wheels L 5.0 R 6.0 cm", "decided: drive forward 15.0 cm at 50%"):
             self.assertIn(part, self.text())
 
     def test_the_decision_to_turn_explains_the_angle(self):
@@ -745,7 +777,7 @@ class ApproachTest(unittest.TestCase):
         self.car.finish_motion()
         self.see(22)
         self.advance(1.0)
-        self.assertIn("result : drove (asked +16.8 cm); wheels L +17.2 R +16.4 cm; heading moved left 0.4 deg", self.text())
+        self.assertIn("result : drove (asked +15.0 cm); wheels L +17.2 R +16.4 cm; heading moved left 0.4 deg", self.text())
 
     def test_a_stop_says_where_things_stood(self):
         self.go(40)
