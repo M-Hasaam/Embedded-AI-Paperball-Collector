@@ -19,6 +19,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import tkinter as tk
@@ -32,7 +33,7 @@ from bleak import BleakClient, BleakScanner
 from PIL import Image, ImageTk
 
 from helpers.ball_detector import DetectorWorker, draw_detections, summarize
-from helpers.ball_approach import Approach, BallTracker, Reading
+from helpers.ball_approach import Approach, BallTracker, Reading, Telemetry
 from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, draw_guides, draw_spot_marker, load_model,
                                    save_model)
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
@@ -1599,6 +1600,19 @@ class DashboardWorld:
     def balls_seen_since(self, stamp):
         return self.tracker.seen_since(stamp)
 
+    def ball_spread(self, since):
+        return self.tracker.spread_since(since)
+
+    def telemetry(self):
+        """The gyro's heading, the wheel encoders' distances and the gripper sensor, for the Collect log."""
+        app = self.app
+        left, right = app.wheel_cm or (None, None)
+        if app.tof_stamp is None:
+            gripper = "no readings"
+        else:
+            gripper = "out of range" if app.tof_mm is None else f"{app.tof_mm} mm"
+        return Telemetry(app.tracker.heading, left, right, gripper)
+
 
 class CollectWindow:
     """Teach the camera its distances and the grab spot, then Collect: the car turns to the paper ball, hops toward it, and plays a
@@ -1620,7 +1634,7 @@ class CollectWindow:
         win = self.win = tk.Toplevel(app.root)
         win.title("Collect - drive to a paper ball and pick it up")
         win.configure(bg=BG)
-        win.geometry("640x640+160+40")
+        win.geometry("720x680+160+20")
         win.minsize(560, 520)
         win.protocol("WM_DELETE_WINDOW", self.close)
         self.status_var = tk.StringVar(master=win, value="Tick 'Detect paper balls' and put a ball in front of the camera.")
@@ -1688,7 +1702,7 @@ class CollectWindow:
         self._logged = len(approach.log)
         if approach.player.active and approach.player.status != self._player_status:
             self._player_status = approach.player.status
-            self._log(f"  move: {self._player_status}")
+            self._log(f"  move: {self._player_status}  [{approach.sensors_text()}]")
         if not approach.active and not self._end_logged:
             self._end_logged = True
             self._log(approach.status)
@@ -1833,7 +1847,8 @@ class CollectWindow:
             self._status(self.approach.status)
             self.log_box.delete(0, "end")
             for line in self.approach.log[-12:]:
-                self.log_box.insert("end", line)
+                for part in textwrap.wrap(line, 100, subsequent_indent=" " * 13):    # the box does not wrap by itself
+                    self.log_box.insert("end", part)
             self.log_box.see("end")
         self._log_progress()
 
@@ -1951,6 +1966,7 @@ class Dashboard:
         self.dist_note = tk.StringVar(value="waiting for sensor")
         self.tof_var = tk.StringVar(value=TOF_WAITING)          # the whole text of the gripper line in the Distance card's title row
         self.tof_mm = None             # latest gripper sensor reading in mm, None = nothing in range or no sensor
+        self.wheel_cm = None           # latest (left, right) distance counted by the wheel encoders, in cm
         self.tof_stamp = None          # time.monotonic() of the newest reading, None = none since connecting
         self.heading_var = tk.StringVar(value="--")
         self.spin_var = tk.StringVar(value="Turning speed: --")
@@ -2747,6 +2763,7 @@ class Dashboard:
     def _show_encoder(self, lcm, rcm, lv, rv, stamp):
         if stamp < self._enc_ignore_until:
             return
+        self.wheel_cm = (lcm, rcm)
         avg, speed = (lcm + rcm) / 2, (lv + rv) / 2
         self.tracker.feed_encoder(avg, stamp)
         self.enc_dist_var.set(f"{avg:.1f}")
@@ -2780,6 +2797,7 @@ class Dashboard:
         self.tof_var.set(TOF_WAITING)
         self.tof_label.configure(fg=MUTED)
         self.tof_mm = self.tof_stamp = None
+        self.wheel_cm = None
         self.heading_var.set("--")
         self.spin_var.set("Turning speed: --")
         self.pitch_var.set("Front-back tilt: --")

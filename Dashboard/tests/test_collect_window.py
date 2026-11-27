@@ -43,7 +43,8 @@ class FakeDetector:
 
 def make_app():
     app = types.SimpleNamespace(root=ROOT, moves_window=None, collect_window=None, detector=FakeDetector(), distance_model=None,
-                                grab_spot=None, dist_cm=None, dist_stamp=None, detect_var=tk.BooleanVar(master=ROOT))
+                                grab_spot=None, dist_cm=None, dist_stamp=None, detect_var=tk.BooleanVar(master=ROOT),
+                                tracker=types.SimpleNamespace(heading=0.0), wheel_cm=None, tof_mm=None, tof_stamp=None)
     app._button = lambda parent, text, command, **kw: tk.Button(parent, text=text, command=command)
     return app
 
@@ -213,8 +214,57 @@ class CollectWindowTest(unittest.TestCase):
         text = self.log_path.read_text(encoding="utf-8")
         self.assertIn("Collect started", text)
         self.assertIn("pick", text)                                   # the move's name
-        self.assertIn("sensor 40.0 cm", text)                         # a decision line
+        self.assertIn("front 40.0 cm", text)                          # what a decision was made from
         self.assertIn("Stopped: stopped by you", text)                # why it ended
+
+    def test_the_log_carries_the_camera_gyro_wheels_and_gripper(self):
+        self.app.tracker.heading, self.app.wheel_cm = -12.5, (101.0, 99.5)
+        self.app.tof_mm, self.app.tof_stamp = 143, self.now
+        self.ready_to_collect()
+        self.window.collect(self.now)
+        for _ in range(12):
+            self.now += 0.1
+            self.reading(40)
+            self.feed()
+        self.window.stop()
+        text = self.log_path.read_text(encoding="utf-8")
+        for part in ("step 1", "50% across", "box 40x40 px", "sure 90%", "pictures: 50-50%", "heading -12.5",
+                     "wheels L 101.0 R 99.5 cm", "gripper 143 mm", "decided: drive forward", "result : drove"):
+            self.assertIn(part, text)
+
+    def test_the_gripper_sensor_in_words(self):
+        self.assertEqual(self.window.world.telemetry().gripper, "no readings")
+        self.app.tof_stamp = self.now
+        self.assertEqual(self.window.world.telemetry().gripper, "out of range")
+        self.app.tof_mm = 38
+        self.assertEqual(self.window.world.telemetry().gripper, "38 mm")
+
+    def test_move_steps_are_logged_with_the_front_and_gripper_readings(self):
+        self.app.tof_mm, self.app.tof_stamp = 38, self.now
+        self.ready_to_collect()
+        self.window.collect(self.now)
+        for _ in range(100):
+            self.now += 0.1
+            self.reading(16.0)
+            judging = self.window.approach._state in ("picking", "verifying")
+            self.feed(boxes=() if judging else (BOX,))
+            if not self.window.approach.active:
+                break
+        moves = [line for line in self.log_path.read_text(encoding="utf-8").splitlines() if " move: " in line]
+        self.assertTrue(moves)
+        self.assertIn("[front 16.0 cm, gripper 38 mm]", moves[0])
+
+    def test_long_log_lines_are_wrapped_in_the_window(self):
+        self.app.tracker.heading, self.app.wheel_cm = -1234.5, (1010.0, 990.5)
+        self.ready_to_collect()
+        self.window.collect(self.now)
+        for _ in range(12):
+            self.now += 0.1
+            self.reading(40)
+            self.feed()
+        shown = self.window.log_box.get(0, "end")
+        self.assertTrue(any("camera :" in line for line in shown))
+        self.assertTrue(all(len(line) <= 100 for line in shown), max(shown, key=len))
 
     def test_a_log_file_that_cannot_be_written_does_not_break_collect(self):
         self.window.log_path = self.dir / "no_such_folder" / "x" / "log.txt"
@@ -241,6 +291,15 @@ class CollectWindowTest(unittest.TestCase):
         self.assertFalse(approach.active)
         self.assertIn(("stop",), self.car.calls)
         self.assertIsNone(self.app.collect_window)
+
+
+class WheelReadingTest(unittest.TestCase):
+    def test_the_dashboard_keeps_the_newest_wheel_distances(self):
+        text = types.SimpleNamespace(set=lambda value: None)
+        app = types.SimpleNamespace(_enc_ignore_until=0.0, tracker=types.SimpleNamespace(feed_encoder=lambda avg, stamp: None),
+                                    enc_dist_var=text, enc_speed_var=text, enc_wheels_var=text, wheel_cm=None)
+        dashboard.Dashboard._show_encoder(app, 12.5, 13.0, 0.0, 0.0, 5.0)
+        self.assertEqual(app.wheel_cm, (12.5, 13.0))
 
 
 if __name__ == "__main__":

@@ -15,7 +15,9 @@ import numpy as np
 
 from helpers.paths import data_file
 
-FOV_DEG = 36.0                         # the picture's horizontal field of view. Measured on the car, not the sensor's data sheet figure (55): in four gyro turns the ball moved 1.5-1.7x more than 55 predicted
+FOV_DEG = 55.0                         # the picture's horizontal field of view (the data sheet figure; 44 turns logged on the car agree)
+CAMERA_AHEAD_CM = 18.0                 # how far the camera sits ahead of the point the car turns about. It makes a close ball move
+#                                        further across the picture than the car turned: the same 44 turns give 18 cm
 GUIDE_DISTANCES_CM = (20, 30, 40, 60, 80)
 CALIB_FILE = data_file("ball_calibration.json")
 RED, YELLOW, GREEN = (255, 0, 0), (255, 255, 0), (0, 255, 0)      # RGB, like the dashboard's camera frames
@@ -98,6 +100,17 @@ def ball_angle_deg(x_ratio, fov_deg=FOV_DEG):
     + = to the left, the same sign as the car's turns."""
     focal = 0.5 / math.tan(math.radians(fov_deg) / 2.0)                    # in picture widths
     return math.degrees(math.atan((0.5 - x_ratio) / focal))
+
+
+def turn_to_ball(x_ratio, distance_cm, spot_x_ratio, spot_cm):
+    """How far the car must turn in place (+ = left, degrees) so that driving straight brings the ball to the grab spot.
+    `distance_cm` is from the camera to the ball; the grab spot is a place across the picture at a distance. The car turns about a
+    point behind the camera, so up close it turns less than the angle the camera sees."""
+    angle = math.radians(ball_angle_deg(x_ratio))
+    forward, left = CAMERA_AHEAD_CM + distance_cm * math.cos(angle), distance_cm * math.sin(angle)
+    goal_left = spot_cm * math.sin(math.radians(ball_angle_deg(spot_x_ratio)))      # kept all the way when driving straight
+    away = math.hypot(forward, left)
+    return math.degrees(math.atan2(left, forward) - math.asin(max(-1.0, min(1.0, goal_left / away))))
 
 
 def draw_guides(rgb, model, distances=GUIDE_DISTANCES_CM):

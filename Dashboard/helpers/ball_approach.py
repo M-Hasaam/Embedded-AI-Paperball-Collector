@@ -1,7 +1,8 @@
 """Collect: driving the car to a paper ball and picking it up. This file holds the pieces that decide things, without any screen or
 Bluetooth: the tracker that finds a steady ball in the detector's results (here), and the Approach state machine (below)."""
+import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -9,6 +10,12 @@ class Ball:
     x_ratio: float          # the box centre across the picture: 0 = left edge, 1 = right edge
     bottom_y: float         # the bottom edge of the box in picture pixels (how far down the picture the ball touches the floor)
     stamp: float            # time.monotonic() when the detector finished this picture
+    # the rest is only for the log
+    width: float = field(default=0.0, compare=False)              # the box, in picture pixels
+    height: float = field(default=0.0, compare=False)
+    confidence: float = field(default=0.0, compare=False)         # how sure the model is, 0 to 1
+    in_view: int = field(default=1, compare=False)                # balls on the floor in this picture
+    bottom_ratio: float = field(default=None, compare=False)      # the bottom edge down the picture: 0 = top, 1 = bottom
 
 
 class BallTracker:
@@ -25,7 +32,7 @@ class BallTracker:
         self.reset()
 
     def reset(self):
-        self._seen = deque(maxlen=100)    # the time of every result that showed a ball on the floor
+        self._seen = deque(maxlen=100)    # (time, place across) of every result that showed a ball on the floor
         self._last_id = None
         self._ball = None
         self._centre = None          # the previous result's centre (x, y) in pixels
@@ -45,7 +52,6 @@ class BallTracker:
                 self._ball, self._centre, self._count = None, None, 0
             return                   # a short gap: the ball is still there, and keeps the time of the picture it was last seen in
         self._gap = 0
-        self._seen.append(result.stamp)
         self._last_seen = result.stamp
         d = max(floor, key=lambda det: det.y2)
         centre = ((d.x1 + d.x2) / 2.0, (d.y1 + d.y2) / 2.0)
@@ -57,7 +63,9 @@ class BallTracker:
         else:
             self._count = 1
         self._centre, self._size = centre, size
-        self._ball = Ball(centre[0] / result.width, float(d.y2), result.stamp)
+        self._seen.append((result.stamp, centre[0] / result.width))
+        self._ball = Ball(centre[0] / result.width, float(d.y2), result.stamp, width=float(d.x2 - d.x1), height=float(d.y2 - d.y1),
+                          confidence=float(d.score), in_view=len(floor), bottom_ratio=d.y2 / result.height)
 
     def ball(self):
         """The newest steady ball, else None."""
@@ -65,19 +73,31 @@ class BallTracker:
 
     def seen_since(self, stamp):
         """How many results since `stamp` showed a ball on the floor (steady or not, so a ball that is still rolling counts)."""
-        return sum(1 for t in self._seen if t >= stamp)
+        return sum(1 for t, _ in self._seen if t >= stamp)
+
+    def spread_since(self, stamp):
+        """(leftmost, rightmost, results) of the ball's place across the picture since `stamp`; None if none showed it."""
+        places = [x for t, x in self._seen if t >= stamp]
+        return (min(places), max(places), len(places)) if places else None
 
 
 # ---- the approach -------------------------------------------------------------------------------------------------------------
 
 from typing import NamedTuple, Optional, Protocol          # noqa: E402
 
-from helpers.ball_distance import ball_angle_deg            # noqa: E402
+from helpers.ball_distance import ball_angle_deg, turn_to_ball   # noqa: E402
 
 
 class Reading(NamedTuple):
     cm: Optional[float]      # the ultrasonic distance; None = no echo (nothing in front, or too far)
     stamp: float             # time.monotonic() when it arrived
+
+
+class Telemetry(NamedTuple):
+    heading: Optional[float] = None      # the gyro's heading in degrees, + = left, not wrapped at 360
+    left_cm: Optional[float] = None      # how far each wheel's encoder has counted
+    right_cm: Optional[float] = None
+    gripper: str = "no readings"         # the sensor in the gripper, in words: "38 mm", "out of range", "no readings"
 
 
 class World(Protocol):
@@ -86,6 +106,8 @@ class World(Protocol):
     def reading(self) -> Optional[Reading]: ...              # the newest ultrasonic reading
     def camera_cm(self, ball: Ball) -> Optional[float]: ...  # distance by the camera model; None when not calibrated
     def balls_seen_since(self, stamp: float) -> int: ...     # camera results since then that showed a ball on the floor
+    def ball_spread(self, since: float) -> Optional[tuple]: ...   # (leftmost, rightmost, results), for the log
+    def telemetry(self) -> Telemetry: ...                    # gyro, wheels and gripper sensor, for the log
 
 
 class Approach:
@@ -93,7 +115,10 @@ class Approach:
     (read while the car stands still, on fresh data only) says when the ball is in the pick range; the camera distance cross-checks it.
     Anything unexpected stops the car (abort) instead of guessing."""
 
-    TURN_TOL_DEG = 2.0
+    TURN_TOL_DEG = 1.5              # car degrees: no turn when the ball needs less than this
+    TURN_SHORT_DEG = 1.0            # the car stops this much short of a turn (median of 106 logged turns): ask for this much more
+    SENSOR_SEES_DEG = 10.0          # the sensor's reading is the ball's distance only with the ball this close to straight ahead
+    ASSUMED_CM = 40.0               # distance used for a turn when neither the sensor nor the camera can say
     SETTLE_S = 0.6
     FRAME_AFTER_S = 0.3
     READING_AFTER_S = 0.5
@@ -134,6 +159,9 @@ class Approach:
         self._decisions = 0
         self._recoveries = 0                        # back-ups to find the ball again, in this attempt
         self._drove_forward = False                 # a forward hop was made in this attempt: the ball may now be too close to see
+        self._now, self._pressed = 0.0, 0.0         # the latest tick, and when Collect was pressed (for the log)
+        self._motion = None                         # (kind, value, telemetry before) of a motion whose result is not logged yet
+        self._last_ball = None                      # the last steady ball seen, for the log
 
     # -- control --
     def start(self, now):
@@ -143,11 +171,16 @@ class Approach:
         self._state, self._started, self._ready_since = "deciding", now, float("-inf")
         self._last_ball_seen, self._decisions, self.attempts = now, 0, 1
         self._recoveries, self._drove_forward = 0, False
+        self._now, self._pressed, self._motion, self._last_ball = now, now, None, None
         return True
 
-    def abort(self, reason):
+    def abort(self, reason, show=True):
+        """Stop everything. `show`: first write down where things stood (not needed right after a decision, which just did)."""
         if not self.active:
             return
+        if show:
+            self._log_result()
+            self._log_scene(self._now, self.world.ball(), self.world.reading())
         self.active, self.ok, self.status = False, False, f"Stopped: {reason}"
         self.car.stop()
         if self.player.active:
@@ -160,6 +193,8 @@ class Approach:
     def tick(self, now):
         if not self.active:
             return
+        self._now = now
+        self._last_ball = self.world.ball() or self._last_ball
         if not self.car.connected():
             return self.abort("the car disconnected")
         if now - self._started > self.MAX_TIME_S:
@@ -196,15 +231,18 @@ class Approach:
         frame = self.world.frame_stamp()
         if frame is None or frame < self._verify_since + self.FRAME_AFTER_S:
             return                                   # no picture taken since the move: "no ball seen" would prove nothing
-        if self.world.balls_seen_since(self._verify_since + self.FRAME_AFTER_S) < self.MISS_FRAMES:
+        seen = self.world.balls_seen_since(self._verify_since + self.FRAME_AFTER_S)
+        found = "a ball is still on the floor" if seen >= self.MISS_FRAMES else "no ball left on the floor"
+        self.log.append(f"  check  : {found} (seen in {seen} pictures after the move)")
+        self._log_scene(now, self.world.ball(), self.world.reading())
+        if seen < self.MISS_FRAMES:
             return self._finish_ok()
-        self.log.append(f"attempt {self.attempts}: the ball is still on the floor")
         if self.attempts >= self.MAX_ATTEMPTS:
-            return self.abort(f"missed {self.attempts} times")
+            return self.abort(f"missed {self.attempts} times", show=False)      # the check just wrote where things stood
         self.attempts += 1
         self._decisions, self._started, self._last_ball_seen = 0, now, now
         self._recoveries, self._drove_forward = 0, False
-        if not self.car.start_drive(-self.RETRY_BACK_CM, 50, 3):
+        if not self._start_drive(-self.RETRY_BACK_CM, 50):
             return self.abort("could not start the drive")
         self._state = "moving"
         self.status = f"Missed: backing up, attempt {self.attempts} of {self.MAX_ATTEMPTS}"
@@ -239,6 +277,9 @@ class Approach:
         if self._decisions >= self.MAX_DECISIONS:
             return self.abort("too many steps")
         self._decisions += 1
+        self._log_result()
+        self.log.append(f"step {self._decisions}, attempt {self.attempts}, {now - self._pressed:.0f} s after Collect was pressed")
+        self._log_scene(now, ball, reading)
         self._act(now, *self._decide(ball, reading.cm))
 
     # -- too close to see --
@@ -257,62 +298,155 @@ class Approach:
             back, why = self.RECOVER_BACK_CM, "not in view after driving at it"
         back = round(back, 1)
         self._recoveries += 1
+        self._log_result()
+        self._log_scene(now, None, self.world.reading())
         self.log.append(f"no ball ({why}): backing up {back:g} cm to look again, try {self._recoveries} of {self.MAX_RECOVERS}")
-        if not self.car.start_drive(-back, 50, 3):
+        if not self._start_drive(-back, 50):
             return self.abort("could not start the drive")
         self._last_ball_seen = now
         self._state, self.status = "moving", f"Cannot see the ball: backing up {back:g} cm"
 
-    # -- the decision table: returns (action, value, speed, note) --
+    # -- the decision table: returns (action, value, speed, why) --
     def _decide(self, ball, r):
         spot = self.spot
-        error = ball_angle_deg(ball.x_ratio) - ball_angle_deg(spot.x_ratio)
         c = self.world.camera_cm(ball)
-        self._note = f"bearing {error:+.1f} deg, sensor {'none' if r is None else f'{r:.1f}'} cm, camera {'none' if c is None else f'{c:.1f}'} cm"
-        if abs(error) > self.TURN_TOL_DEG:
-            return "turn", error, 0, "turn"
+        pick = spot.ultrasonic_cm
         tol = None if c is None else max(self.AGREE_CM, self.AGREE_FRACTION * c)
+        # closer than the pick range (and not something in front of a farther ball): this close the picture jumps about, so
+        # back off first and aim from there
+        if r is not None and r < spot.pick_min and not (c is not None and r < c - tol):
+            return "drive", -max(self.HOP_MIN_CM, pick - r), 50, "too close to aim or pick"
+        if r is not None and abs(ball_angle_deg(ball.x_ratio)) <= self.SENSOR_SEES_DEG:
+            distance, source = r, "sensor"
+        elif c is not None:
+            distance, source = c, "camera"
+        else:
+            distance, source = self.ASSUMED_CM, "assumed"
+        need = turn_to_ball(ball.x_ratio, distance, spot.x_ratio, pick)
+        if abs(need) > self.TURN_TOL_DEG:
+            why = (f"the ball needs {abs(need):.1f} deg, plus {self.TURN_SHORT_DEG:.1f} because the car stops short; "
+                   f"distance {distance:.0f} cm ({source})")
+            return "turn", need + math.copysign(self.TURN_SHORT_DEG, need), 0, why
         agree = c is None or r is None or abs(r - c) <= tol
         hop = lambda d: min(self.HOP_MAX_CM, max(self.HOP_MIN_CM, d))
-        pick = spot.ultrasonic_cm
         # fast only when nothing is near: at 100% a hop toward a ball within FAR_CM ran past it, too close to be seen
         speed = lambda cm, away: 50 if cm < self.SLOW_BELOW_CM or away <= self.FAR_CM else 100
         step = lambda left: left if left <= self.CREEP_CM else round(left * self.APPROACH_FRACTION, 1)
         if r is not None and spot.pick_min <= r <= spot.pick_max:
             if not agree:
-                return "stop", f"the sensor says {r:.0f} cm but the camera says {c:.0f} cm", 0, "disagree"
-            return "pick", 0, 0, "pick"
+                return "stop", f"the sensor says {r:.0f} cm but the camera says {c:.0f} cm", 0, ""
+            return "pick", 0, 0, f"front {r:.1f} cm is in the pick range {spot.pick_min:.0f}-{spot.pick_max:.0f} cm"
         if r is not None and r < spot.pick_min:
-            if c is not None and r < c - tol:
-                return "stop", "something is closer than the ball", 0, "closer"
-            return "drive", -max(self.HOP_MIN_CM, pick - r), 50, "back up"
+            return "stop", "something is closer than the ball", 0, ""
         if r is not None and r <= self.FAR_CM:
             if agree:
                 cm = hop(step(r - pick))
             elif r < c:
-                return "stop", "something is closer than the ball", 0, "closer"
+                return "stop", "something is closer than the ball", 0, ""
             else:
                 cm = hop(c - pick - self.CAMERA_MARGIN_CM)
-            return "drive", cm, 50, "hop"
+            return "drive", cm, 50, f"{r - pick:.0f} cm left to the pick distance"
         if c is not None:
             cm = hop(c - pick - self.CAMERA_MARGIN_CM)
-            return "drive", cm, speed(cm, c), "hop (no sensor reading)"
-        return "drive", self.BLIND_HOP_CM, 50, "hop (no sensor reading)"
+            return "drive", cm, speed(cm, c), "beyond the sensor: by the camera estimate"
+        return "drive", self.BLIND_HOP_CM, 50, "beyond the sensor: a short blind hop"
 
-    def _act(self, now, action, value, speed, note):
-        self.log.append(f"{self._note}: {note if action != 'stop' else value}")
+    def _act(self, now, action, value, speed, why):
         if action == "stop":
-            return self.abort(value)
+            self.log.append(f"  decided: stop - {value}")
+            return self.abort(value, show=False)
         if action == "turn":
+            self.log.append(f"  decided: turn {self._side(value)} {abs(value):.1f} deg ({why})")
+            before = self.world.telemetry()
             if not self.car.start_turn(value):
-                return self.abort("could not start the turn")
+                return self.abort("could not start the turn", show=False)
+            self._motion = ("turn", value, before)
             self._state, self.status = "moving", f"Turning {value:+.0f} deg"
         elif action == "drive":
-            if not self.car.start_drive(value, speed, 3):
-                return self.abort("could not start the drive")
+            self.log.append(f"  decided: drive {'forward' if value > 0 else 'back'} {abs(value):.1f} cm at {speed}% ({why})")
+            if not self._start_drive(value, speed):
+                return self.abort("could not start the drive", show=False)
             if value > 0:
                 self._drove_forward = True
             self._state, self.status = "moving", f"Driving {value:+.0f} cm"
         else:
+            self.log.append(f"  decided: pick up ({why})")
             self.player.start(self.move, now)
             self._state, self.status = "picking", "Picking up"
+
+    def _start_drive(self, cm, speed):
+        before = self.world.telemetry()
+        if not self.car.start_drive(cm, speed, 3):
+            return False
+        self._motion = ("drive", cm, before)
+        return True
+
+    # -- the log: what the camera and the sensors saw, and what the car then did --
+    @staticmethod
+    def _side(deg):
+        return "left" if deg > 0 else "right"
+
+    @staticmethod
+    def _front(reading):
+        if reading is None:
+            return "front: no reading"
+        return "front: nothing in range" if reading.cm is None else f"front {reading.cm:.1f} cm"
+
+    def sensors_text(self):
+        """The front and gripper sensors in a few words (the window adds this to every step of the pick-up move)."""
+        return f"{self._front(self.world.reading())}, gripper {self.world.telemetry().gripper}"
+
+    def _camera_text(self, now, ball):
+        if ball is None:
+            last = self._last_ball
+            if last is None:
+                return "no ball in view; none seen yet"
+            return f"no ball in view; last seen {last.x_ratio * 100:.0f}% across, {max(0.0, now - last.stamp):.1f} s ago"
+        offset = (ball.x_ratio - self.spot.x_ratio) * 100
+        line = "on the grab line" if abs(offset) < 0.5 else f"{abs(offset):.0f}% {'right' if offset > 0 else 'left'} of the grab line"
+        parts = [f"ball {ball.x_ratio * 100:.0f}% across ({line})"]
+        if ball.width:
+            parts.append(f"box {ball.width:.0f}x{ball.height:.0f} px")
+        if ball.bottom_ratio is not None:
+            parts.append(f"bottom edge {ball.bottom_ratio * 100:.0f}% down")
+        if ball.confidence:
+            parts.append(f"sure {ball.confidence * 100:.0f}%")
+        parts.append(f"{ball.in_view} ball{'s' if ball.in_view != 1 else ''} in view")
+        text = ", ".join(parts)
+        spread = self.world.ball_spread(self._ready_since + self.FRAME_AFTER_S)
+        if spread:
+            text += f"; across in the last {spread[2]} pictures: {spread[0] * 100:.0f}-{spread[1] * 100:.0f}%"
+        return text
+
+    def _log_scene(self, now, ball, reading):
+        self.log.append(f"  camera : {self._camera_text(now, ball)}")
+        t = self.world.telemetry()
+        parts = [self._front(reading), f"gripper {t.gripper}"]
+        estimate = None if ball is None else self.world.camera_cm(ball)
+        if estimate is not None:
+            parts.insert(1, f"camera estimate {estimate:.1f} cm")
+        if t.heading is not None:
+            parts.append(f"heading {t.heading:+.1f}")
+        if t.left_cm is not None:
+            parts.append(f"wheels L {t.left_cm:.1f} R {t.right_cm:.1f} cm")
+        self.log.append(f"  sensors: {', '.join(parts)}")
+
+    def _log_result(self):
+        """What the last turn or drive really did, by the gyro and the wheel encoders."""
+        if self._motion is None:
+            return
+        (kind, value, before), self._motion = self._motion, None
+        after = self.world.telemetry()
+        turned = None if before.heading is None or after.heading is None else after.heading - before.heading
+        wheels = None
+        if before.left_cm is not None and after.left_cm is not None:
+            wheels = f"wheels L {after.left_cm - before.left_cm:+.1f} R {after.right_cm - before.right_cm:+.1f} cm"
+        if kind == "turn":
+            asked = f"(asked {self._side(value)} {abs(value):.1f})"
+            text = (f"the turn ended {asked}, no gyro reading" if turned is None else
+                    f"turned {self._side(turned)} {abs(turned):.1f} deg {asked}")
+            parts = [text, wheels]
+        else:
+            heading = None if turned is None else f"heading moved {self._side(turned)} {abs(turned):.1f} deg"
+            parts = [f"drove (asked {value:+.1f} cm)", wheels, heading]
+        self.log.append(f"  result : {'; '.join(part for part in parts if part)}")

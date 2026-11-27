@@ -1,13 +1,14 @@
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers.ball_approach import Approach, Ball, BallTracker, Reading  # noqa: E402
+from helpers.ball_approach import Approach, Ball, BallTracker, Reading, Telemetry  # noqa: E402
 from helpers.ball_detector import Detection, DetectionResult  # noqa: E402
-from helpers.ball_distance import ball_angle_deg  # noqa: E402
+from helpers.ball_distance import turn_to_ball  # noqa: E402
 from helpers.grab_spot import GrabSpot  # noqa: E402
 from test_moves import FakeCar  # noqa: E402
 
@@ -149,6 +150,25 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(tracker.seen_since(2.5), 2)
         self.assertEqual(tracker.seen_since(5.0), 0)
 
+    def test_the_ball_carries_its_box_confidence_and_how_many_are_in_view(self):
+        tracker = BallTracker()
+        for i in (1, 2, 3):
+            tracker.update(DetectionResult(i, [Detection(0.82, 300, 300, 340, 336), Detection(0.9, 10, 200, 30, 220)], 30.0,
+                                           float(i), 640, 480))
+        ball = tracker.ball()
+        self.assertEqual((ball.width, ball.height, ball.confidence, ball.in_view), (40.0, 36.0, 0.82, 2))
+        self.assertAlmostEqual(ball.bottom_ratio, 336 / 480)
+
+    def test_where_the_ball_was_across_the_pictures_since_a_time(self):
+        tracker = BallTracker()
+        for i, left in ((1, 300), (2, 292), (3, 316), (4, 300)):
+            tracker.update(result(i, [(left, 300, left + 40, 340)], stamp=float(i)))
+        low, high, n = tracker.spread_since(2.0)
+        self.assertEqual(n, 3)
+        self.assertAlmostEqual(low, 312 / 640)
+        self.assertAlmostEqual(high, 336 / 640)
+        self.assertIsNone(tracker.spread_since(9.0))
+
     def test_reset(self):
         tracker = BallTracker()
         for i in (1, 2, 3):
@@ -177,6 +197,12 @@ class FakeWorld:
 
     def balls_seen_since(self, stamp):
         return sum(1 for t in getattr(self, "seen", []) if t >= stamp)
+
+    def ball_spread(self, since):
+        return getattr(self, "spread", None)
+
+    def telemetry(self):
+        return getattr(self, "sensors", Telemetry())
 
 
 class FakePlayer:
@@ -223,7 +249,7 @@ class ApproachTest(unittest.TestCase):
         for _ in range(int(round(seconds * 10))):
             self.now += 0.1
             if self.world.ball_value is not None:
-                self.world.ball_value = Ball(self.world.ball_value.x_ratio, self.world.ball_value.bottom_y, self.now)
+                self.world.ball_value = replace(self.world.ball_value, stamp=self.now)
                 self.world.seen = getattr(self.world, "seen", []) + [self.now]
             if self.world.reading_value is not None:
                 self.world.reading_value = Reading(self.world.reading_value.cm, self.now)
@@ -238,15 +264,44 @@ class ApproachTest(unittest.TestCase):
     def drives(self):
         return [c for c in self.car.calls if c[0] == "start_drive"]
 
+    def asked(self, x, cm):
+        """The turn the car should be asked for: what the ball needs, plus the 1 degree the car stops short."""
+        need = turn_to_ball(x, cm, 0.5, 16.0)
+        return need + (1.0 if need > 0 else -1.0)
+
     def test_turns_toward_a_ball_off_the_taught_direction(self):
         self.go(40, x=0.2)
-        self.assertAlmostEqual(self.car.calls[0][1], ball_angle_deg(0.2) - ball_angle_deg(0.5), places=1)
+        self.assertAlmostEqual(self.car.calls[0][1], self.asked(0.2, 40), places=1)
         self.assertGreater(self.car.calls[0][1], 5)                   # to the left (+)
         self.assertEqual(self.drives(), [])
         self.setUp()
         self.go(40, x=0.8)
-        self.assertAlmostEqual(self.car.calls[0][1], ball_angle_deg(0.8) - ball_angle_deg(0.5), places=1)
+        self.assertAlmostEqual(self.car.calls[0][1], self.asked(0.8, 40), places=1)
         self.assertLess(self.car.calls[0][1], -5)
+
+    def test_asks_for_a_degree_more_than_needed_because_the_car_stops_short(self):
+        self.go(100, x=0.44)
+        need = turn_to_ball(0.44, 100, 0.5, 16.0)
+        self.assertAlmostEqual(self.car.calls[0][1] - need, 1.0, places=1)
+
+    def test_a_far_ball_a_little_off_the_line_is_turned_to(self):
+        self.go(110, x=0.46)                                          # the old maths left a far ball like this uncentred
+        self.assertEqual(self.car.kinds()[0], "start_turn")
+        self.assertGreater(self.car.calls[0][1], 2.5)                 # enough for the car to really move
+
+    def test_the_same_place_across_the_picture_close_up_needs_no_turn(self):
+        self.go(17, x=0.46)                                           # 17 cm away that is under 1 cm to the side
+        self.assertNotIn("start_turn", self.car.kinds())
+        self.assertEqual(self.player.started, [MOVE])
+
+    def test_a_far_reading_is_not_the_distance_of_a_ball_off_to_the_side(self):
+        self.go(150, x=0.2)                                           # the sensor looks past the ball: assume 40 cm
+        self.assertAlmostEqual(self.car.calls[0][1], self.asked(0.2, 40), places=1)
+
+    def test_too_close_and_off_to_one_side_backs_up_before_turning(self):
+        self.go(11, x=0.3)                                            # this close the picture jumps about: no turning
+        self.assertEqual(self.car.kinds()[:1], ["start_drive"])
+        self.assertEqual(self.drives(), [("start_drive", -5.0, 50, 3)])
 
     def test_no_turn_within_three_degrees(self):
         self.go(40, x=0.52)
@@ -579,6 +634,74 @@ class ApproachTest(unittest.TestCase):
         self.approach.abort("again")
         self.assertEqual(self.car.kinds().count("stop"), 1)
         self.assertEqual(self.player.aborted, ["user"])
+
+    # -- the log says what the camera and the sensors saw, what was decided and what the car then did --
+    def text(self):
+        return "\n".join(self.approach.log)
+
+    def test_each_decision_says_what_the_camera_and_sensors_saw(self):
+        self.see(40, x=0.52)
+        self.world.ball_value = replace(self.world.ball_value, width=40.0, height=30.0, confidence=0.82, in_view=2,
+                                        bottom_ratio=0.625)
+        self.world.spread = (0.51, 0.53, 9)
+        self.world.sensors = Telemetry(12.0, 5.0, 6.0, "143 mm")
+        self.approach.start(self.now)
+        self.advance(1.0)
+        for part in ("step 1", "attempt 1", "52% across", "2% right of the grab line", "box 40x30 px", "62% down", "sure 82%",
+                     "2 balls in view", "9 pictures: 51-53%", "front 40.0 cm", "gripper 143 mm", "heading +12.0",
+                     "wheels L 5.0 R 6.0 cm", "decided: drive forward 16.8 cm at 50%"):
+            self.assertIn(part, self.text())
+
+    def test_the_decision_to_turn_explains_the_angle(self):
+        self.go(100, x=0.44)
+        need = turn_to_ball(0.44, 100, 0.5, 16.0)
+        for part in (f"decided: turn left {need + 1:.1f} deg", f"ball needs {need:.1f}", "stops short", "100 cm (sensor)"):
+            self.assertIn(part, self.text())
+
+    def test_the_result_of_a_turn_is_logged_from_the_gyro_and_wheels(self):
+        self.world.sensors = Telemetry(10.0, 5.0, 6.0, "143 mm")
+        self.go(40, x=0.8)
+        self.assertNotIn("result", self.text())
+        self.world.sensors = Telemetry(7.6, 6.2, 4.9, "143 mm")
+        self.car.finish_motion()
+        self.see(40)
+        self.advance(1.0)
+        asked = abs(self.car.calls[0][1])
+        self.assertIn(f"result : turned right 2.4 deg (asked right {asked:.1f}); wheels L +1.2 R -1.1 cm", self.text())
+        self.assertEqual(self.text().count("result :"), 1)
+
+    def test_the_result_of_a_drive_is_logged_from_the_wheels_and_gyro(self):
+        self.world.sensors = Telemetry(10.0, 100.0, 200.0, "143 mm")
+        self.go(40)
+        self.world.sensors = Telemetry(10.4, 117.2, 216.4, "143 mm")
+        self.car.finish_motion()
+        self.see(22)
+        self.advance(1.0)
+        self.assertIn("result : drove (asked +16.8 cm); wheels L +17.2 R +16.4 cm; heading moved left 0.4 deg", self.text())
+
+    def test_a_stop_says_where_things_stood(self):
+        self.go(40)
+        self.world.sensors = Telemetry(1.0, 2.0, 3.0, "90 mm")
+        self.world.ball_value = None
+        self.approach.abort("stopped by you")
+        for part in ("result :", "no ball in view; last seen 50% across", "front 40.0 cm", "gripper 90 mm"):
+            self.assertIn(part, self.text())
+
+    def test_the_check_after_the_pick_is_logged_with_the_gripper(self):
+        self.go(16.2)
+        self.world.sensors = Telemetry(0.0, 0.0, 0.0, "35 mm")
+        self.player.finish(True)
+        self.world.ball_value = None
+        self.advance(2.0)
+        self.assertIn("check  : no ball left on the floor (seen in 0 pictures after the move)", self.text())
+        self.assertIn("gripper 35 mm", self.text().split("check  :")[1])
+
+    def test_missing_sensors_do_not_break_the_log(self):
+        self.go(None)
+        self.car.finish_motion()
+        self.advance(1.0)
+        self.assertIn("front: nothing in range", self.text())
+        self.assertIn("result : drove (asked +10.0 cm)", self.text())
 
     def test_start_refused_when_already_active_or_disconnected(self):
         self.see(40)
