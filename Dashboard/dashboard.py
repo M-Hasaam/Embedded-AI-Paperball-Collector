@@ -45,6 +45,7 @@ from helpers.path_settings import (ASSISTS, SPEEDS, TRUSTS, Odometer, PathSettin
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
 from helpers.sensor_watch import SensorWatch
+from helpers import touchpad
 from helpers.moves import (MAX_DRIVE_CM, MAX_REPEATS, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, REPEAT_PAUSE_S, LogTail, MoveFileError,
                    MovePlayer, Readings, RepeatPlayer, arm_step, describe_step, drive_step, front_text, load_move, new_move,
                    save_move, turn_step, validate_move, wait_step)
@@ -743,10 +744,22 @@ class PathRunner:
 
 
 class PathWindow:
-    """The map: estimated path (blue = going out, green = coming back), click to plan waypoints."""
+    """The map: estimated path (blue = going out, green = coming back), click to plan waypoints. It fits everything into view
+    by itself until you zoom (two fingers apart or together, Ctrl + wheel, or + / -) or drag it (two fingers moving together,
+    or the held button); Fit goes back to that."""
+    ZOOM_STEP = 1.2             # one press of + or -
+    PINCH_STEP = 1.35           # one notch of Ctrl + wheel; a pinch sends many small parts of one
+    PAN_PX = 0.8                # how far the map is dragged, in pixels, for one unit of scrolling (a notch is 120)
+    TOUCH_POLL_MS = 10
+    TOUCH_LOG_BYTES = 500_000
+    CLOSEST_CM = 15.0           # half the height or width of the view, zoomed all the way in ...
+    FARTHEST_CM = 2000.0        # ... and out
+    DRAG_PX = 5                 # the pointer must move this far for a press to be a drag instead of a click
 
-    def __init__(self, app):
+    def __init__(self, app, touch_log=None):
         self.app = app
+        self.touch_log = Path(touch_log) if touch_log else data_file("touchpad_log.txt")     # every gesture, to check them
+        self.touch = None
         win = self.win = tk.Toplevel(app.root)
         win.title("Path map - gyro heading + wheel-encoder distance")
         win.configure(bg=BG)
@@ -760,7 +773,23 @@ class PathWindow:
 
         self.canvas = tk.Canvas(win, height=180, bg="#0a0e14", highlightbackground=LINE, highlightthickness=1)
         self.canvas.pack(fill="both", expand=True, padx=12, pady=(12, 6))
-        self.canvas.bind("<Button-1>", self._click)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        # these are what Tk itself reports; on Windows the touchpad's messages are read directly instead (see _hook_touch)
+        self.canvas.bind("<MouseWheel>", lambda e: self._gesture(False, False, e.delta, e.x, e.y) or "break")
+        self.canvas.bind("<Shift-MouseWheel>", lambda e: self._gesture(True, False, -e.delta, e.x, e.y) or "break")
+        self.canvas.bind("<Control-MouseWheel>", lambda e: self._pinch(e) or "break")
+        self.view = None                 # None = fitted; else (centre x, centre y, half the shorter side) in cm
+        self._held = None                # where a press began, while the button is down
+        zoom = tk.Frame(self.canvas, bg="#0a0e14")
+        zoom.place(relx=1.0, x=-8, y=8, anchor="ne")
+        self.zoom_in_button = app._button(zoom, "+", lambda: self.zoom(self.ZOOM_STEP))
+        self.zoom_out_button = app._button(zoom, "\u2212", lambda: self.zoom(1 / self.ZOOM_STEP))
+        self.fit_button = app._button(zoom, "Fit", self.fit)
+        for button in (self.zoom_in_button, self.zoom_out_button, self.fit_button):
+            button.configure(width=3, padx=4, pady=1, cursor="hand2")
+            button.pack(side="left", padx=(3, 0))
         self.canvas.bind("<Button-3>", lambda e: self._undo_waypoint())
         self.canvas.bind("<Configure>", lambda e: self.refresh(force=True))
 
@@ -770,8 +799,9 @@ class PathWindow:
         self.status_var = tk.StringVar(value="")
         tk.Label(info, textvariable=self.pos_var, bg=BG, fg=TEXT, font=(FONT, 10, "bold"), justify="left").pack(anchor="w")
         tk.Label(info, textvariable=self.status_var, bg=BG, fg=MUTED, font=(FONT, 10)).pack(anchor="w")
-        tk.Label(info, text="Click the map to plan waypoints (right-click removes the last one). Drive by hand and the "
-                            "path is recorded.", bg=BG, fg=MUTED, font=(FONT, 9), wraplength=550, justify="left").pack(anchor="w")
+        tk.Label(info, text="Click the map to plan waypoints (right-click removes the last one). Two fingers apart or together "
+                            "zoom, two fingers moving drag the map. Drive by hand and the path is recorded.", bg=BG, fg=MUTED, font=(FONT, 9),
+                 wraplength=550, justify="left").pack(anchor="w")
 
         row1 = tk.Frame(win, bg=BG)
         row1.pack(fill="x", padx=12, pady=(8, 0))
@@ -793,6 +823,8 @@ class PathWindow:
         entry.bind("<Return>", lambda e: self.apply_speed())
         entry.bind("<FocusOut>", lambda e: self.apply_speed())
         app._button(row2, f"Test drive {TEST_DRIVE_S:.0f} s (calibrate)", app.path_test_drive).pack(side="left", padx=6)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        self._hook_touch()
 
     # -- how paths are driven (see helpers/path_settings.py) --
     SETTING_ROWS = (
@@ -851,7 +883,74 @@ class PathWindow:
 
     def close(self):
         self.app.path_window = None
+        self.release_touch()
         self.win.destroy()
+
+    # -- the touchpad --
+    def _hook_touch(self):
+        try:
+            self.canvas.update_idletasks()
+            self.touch = touchpad.TouchHook(self.canvas.winfo_id())
+        except OSError:
+            self.touch = None                    # Tk's own events are used then (no sideways scrolling)
+        else:
+            self.win.after(self.TOUCH_POLL_MS, self._touch_loop)
+
+    def release_touch(self):
+        if self.touch is not None:
+            self.touch.detach()
+            self.touch = None
+
+    def _touch_loop(self):
+        if self.touch is None:
+            return
+        self._poll_touch()
+        self.win.after(self.TOUCH_POLL_MS, self._touch_loop)
+
+    def _poll_touch(self):
+        """Apply the gestures that have arrived since the last look."""
+        if self.touch is None:
+            return
+        events = self.touch.take()
+        if not events:
+            return
+        left, top = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
+        lines = []
+        for sideways, ctrl, delta, x, y in events:
+            self._gesture(sideways, ctrl, delta, x - left, y - top)
+            lines.append(f"{'sideways' if sideways else 'vertical'} {delta:+d}{' with Ctrl' if ctrl else ''} -> "
+                         f"{'zoom' if ctrl else 'drag'}")
+        self._log_touch(lines)
+
+    def _log_touch(self, lines):
+        try:
+            if self.touch_log.exists() and self.touch_log.stat().st_size > self.TOUCH_LOG_BYTES:
+                self.touch_log.unlink()
+        except OSError:
+            pass
+        for line in lines:
+            append_log(self.touch_log, line)
+
+    def _gesture(self, sideways, ctrl, delta, x, y):
+        """One scroll from the touchpad (or a wheel) at the pixel (x, y). With Ctrl it is a pinch: zoom. Otherwise two fingers
+        moving together: the map is dragged with them (scrolling up moves it down, scrolling right moves it left)."""
+        if ctrl:
+            self.zoom(self.PINCH_STEP ** (delta / 120.0), at=(x, y))
+        elif sideways:
+            self._two_finger_move(-delta * self.PAN_PX, 0)
+        else:
+            self._two_finger_move(0, delta * self.PAN_PX)
+
+    def _pinch(self, event):
+        self._gesture(False, True, event.delta, event.x, event.y)
+
+    def _two_finger_move(self, dx, dy):
+        """Drag the map by (dx, dy) pixels."""
+        if self.tf is None:
+            return
+        cx, cy, scale, w, h = self.tf
+        self.view = (cx - dx / scale, cy + dy / scale, min(w, h) / 2 / scale)
+        self.refresh(force=True)
 
     def apply_speed(self):
         try:
@@ -877,6 +976,41 @@ class PathWindow:
         self.waypoints.append((cx + (event.x - w / 2) / scale, cy - (event.y - h / 2) / scale))
         self.refresh(force=True)
 
+    # -- looking around the map --
+    def zoom(self, factor, at=None):
+        """Magnify the map by `factor` (less than 1 = out) about the pixel `at`, which stays where it is; else the middle."""
+        if self.tf is None:
+            return
+        cx, cy, scale, w, h = self.tf
+        x, y = at if at is not None else (w / 2, h / 2)
+        place = cx + (x - w / 2) / scale, cy - (y - h / 2) / scale
+        half = min(max(min(w, h) / 2 / scale / factor, self.CLOSEST_CM), self.FARTHEST_CM)
+        new = min(w, h) / 2 / half
+        self.view = (place[0] - (x - w / 2) / new, place[1] + (y - h / 2) / new, half)
+        self.refresh(force=True)
+
+    def fit(self):
+        self.view = None
+        self.refresh(force=True)
+
+    def _press(self, event):
+        self._held = None if self.tf is None else (event.x, event.y, self.tf, False)
+
+    def _drag(self, event):
+        if self._held is None:
+            return
+        x, y, (cx, cy, scale, w, h), dragged = self._held
+        if not dragged and max(abs(event.x - x), abs(event.y - y)) < self.DRAG_PX:
+            return
+        self._held = (x, y, (cx, cy, scale, w, h), True)
+        self.view = (cx - (event.x - x) / scale, cy + (event.y - y) / scale, min(w, h) / 2 / scale)
+        self.refresh(force=True)
+
+    def _release(self, event):
+        held, self._held = self._held, None
+        if held is not None and not held[3]:             # it never became a drag: a click, which places a point
+            self._click(event)
+
     @staticmethod
     def _grid_step(span):
         for step in (5, 10, 20, 25, 50, 100, 200, 250, 500, 1000):
@@ -896,6 +1030,8 @@ class PathWindow:
         ys = [p[1] for p in pts] + [y for _, y in self.waypoints] + [tr.y]
         cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
         half = max((max(max(xs) - min(xs), max(ys) - min(ys))) / 2 * 1.2, 60.0)
+        if self.view is not None:                        # zoomed or dragged: it stays where it was put
+            cx, cy, half = self.view
         scale = min(w, h) / 2 / half
         self.tf = (cx, cy, scale, w, h)
 
