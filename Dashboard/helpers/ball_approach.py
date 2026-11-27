@@ -123,8 +123,9 @@ class Approach:
     FRAME_AFTER_S = 0.3
     READING_AFTER_S = 0.5
     NO_BALL_S = 3.0                 # standing still this long without seeing the ball = lost
-    FRAME_STALE_S = 1.5
-    FRAME_RESUME_S = 3.0            # the camera link often drops while the motors run: after a motion it gets this long to come back
+    FRAME_STALE_S = 1.5             # no new picture for this long: the camera is pausing, so wait and judge nothing
+    CAMERA_WAIT_S = 10.0            # the Wi-Fi camera pauses now and then; with the car standing still, wait this long for it
+    VERIFY_LOOK_S = 0.8             # the pick is judged only after watching this long without a pause
     READING_STALE_S = 2.0
     MAX_DECISIONS = 25
     MAX_TIME_S = 90.0
@@ -162,6 +163,9 @@ class Approach:
         self._now, self._pressed = 0.0, 0.0         # the latest tick, and when Collect was pressed (for the log)
         self._motion = None                         # (kind, value, telemetry before) of a motion whose result is not logged yet
         self._last_ball = None                      # the last steady ball seen, for the log
+        self._paused_since = None                   # the camera has been silent since then (the car is standing still)
+        self._eyes_since = float("-inf")            # the camera came back from a pause then: "no ball" counts only from here
+        self._look_from = None                      # the first picture of an unbroken look at the floor after the pick
 
     # -- control --
     def start(self, now):
@@ -172,6 +176,7 @@ class Approach:
         self._last_ball_seen, self._decisions, self.attempts = now, 0, 1
         self._recoveries, self._drove_forward = 0, False
         self._now, self._pressed, self._motion, self._last_ball = now, now, None, None
+        self._paused_since, self._eyes_since, self._look_from = None, float("-inf"), None
         return True
 
     def abort(self, reason, show=True):
@@ -219,18 +224,25 @@ class Approach:
             return
         if self.player.ok:
             self._state, self._verify_since, self.status = "verifying", now, "Checking the pick"
+            self._look_from = None
         else:
             self.abort(self.player.status)
 
     def _tick_verifying(self, now):
         """The move is done. A ball still lying on the floor means it missed (or rolled away): back up and try again."""
-        if now < self._verify_since + self.VERIFY_S:
-            return
         if self._camera_dead(now, self._verify_since):
             return self.abort("no new camera frame")
+        if self._camera_paused(now, self._verify_since):
+            self._look_from = None                   # start looking again when it is back
+            return
         frame = self.world.frame_stamp()
         if frame is None or frame < self._verify_since + self.FRAME_AFTER_S:
             return                                   # no picture taken since the move: "no ball seen" would prove nothing
+        if self._look_from is None:
+            self._look_from = frame
+        if now < self._verify_since + self.VERIFY_S or frame - self._look_from < self.VERIFY_LOOK_S:
+            return
+        self.status = "Checking the pick"
         seen = self.world.balls_seen_since(self._verify_since + self.FRAME_AFTER_S)
         found = "a ball is still on the floor" if seen >= self.MISS_FRAMES else "no ball left on the floor"
         self.log.append(f"  check  : {found} (seen in {seen} pictures after the move)")
@@ -247,14 +259,28 @@ class Approach:
         self._state = "moving"
         self.status = f"Missed: backing up, attempt {self.attempts} of {self.MAX_ATTEMPTS}"
 
-    def _camera_dead(self, now, since):
-        """No camera result for too long. `since` is when the car last stood still: a pause before that is not held against the
-        camera (it drops out while driving), but it must be back within FRAME_RESUME_S of the car stopping."""
+    def _silent_for(self, now, since):
+        """Seconds without a camera picture, counted from `since` (when the car last stood still: it is not held against the
+        camera that it drops out while the car drives)."""
         frame = self.world.frame_stamp()
-        last = self._started if frame is None else frame
-        if last < since:
-            return now - since > self.FRAME_RESUME_S
-        return now - last > self.FRAME_STALE_S
+        return now - max(self._started, since, self._started if frame is None else frame)
+
+    def _camera_dead(self, now, since):
+        return self._silent_for(now, since) > self.CAMERA_WAIT_S
+
+    def _camera_paused(self, now, since):
+        """True while there is no fresh picture to judge by (the car stays where it is). Writes the longer pauses in the log."""
+        silent = self._silent_for(now, since)
+        if silent > self.FRAME_STALE_S:
+            if self._paused_since is None:
+                self._paused_since = now - silent
+                self.log.append(f"  waiting: no camera picture for {silent:.1f} s, the car stands still")
+                self.status = "Waiting for the camera"
+            return True
+        if self._paused_since is not None:
+            self.log.append(f"  waiting: the camera is back after {now - self._paused_since:.1f} s")
+            self._paused_since, self._eyes_since = None, now
+        return False
 
     def _tick_deciding(self, now):
         if self._camera_dead(now, self._ready_since):
@@ -262,12 +288,14 @@ class Approach:
         reading = self.world.reading()
         if now - (self._started if reading is None else reading.stamp) > self.READING_STALE_S:
             return self.abort("no distance readings")
+        if self._camera_paused(now, self._ready_since):
+            return
         ball = self.world.ball()
         if ball is not None:
             self._last_ball_seen = now
         elif self._too_close(now, reading):
             return self._back_up_to_look(now, reading.cm)
-        elif now - max(self._last_ball_seen, self._ready_since) > self.NO_BALL_S:      # counted from when the car stood still
+        elif now - max(self._last_ball_seen, self._ready_since, self._eyes_since) > self.NO_BALL_S:   # while standing, and seeing
             if self._drove_forward and self._recoveries < self.MAX_RECOVERS:
                 return self._back_up_to_look(now, None)       # we drove at it and now cannot see it: probably right under the nose
             return self.abort("lost the ball")
@@ -288,7 +316,8 @@ class Approach:
         closer than the pick range, for long enough that it is not just a flicker."""
         return (reading is not None and reading.cm is not None and reading.cm < self.spot.pick_min
                 and reading.stamp >= self._ready_since + self.READING_AFTER_S
-                and now - max(self._ready_since, self._started) >= self.BLIND_WAIT_S and self._recoveries < self.MAX_RECOVERS)
+                and now - max(self._ready_since, self._started, self._eyes_since) >= self.BLIND_WAIT_S
+                and self._recoveries < self.MAX_RECOVERS)
 
     def _back_up_to_look(self, now, cm):
         """Reverse so the ball comes back into the camera's view. `cm` = the close sensor reading, None when the ball is just lost."""

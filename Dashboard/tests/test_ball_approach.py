@@ -383,7 +383,8 @@ class ApproachTest(unittest.TestCase):
         self.approach.tick(self.now)
         self.assertTrue(self.approach.active)                         # no picture since the move: it cannot say "picked" yet, so it waits
         self.assertIsNone(self.approach.ok)
-        self.now += 1.5
+        self.now += 9.0
+        self.world.reading_value = Reading(16.2, self.now)
         self.approach.tick(self.now)
         self.assertFalse(self.approach.active)                        # and gives up if the camera does not come back
         self.assertIn("camera", self.approach.status)
@@ -553,7 +554,8 @@ class ApproachTest(unittest.TestCase):
         self.see(40)
         self.approach.start(0.0)
         self.world.frame = -2.0
-        self.approach.tick(0.7)
+        self.world.reading_value = Reading(40, 10.5)
+        self.approach.tick(10.5)
         self.assertIn("camera", self.approach.status)
         self.assertEqual(self.car.kinds().count("stop"), 1)
         self.setUp()
@@ -588,10 +590,76 @@ class ApproachTest(unittest.TestCase):
         self.world.frame = 0.7
         self.car.finish_motion()
         self.approach.tick(5.0)
-        self.world.reading_value = Reading(25, 8.0)
-        self.approach.tick(8.2)                                       # 3.2 s after the car stopped and still no picture
+        self.world.reading_value = Reading(25, 15.2)
+        self.approach.tick(15.4)                                      # over 10 s after the car stopped and still no picture
         self.assertFalse(self.approach.active)
         self.assertIn("camera", self.approach.status)
+
+    # -- the Wi-Fi camera pauses now and then (seen on the car: 2.7 s with the car standing still) --
+    def stand_still_then_lose_the_camera(self, seconds, ball=True):
+        """A hop ends at t = 5.0, one picture arrives, then nothing for `seconds` while the distance readings carry on."""
+        self.see(40, at=0.0)
+        self.approach.start(0.0)
+        self.approach.tick(0.7)
+        self.car.finish_motion()
+        self.approach.tick(5.0)
+        self.world.frame = 5.4
+        self.world.ball_value = Ball(0.5, 300.0, 5.4) if ball else None
+        t = 5.4
+        while t < 5.4 + seconds:
+            t = round(t + 0.1, 1)
+            self.world.reading_value = Reading(25, t)
+            if t < 5.7:                                               # not yet long enough to decide on that one picture
+                continue
+            self.world.ball_value = None if not ball else self.world.ball_value
+            self.approach.tick(t)
+        self.now = t
+
+    def test_a_camera_pause_while_the_car_stands_still_is_waited_out(self):
+        self.stand_still_then_lose_the_camera(2.7, ball=False)
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.assertIn("Waiting for the camera", self.approach.status)
+        self.assertEqual(len(self.drives()), 1)                       # it does not move without a picture
+        self.see(25)
+        self.advance(1.0)                                             # the camera is back
+        self.assertEqual(len(self.drives()), 2)
+
+    def test_a_pause_is_not_counted_as_a_lost_ball(self):
+        self.stand_still_then_lose_the_camera(6.0, ball=False)
+        self.world.reading_value = Reading(25, self.now)
+        self.advance(2.0)                                             # pictures again, the ball not found in them yet
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.assertEqual(len(self.drives()), 1)                       # nor does it back up for a ball it "lost" in the pause
+        self.see(25)
+        self.advance(1.0)
+        self.assertEqual(len(self.drives()), 2)
+
+    def test_the_log_says_when_it_waited_for_the_camera(self):
+        self.stand_still_then_lose_the_camera(2.7, ball=False)
+        self.see(25)
+        self.advance(1.0)
+        self.assertEqual(self.text().count("waiting: no camera picture"), 1)
+        self.assertIn("waiting: the camera is back after", self.text())
+
+    def test_a_camera_that_does_not_come_back_ends_the_run(self):
+        self.stand_still_then_lose_the_camera(11.0, ball=False)
+        self.assertFalse(self.approach.active)
+        self.assertIn("no new camera frame", self.approach.status)
+        self.assertEqual(len(self.drives()), 1)
+
+    def test_one_picture_after_a_pause_is_not_enough_to_call_it_picked(self):
+        self.go(16.2)
+        self.player.finish(True)
+        self.advance(0.1)
+        self.world.ball_value = None
+        self.now += 4.0                                               # silence
+        self.world.reading_value = Reading(16.2, self.now)
+        self.approach.tick(self.now)
+        self.world.frame = self.now                                   # a single picture, no ball in it
+        self.approach.tick(self.now)
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.advance(1.5)
+        self.assertIs(self.approach.ok, True)
 
     def test_limits(self):
         self.see(40)
