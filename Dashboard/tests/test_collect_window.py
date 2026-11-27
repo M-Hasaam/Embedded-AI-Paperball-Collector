@@ -297,7 +297,9 @@ class WheelReadingTest(unittest.TestCase):
     def test_the_dashboard_keeps_the_newest_wheel_distances(self):
         text = types.SimpleNamespace(set=lambda value: None)
         app = types.SimpleNamespace(_enc_ignore_until=0.0, tracker=types.SimpleNamespace(feed_encoder=lambda avg, stamp: None),
-                                    enc_dist_var=text, enc_speed_var=text, enc_wheels_var=text, wheel_cm=None)
+                                    enc_dist_var=text, enc_speed_var=text, enc_wheels_var=text, wheel_cm=None,
+                                    odometer=dashboard.Odometer(), path_settings=dashboard.PathSettings(), drive_state=0)
+        app.tracker.cmd = "S"
         dashboard.Dashboard._show_encoder(app, 12.5, 13.0, 0.0, 0.0, 5.0)
         self.assertEqual(app.wheel_cm, (12.5, 13.0))
 

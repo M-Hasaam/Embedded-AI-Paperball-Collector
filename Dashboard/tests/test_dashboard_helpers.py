@@ -577,32 +577,5 @@ class RemainingAheadTest(unittest.TestCase):
         self.assertAlmostEqual(dashboard.remaining_along_heading(0, 0, 0, 0, -2), -2.0)     # already passed
 
 
-class RunnerMoveArrivalTest(unittest.TestCase):
-    def runner_with(self, step, y, cmd):
-        stub = types.SimpleNamespace(x=0.0, y=y, cmd=cmd, cm_per_s_100=30.0, corners=[], heading_now=lambda now: 0.0)
-        sent = []
-        runner = dashboard.PathRunner(stub, sent.append, lambda: 100, lambda: None)
-        runner.log_file = Path(tempfile.gettempdir()) / "moves_test_runner_log.txt"
-        runner.active, runner.steps, runner.idx = True, [step], 0
-        runner.state, runner.until, runner.move_from, runner.coast_cm = "moving", 1e9, (0.0, 0.0), 10.0
-        return runner, stub, sent
-
-    def test_runner_stops_backward_move_at_target(self):
-        runner, stub, sent = self.runner_with(["move", -20.0, 0.0, -20.0], -5.0, "D")
-        runner.tick(1.0, 0.0)
-        self.assertEqual(sent, [])                      # still 15 cm from the target: keep reversing
-        stub.y = -15.0                                  # within the coast distance of the target
-        runner.tick(2.0, 0.0)
-        self.assertEqual(sent, ["S"])
-
-    def test_runner_still_stops_forward_move_at_target(self):
-        runner, stub, sent = self.runner_with(["move", 20.0, 0.0, 20.0], 5.0, "U")
-        runner.tick(1.0, 0.0)
-        self.assertEqual(sent, [])
-        stub.y = 15.0
-        runner.tick(2.0, 0.0)
-        self.assertEqual(sent, ["S"])
-
-
 if __name__ == "__main__":
     unittest.main()

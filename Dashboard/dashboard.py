@@ -40,6 +40,8 @@ from helpers.elbow_limit import elbow_window
 from helpers.floor import Floor, dot_offset, load_zero, save_zero, tilt_words
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
 from helpers.mpu_log import MpuLog
+from helpers.path_settings import (ASSISTS, SPEEDS, TRUSTS, Odometer, PathSettings, load_settings, save_settings,
+                                   wheels_disagree)
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
 from helpers.sensor_watch import SensorWatch
@@ -109,6 +111,7 @@ ENCODER_LIVE_S = 1.0              # encoder data older than this is treated as m
 ENCODER_MAX_JUMP_CM = 1000.0      # sanity limit only: a car reboot disconnects BLE, which already resets the baseline.
                                   # (60 cm used to drop real driving when BLE notifications were delayed for ~1 s)
                                   # (if the wheels only hum, the dashboard raises these by itself - stall detection)
+MIN_FAST_CM = 10.0                # a fast part shorter than this is not worth it: it overshoots (3 cm at 100% went 8)
 BACK_SPEED_RATIO = 1.0            # reverse speed / forward speed (measure it: a 10% gap = ~5% error on the way home)
 TEST_DRIVE_S = 3.0                # length of the calibration drive
 SERVO_SEND_INTERVAL = 0.06        # seconds between live commands while dragging
@@ -494,63 +497,78 @@ def servo_commands(index, angle, speed, last_angle=None):
 class PathRunner:
     """Drives a list of steps on its own, re-aiming before every leg.
 
-    Steps: ["goto", x, y]          turn towards the point (gyro), then drive forward until the estimate reaches it
+    Steps: ["goto", x, y]          turn towards the point (gyro), then drive until the estimate is there
            ["turn_to", heading]    in-place turn: the car turns itself by the angle (Y command, closed loop on its gyro)
-           ["move", cm, tx, ty]    (made from a goto) forward drive; tx/ty let it stop when the estimate arrives
-    tick(now, gz) must be called every ~30 ms; send(cmd) sends a drive command to the car.
+           ["move", cm, x, y]      (made from a goto) the straight drive to the point, in one or more drives
+    The car stops each drive by itself on its wheel encoders (the M command), so no Bluetooth delay makes it run past: fast
+    while far from the point, slow for the last part (see helpers/path_settings.py). tick(now, gz) must be called every ~30 ms.
+    car: drive(cm, pct, assist), cancel(), drive_busy(), drive_ok(), drive_why(), wheels(). send(cmd) sends other commands.
     """
-    TURN_TOL_DEG = 2.0
+    TURN_TOL_DEG = 2.0          # for a single turn (the buttons, Collect, Moves); a path takes its tolerance from the settings
     SETTLE_S = 0.45             # wait for the car to stop before judging a turn
+    DRIVE_SETTLE_S = 0.45       # ... and for the last wheel readings after a drive
     MAX_CORRECTIONS = 2         # the car already turns to within about 1.5 degrees; this only catches a missed turn
+    MAX_DRIVES = 4              # drives towards one point before it is left as it is
     TURN_TIMEOUT_S = 15.0
-    GOTO_TOL_CM = 3.0
     TURN_MOVING_DPS = 10.0      # the car counts as turning faster than this ...
     TURN_QUIET_S = 0.35         # ... and as done once it has been slower than that for this long
+    SAMPLE_S = 0.5              # while a drive runs, the log gets a line this often
 
-    def __init__(self, tracker, send, get_speed, get_dist, on_finish=None):
-        self.tracker, self.send = tracker, send
-        self.get_speed, self.get_dist = get_speed, get_dist
+    def __init__(self, tracker, send, get_dist, car=None, get_settings=PathSettings, on_finish=None):
+        self.tracker, self.send, self.get_dist = tracker, send, get_dist
+        self.car, self.get_settings = car, get_settings
         self.on_finish = on_finish
         self.active = False
         self.status = "Idle"
         self.label = ""
+        self.path = False                # a planned path or the way back (not a single turn)
         self.steps, self.idx, self.state = [], 0, "idle"
         self.legs_done = self.legs_total = 0
         self.last_turn_error = None
         self.turn_started, self.turn_moved, self.quiet_since = 0.0, False, None
-        self.coast_cm = 10.0            # how far the car rolls on after a stop command; learned from every leg (it was 10-15 cm)
-        self.stop_at = None             # where the stop command for the leg was sent
-        self.log_file = data_file("path_runner_log.txt")   # one line per step, to see where a return goes wrong
-        self.move_from = None
+        self.started = self.sample_at = 0.0
+        self.target = None               # the point the car is driving to
+        self.drives, self.reversed = 0, False
+        self.drive_cm, self.drive_from = 0.0, None
+        self.log_file = data_file("path_runner_log.txt")   # everything a path did, to see where it goes wrong
 
     def _log(self, now, text):
         tr = self.tracker
         try:
             with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(f"{now:9.2f}  pos=({tr.x:7.1f},{tr.y:7.1f}) heading={tr.heading_now(now):7.1f}  {text}\n")
+                f.write(f"{time.strftime('%H:%M:%S')} {now:9.2f}  pos=({tr.x:7.1f},{tr.y:7.1f}) "
+                        f"heading={tr.heading_now(now):7.1f}  {text}\n")
         except OSError:
             pass
 
     def _begin_turn(self, now, target):
         """Ask the car to turn by the remaining angle on its own (it runs the loop on its gyro, no Bluetooth delay)."""
         err = wrap180(target - self.tracker.heading_now(now))
-        self._log(now, f"TURN start: to {target:.1f}, error {err:.1f} (the car turns by itself: Y{err:.1f})")
-        self.send(f"Y{err:.1f}")
+        extra = self.get_settings().turn_extra_deg if self.path else 0.0        # the car stops about this much short
+        asked = err + math.copysign(extra, err)
+        self._log(now, f"TURN start: to {target:.1f}, error {err:.1f} (the car turns by itself: Y{asked:.1f})")
+        self.send(f"Y{asked:.1f}")
         self.turn_started, self.turn_moved, self.quiet_since = now, False, None
+        self.turn_from = self.tracker.heading_now(now)
         self.state = "fwturn"
 
-    def start(self, steps, label, now):
+    def _turn_tolerance(self):
+        return self.get_settings().turn_within_deg if self.path else self.TURN_TOL_DEG
+
+    def start(self, steps, label, now, path=False):
         if not steps:
             self.status = f"{label}: nothing to do"
             return False
         self.steps = [list(s) for s in steps]
-        self.idx, self.label, self.state = 0, label, "next"
+        self.idx, self.label, self.state, self.path = 0, label, "next", path
         self.legs_done, self.legs_total = 0, sum(1 for s in steps if s[0] == "goto")
-        self.last_turn_error = None
+        self.last_turn_error, self.target, self.started = None, None, now
         self.active = True
         self.status = f"{label}: starting"
         self._log(now, f"START {label}: " + ", ".join(
             "goto(%.0f,%.0f)" % (s[1], s[2]) if s[0] == "goto" else "%s(%.0f)" % (s[0], s[1]) for s in steps))
+        if path:
+            self._log(now, f"SETTINGS {self.get_settings().describe()}")
         return True
 
     def abort(self, reason):
@@ -558,33 +576,101 @@ class PathRunner:
             return
         self._log(time.monotonic(), f"ABORT: {reason}")
         self.active, self.state = False, "idle"
+        self.tracker.set_command("S")
         self.send("S")
         self.status = f"{self.label} stopped: {reason}"
         if self.on_finish:
             self.on_finish(False)
 
-    def _finish(self):
+    def _finish(self, now):
         self.active, self.state = False, "idle"
         self.send("S")
         extra = f" (turn error {self.last_turn_error:+.1f}°)" if self.last_turn_error is not None else ""
         self.status = f"{self.label}: done{extra}"
+        if self.path:
+            end = "" if self.target is None else (f"; ended {math.hypot(self.target[0] - self.tracker.x, self.target[1] - self.tracker.y):.1f}"
+                                                  f" cm from the last point")
+            self._log(now, f"DONE {self.label} in {now - self.started:.1f} s{end}")
         if self.on_finish:
             self.on_finish(True)
+
+    # -- driving to a point --
+    def _remaining(self, now):
+        tr = self.tracker
+        return remaining_along_heading(tr.x, tr.y, tr.heading_now(now), *self.target)
+
+    def _next_drive(self, now):
+        """The next straight drive towards the point, or the end of this leg."""
+        s = self.get_settings()
+        left = self._remaining(now)
+        if abs(left) <= s.arrive_cm or (left < 0 and self.reversed) or self.drives >= self.MAX_DRIVES:
+            return self._end_leg(now, left)
+        if left < 0:
+            self.reversed = True                       # went past: back up once
+            kind, cm, pct = "back", left, s.slow_pct
+        elif left - s.slow_within_cm >= max(MIN_FAST_CM, s.arrive_cm):
+            kind, cm, pct = "fast", left - s.slow_within_cm, s.fast_pct
+        else:
+            kind, cm, pct = "slow", left, s.slow_pct
+        if self.drives == 0:
+            self.tracker.set_command("U")              # the map: one straight stretch, its end becomes a corner
+        self.drive_cm, self.drive_from = cm, self.car.wheels()
+        if not self.car.drive(round(cm, 1), pct, s.assist_mode()):
+            return self.abort("could not start the drive")
+        self.drives += 1
+        self.state, self.sample_at = "driving", now + self.SAMPLE_S
+        self._log(now, f"DRIVE {kind}: {cm:.1f} cm at {pct}% ({left:.1f} cm to the point, straight assist {s.assist})")
+
+    def _wheel_change(self):
+        now = self.car.wheels()
+        if now is None or self.drive_from is None:
+            return None
+        return now[0] - self.drive_from[0], now[1] - self.drive_from[1]
+
+    def _log_drive_end(self, now):
+        change = self._wheel_change()
+        text = f"DRIVE end: asked {self.drive_cm:.1f} cm"
+        s = self.get_settings()
+        if change is not None:
+            text += f", wheels L {change[0]:+.1f} R {change[1]:+.1f} cm"
+        text += f", now {self._remaining(now):.1f} cm to the point"
+        if change is not None and wheels_disagree(*change, s):
+            believed = "the lower count" if s.trust == "lower" else f"the {s.trust} wheel"
+            text += f"; THE WHEELS DISAGREE (trusting {believed})"
+        self._log(now, text)
+
+    def _end_leg(self, now, left):
+        tr = self.tracker
+        tr.set_command("S")
+        tr.settle_corner()                             # the car is standing still: the corner is where it is
+        away = math.hypot(self.target[0] - tr.x, self.target[1] - tr.y)
+        reached = abs(left) <= self.get_settings().arrive_cm
+        word = f"reached: {away:.1f} cm from it" if reached else f"still {away:.1f} cm from it"
+        self._log(now, f"POINT {self.legs_done} of {self.legs_total} {word} ({left:+.1f} cm along the way) after {self.drives} drives")
+        if self.label == "Return" and len(tr.corners) >= 2:
+            # The car has reached this corner of the way back: it is no longer part of the route still to undo. If the return
+            # is stopped (an obstacle, the stop button) and started again, it carries on from here instead of driving back to
+            # corners it has already passed.
+            tr.corners.pop()
+        self.idx += 1
+        self.state = "next"
 
     def tick(self, now, gz):
         if not self.active:
             return
-        tr, tol = self.tracker, self.TURN_TOL_DEG
+        tr = self.tracker
         if self.state == "next":
             if self.idx >= len(self.steps):
-                self._finish()
+                self._finish(now)
                 return
             step = self.steps[self.idx]
             if step[0] == "goto":                      # re-aim from where the car is now
                 dx, dy = step[1] - tr.x, step[2] - tr.y
                 dist = math.hypot(dx, dy)
                 self.legs_done += 1
-                if dist < self.GOTO_TOL_CM:
+                self.target = (step[1], step[2])
+                if dist <= self.get_settings().arrive_cm:
+                    self._log(now, f"POINT {self.legs_done} of {self.legs_total} already reached: {dist:.1f} cm from it")
                     self.idx += 1
                     return
                 bearing = math.degrees(math.atan2(-dx, dy))      # 0 = up, + = left
@@ -593,43 +679,39 @@ class PathRunner:
                 self.status = f"{self.label}: leg {self.legs_done}/{self.legs_total}"
                 return
             if step[0] == "move":
-                v = tr.cm_per_s_100 * self.get_speed() / 100.0 * (1.0 if step[1] > 0 else BACK_SPEED_RATIO)
-                if v <= 0:
-                    self.abort("speed is 0")
-                    return
-                self.move_from = (tr.x, tr.y)
-                self._log(now, f"MOVE start: {step[1]:.1f} cm, time limit {abs(step[1]) / v * (1.0 if len(step) < 4 else 1.6):.1f} s")
-                self.send("U" if step[1] > 0 else "D")
-                self.until = now + abs(step[1]) / v * (1.0 if len(step) < 4 else 1.6)
-                self.state = "moving"
+                self.target = (step[2], step[3])
+                self.drives, self.reversed = 0, False
+                self._next_drive(now)
             else:                                      # turn_to
                 err = wrap180(step[1] - tr.heading_now(now))
-                if abs(err) <= tol:
+                if abs(err) <= self._turn_tolerance():
                     self.last_turn_error = err
                     self.idx += 1
                     return
                 self.corrections = 0
                 self._begin_turn(now, step[1])
-        elif self.state == "moving":
-            step = self.steps[self.idx]
-            if tr.cmd == "U":
+        elif self.state == "driving":
+            if self.drive_cm > 0:
                 d = self.get_dist()
                 if d is not None and d < DIST_STOP_CM:
-                    self.abort("obstacle ahead")
-                    return
-            arrived = now >= self.until
-            if len(step) >= 4:                         # stop when the car will roll to the target point (stop early by the coast)
-                ahead = remaining_along_heading(tr.x, tr.y, tr.heading_now(now), step[2], step[3])
-                margin = max(0.5, self.coast_cm)
-                if (step[1] > 0 and ahead <= margin) or (step[1] < 0 and ahead >= -margin):   # forward, or reversing
-                    arrived = True
-            if arrived:
-                why = "time limit" if now >= self.until else "reached the point"
-                went = math.hypot(tr.x - self.move_from[0], tr.y - self.move_from[1]) if self.move_from else 0.0
-                self._log(now, f"MOVE end ({why}): travelled {went:.1f} cm of {abs(step[1]):.1f}")
-                self.stop_at = (tr.x, tr.y)
-                self.send("S")
-                self.state, self.settle_until, self.after_settle = "settle", now + self.SETTLE_S, "advance"
+                    self._log_drive_end(now)
+                    return self.abort("obstacle ahead")
+            if self.car.drive_busy():
+                if now >= self.sample_at:
+                    self.sample_at = now + self.SAMPLE_S
+                    change = self._wheel_change()
+                    wheels = "" if change is None else f"wheels L {change[0]:+.1f} R {change[1]:+.1f} cm since this drive began"
+                    self._log(now, f"  driving: {wheels}")
+                return
+            if not self.car.drive_ok():
+                self._log_drive_end(now)
+                self.abort(f"the drive did not finish: {self.car.drive_why()}")
+                return
+            self.state, self.settle_until = "drive_settle", now + self.DRIVE_SETTLE_S
+        elif self.state == "drive_settle":
+            if now >= self.settle_until:
+                self._log_drive_end(now)
+                self._next_drive(now)
         elif self.state == "fwturn":                   # the car is turning itself: wait until it has stopped
             if now - self.turn_started > self.TURN_TIMEOUT_S:
                 self.abort("turn timed out")
@@ -641,30 +723,21 @@ class PathRunner:
                     self.quiet_since = now
                 elif now - self.quiet_since >= self.TURN_QUIET_S:
                     self._log(now, "TURN car stopped")
-                    self.state, self.settle_until, self.after_settle = "settle", now + self.SETTLE_S, "check"
+                    self.state, self.settle_until = "settle", now + self.SETTLE_S
         elif self.state == "settle":
             if now < self.settle_until:
                 return
-            if self.after_settle == "check":
-                err = wrap180(self.steps[self.idx][1] - tr.heading_now(now))
-                if abs(err) > tol * 1.5 and self.corrections < self.MAX_CORRECTIONS:
-                    self.corrections += 1
-                    self._log(now, f"TURN check: error {err:.1f} -> correction {self.corrections}")
-                    self._begin_turn(now, self.steps[self.idx][1])
-                    return
-                self._log(now, f"TURN done: error {err:.1f}" + ("  (ACCEPTED after the corrections ran out)" if abs(err) > tol * 1.5 else ""))
-                self.last_turn_error = err
-            elif self.stop_at is not None:             # a drive just stopped: how far did it roll on? (smoothed)
-                rolled = math.hypot(tr.x - self.stop_at[0], tr.y - self.stop_at[1])
-                self.coast_cm = min(25.0, max(0.0, 0.5 * self.coast_cm + 0.5 * rolled))
-                self._log(now, f"STOPPED: rolled on {rolled:.1f} cm, coast estimate now {self.coast_cm:.1f} cm")
-                self.stop_at = None
-                done = self.steps[self.idx]
-                if self.label == "Return" and done[0] == "move" and len(done) >= 4 and len(tr.corners) >= 2:
-                    # The car has reached this corner of the way back: it is no longer part of the route still to undo. If the
-                    # return is stopped (an obstacle, the stop button) and started again, it carries on from here instead of
-                    # driving back to corners it has already passed.
-                    tr.corners.pop()
+            tol = self._turn_tolerance()
+            err = wrap180(self.steps[self.idx][1] - tr.heading_now(now))
+            if abs(err) > tol * 1.5 and self.corrections < self.MAX_CORRECTIONS:
+                self.corrections += 1
+                self._log(now, f"TURN check: error {err:.1f} -> correction {self.corrections}")
+                self._begin_turn(now, self.steps[self.idx][1])
+                return
+            turned = wrap180(tr.heading_now(now) - self.turn_from)
+            self._log(now, f"TURN done: error {err:.1f}" + ("  (ACCEPTED after the corrections ran out)" if abs(err) > tol * 1.5 else "")
+                      + f", the last turn moved {turned:+.1f} deg by the gyro")
+            self.last_turn_error = err
             self.idx += 1
             self.state = "next"
 
@@ -677,15 +750,15 @@ class PathWindow:
         win = self.win = tk.Toplevel(app.root)
         win.title("Path map - gyro heading + wheel-encoder distance")
         win.configure(bg=BG)
-        h = min(800, win.winfo_screenheight() - 110)
+        h = min(890, win.winfo_screenheight() - 110)
         win.geometry(f"660x{h}+80+20")
-        win.minsize(520, 560)
+        win.minsize(580, 670)
         win.protocol("WM_DELETE_WINDOW", self.close)
         self.waypoints = []
         self.tf = None
         self._last_draw = 0.0
 
-        self.canvas = tk.Canvas(win, bg="#0a0e14", highlightbackground=LINE, highlightthickness=1)
+        self.canvas = tk.Canvas(win, height=180, bg="#0a0e14", highlightbackground=LINE, highlightthickness=1)
         self.canvas.pack(fill="both", expand=True, padx=12, pady=(12, 6))
         self.canvas.bind("<Button-1>", self._click)
         self.canvas.bind("<Button-3>", lambda e: self._undo_waypoint())
@@ -698,15 +771,17 @@ class PathWindow:
         tk.Label(info, textvariable=self.pos_var, bg=BG, fg=TEXT, font=(FONT, 10, "bold"), justify="left").pack(anchor="w")
         tk.Label(info, textvariable=self.status_var, bg=BG, fg=MUTED, font=(FONT, 10)).pack(anchor="w")
         tk.Label(info, text="Click the map to plan waypoints (right-click removes the last one). Drive by hand and the "
-                            "path is recorded.", bg=BG, fg=MUTED, font=(FONT, 9), wraplength=620, justify="left").pack(anchor="w")
+                            "path is recorded.", bg=BG, fg=MUTED, font=(FONT, 9), wraplength=550, justify="left").pack(anchor="w")
 
         row1 = tk.Frame(win, bg=BG)
         row1.pack(fill="x", padx=12, pady=(8, 0))
-        app._button(row1, "Return to start", app.path_return).pack(side="left")
-        app._button(row1, "Run planned path", lambda: app.path_run_plan(self.waypoints)).pack(side="left", padx=6)
+        app._button(row1, "Return to start", self._return).pack(side="left")
+        app._button(row1, "Run planned path", self._run_plan).pack(side="left", padx=6)
         app._button(row1, "ABORT", app.path_abort, danger=True).pack(side="left")
         app._button(row1, "Clear path (here = origin)", app.path_clear).pack(side="right")
         app._button(row1, "Clear plan", self.clear_plan).pack(side="right", padx=6)
+
+        self._build_settings(win)
 
         row2 = tk.Frame(win, bg=BG)
         row2.pack(fill="x", padx=12, pady=(8, 12))
@@ -718,6 +793,61 @@ class PathWindow:
         entry.bind("<Return>", lambda e: self.apply_speed())
         entry.bind("<FocusOut>", lambda e: self.apply_speed())
         app._button(row2, f"Test drive {TEST_DRIVE_S:.0f} s (calibrate)", app.path_test_drive).pack(side="left", padx=6)
+
+    # -- how paths are driven (see helpers/path_settings.py) --
+    SETTING_ROWS = (
+        ("Drive at", ("fast_pct", SPEEDS), "% until", "slow_within_cm", "cm from a point, then at", ("slow_pct", SPEEDS), "%"),
+        ("A point is reached within", "arrive_cm", "cm.  Turn if over", "turn_within_deg", "° off, asking",
+         "turn_extra_deg", "° extra"),
+        ("Wheels differ by over", "differ_cm", "cm and", "differ_pct", "%: trust the", ("trust", TRUSTS), "wheel"),
+        ("Straight assist", ("assist", ASSISTS), "(gyro is safest while a wheel counter is faulty)"),
+    )
+
+    def _build_settings(self, win):
+        # a read-only box keeps its own pale colours unless the style says otherwise: its text could not be read
+        style = ttk.Style(win)
+        style.configure("Dark.TCombobox", fieldbackground=CARD_HI, background=CARD_HI, foreground=TEXT, arrowcolor=TEXT)
+        style.map("Dark.TCombobox", fieldbackground=[("readonly", CARD_HI)], foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", CARD_HI)], selectforeground=[("readonly", TEXT)])
+        self.setting_vars = {}
+        for parts in self.SETTING_ROWS:
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", padx=12, pady=(5, 0))
+            for part in parts:
+                if isinstance(part, tuple):                      # a choice
+                    name, options = part
+                    var = self.setting_vars[name] = tk.StringVar(master=win)
+                    box = ttk.Combobox(row, textvariable=var, values=[str(o) for o in options], state="readonly",
+                                       width=max(len(str(o)) for o in options) + 1, font=(FONT, 9), style="Dark.TCombobox")
+                    box.pack(side="left", padx=3)
+                    box.bind("<<ComboboxSelected>>", lambda e: self.apply_settings())
+                elif part.endswith(("_cm", "_deg", "_pct")):     # a number
+                    var = self.setting_vars[part] = tk.StringVar(master=win)
+                    entry = tk.Entry(row, textvariable=var, width=4, justify="center", bg=CARD_HI, fg=TEXT, insertbackground=TEXT,
+                                     relief="flat", highlightthickness=1, highlightbackground=LINE)
+                    entry.pack(side="left", padx=3)
+                    entry.bind("<Return>", lambda e: self.apply_settings())
+                    entry.bind("<FocusOut>", lambda e: self.apply_settings())
+                else:
+                    tk.Label(row, text=part, bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
+        self._show_settings()
+
+    def _show_settings(self):
+        for name, var in self.setting_vars.items():
+            value = getattr(self.app.path_settings, name)
+            var.set(f"{value:g}" if isinstance(value, float) else str(value))
+
+    def apply_settings(self):
+        self.app.apply_path_settings(**{name: var.get() for name, var in self.setting_vars.items()})
+        self._show_settings()                                    # as kept: a value out of range was brought inside it
+
+    def _run_plan(self):
+        self.apply_settings()                                    # a number still being typed counts
+        self.app.path_run_plan(self.waypoints)
+
+    def _return(self):
+        self.apply_settings()
+        self.app.path_return()
 
     def close(self):
         self.app.path_window = None
@@ -1135,6 +1265,31 @@ class LevelPanel(tk.Frame):
             return
         self.words.set("flat")
         self._place(0.0, 0.0, GOOD)
+
+
+class RunnerCar:
+    """What the path runner needs from the car: its own drive by encoder distance, and the wheel counts."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def drive(self, cm, pct, assist):
+        return self.app.drive_encoder(cm, pct, assist, from_runner=True)
+
+    def drive_busy(self):
+        return self.app.drive_busy()
+
+    def drive_ok(self):
+        return not self.app.drive_failed
+
+    def drive_why(self):
+        return self.app.drive_fail_reason
+
+    def wheels(self):
+        return self.app.wheel_cm
+
+    def cancel(self):
+        self.app.drive_wait_seq = None       # the S that came with it ends the car's drive: nothing left to wait for
 
 
 class DashboardCar:
@@ -2235,8 +2390,11 @@ class Dashboard:
 
         # Path map: dead reckoning from the gyro heading + wheel-encoder distance
         self.tracker = PathTracker()
-        self.runner = PathRunner(self.tracker, self._runner_send, lambda: int(self.car_speed.get()),
-                                 lambda: self.dist_cm, self._runner_finished)
+        self.path_settings_file = data_file("path_settings.json")
+        self.path_settings = load_settings(self.path_settings_file)
+        self.odometer = Odometer()     # the distance along the way from the two wheel counters
+        self.runner = PathRunner(self.tracker, self._runner_send, lambda: self.dist_cm, RunnerCar(self),
+                                 lambda: self.path_settings, self._runner_finished)
         self.runner_ok = True          # how the last drive/turn run ended (the Moves player reads this)
         # the car's own encoder drive (command M<cm> <speed>): it reports a state number with every encoder reading
         self.encoder_seq = 0           # encoder readings received so far
@@ -3077,6 +3235,7 @@ class Dashboard:
         if not self.connected.is_set():
             return
         self.tracker.enc_last = None
+        self.odometer.forget_counters()
         self._enc_ignore_until = time.monotonic() + 0.7
         self.enc_dist_var.set("0.0")
         self.enc_speed_var.set("stopped")
@@ -3089,7 +3248,8 @@ class Dashboard:
         self.wheel_cm = (lcm, rcm)
         self.wheel_speed = (lv + rv) / 2
         avg, speed = (lcm + rcm) / 2, (lv + rv) / 2
-        self.tracker.feed_encoder(avg, stamp)
+        straight = self.drive_state in (1, 2) or self.tracker.cmd in ("U", "D")      # not while turning in place
+        self.tracker.feed_encoder(self.odometer.feed(lcm, rcm, straight, self.path_settings), stamp)
         self.enc_dist_var.set(f"{avg:.1f}")
         self.enc_speed_var.set(f"{speed:.1f} cm/s" if abs(speed) >= 0.5 else "stopped")
         self.enc_wheels_var.set(f"L {lcm:.1f} · R {rcm:.1f}")
@@ -3140,6 +3300,7 @@ class Dashboard:
         self.rail_alert.set("")
         self._show_limit_message("")
         self.tracker.enc_last = None   # the car may have rebooted: its encoder counters start from 0 again
+        self.odometer.forget_counters()
         self._yaw_resync = True        # the car may have rebooted: its yaw starts from 0 again
         self._draw_dial()
 
@@ -3193,6 +3354,7 @@ class Dashboard:
                 self._post(self._send_turn_speed)
                 self._post(self._send_straight)   # and the straight-drive checkbox
                 self._post(self._send_guard)      # and the overload guard settings
+                self._post(self._send_wheel_rule)  # and which wheel counter to trust
                 self._post(self._reset_elbow_bypass)   # and the elbow limit is on (a bypass never survives a reconnect)
                 self._post(lambda s=time.monotonic() - started: self.car_text.set(f"Connected to AI_Car ({s:.1f} s)"))
                 while not self.stop_event.is_set() and client.is_connected:
@@ -3338,7 +3500,7 @@ class Dashboard:
             self.runner.status = "Nothing recorded to return along"
             return
         self.tracker.recording, self.tracker.phase = False, "back"
-        self.runner.start(steps, "Return", time.monotonic())
+        self.runner.start(steps, "Return", time.monotonic(), path=True)
 
     def turn_by(self, delta):
         """Turn in place by `delta` degrees (+ = left) using the gyro, then report how close it got."""
@@ -3347,12 +3509,12 @@ class Dashboard:
         self._send("S")
         return self.runner.start([["turn_to", self.tracker.heading + delta]], f"Turn {delta:+g}°", time.monotonic())
 
-    def drive_encoder(self, cm, pct, assist=3):
+    def drive_encoder(self, cm, pct, assist=3, from_runner=False):
         """Drive `cm` straight (+ forward, - back) at `pct` percent speed. The car counts its own wheel encoders (no Bluetooth
         delay, so even a 5 cm drive is exact) and stops where the distance says. `assist` is the straight-drive assist for this
         drive only (1 = gyro heading, 2 = encoders; 3 = both, 0 = none); the car puts its own setting back afterwards.
         Returns whether the command was sent."""
-        if not self.connected.is_set() or self.runner.active:
+        if not self.connected.is_set() or (self.runner.active and not from_runner):
             return False
         self.drive_failed = False
         self.drive_wait_seq = self.encoder_seq
@@ -3404,7 +3566,7 @@ class Dashboard:
             self.runner.status = "Click waypoints on the map first"
             return
         self.tracker.recording, self.tracker.phase = True, "out"
-        self.runner.start(steps, "Run path", time.monotonic())
+        self.runner.start(steps, "Run path", time.monotonic(), path=True)
 
     def path_abort(self):
         self.runner.abort("aborted by you")
@@ -3418,7 +3580,21 @@ class Dashboard:
         if self.path_window is not None:
             self.path_window.refresh(force=True)
 
+    def apply_path_settings(self, **values):
+        """Take new path settings (from the Path map's boxes), keep them, and tell the car which wheel to trust."""
+        self.path_settings = self.path_settings.changed(**values)
+        try:
+            save_settings(self.path_settings_file, self.path_settings)
+        except OSError:
+            pass
+        self._send_wheel_rule()
+
+    def _send_wheel_rule(self):
+        self._send(self.path_settings.wheel_command())
+
     def _runner_finished(self, ok):
+        if not ok:
+            self.drive_wait_seq = None       # the stop that came with the abort ended any drive of the car's own
         self.runner_ok = ok
         self.tracker.recording, self.tracker.phase = True, "out"
         if ok and self.runner.label == "Return":
