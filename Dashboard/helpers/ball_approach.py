@@ -97,7 +97,7 @@ class Approach:
     SETTLE_S = 0.6
     FRAME_AFTER_S = 0.3
     READING_AFTER_S = 0.5
-    NO_BALL_S = 3.0
+    NO_BALL_S = 3.0                 # standing still this long without seeing the ball = lost
     FRAME_STALE_S = 1.5
     FRAME_RESUME_S = 3.0            # the camera link often drops while the motors run: after a motion it gets this long to come back
     READING_STALE_S = 2.0
@@ -108,6 +108,12 @@ class Approach:
     HOP_MAX_CM = 25.0
     BLIND_HOP_CM = 10.0
     SLOW_BELOW_CM = 15.0
+    APPROACH_FRACTION = 0.7         # near the ball a hop covers this much of what is left (the car overshoots), until ...
+    CREEP_CM = 8.0                  # ... this little is left, which is driven in one small step
+    BLIND_WAIT_S = 1.5              # something closer than the pick range and no ball in view for this long: too close to see it
+    RECOVER_BACK_CM = 12.0          # lost after driving forward: back up this far and look again
+    TOO_CLOSE_EXTRA_CM = 6.0        # too close: back up to the pick distance and this much more
+    MAX_RECOVERS = 3                # back-ups per attempt before giving up
     AGREE_CM = 8.0
     AGREE_FRACTION = 0.25
     CAMERA_MARGIN_CM = 5.0
@@ -126,6 +132,8 @@ class Approach:
         self._ready_since = float("-inf")           # when the last motion ended and the car stood still
         self._last_ball_seen = 0.0
         self._decisions = 0
+        self._recoveries = 0                        # back-ups to find the ball again, in this attempt
+        self._drove_forward = False                 # a forward hop was made in this attempt: the ball may now be too close to see
 
     # -- control --
     def start(self, now):
@@ -134,6 +142,7 @@ class Approach:
         self.active, self.ok, self.status, self.log = True, None, "Looking for the ball", []
         self._state, self._started, self._ready_since = "deciding", now, float("-inf")
         self._last_ball_seen, self._decisions, self.attempts = now, 0, 1
+        self._recoveries, self._drove_forward = 0, False
         return True
 
     def abort(self, reason):
@@ -194,6 +203,7 @@ class Approach:
             return self.abort(f"missed {self.attempts} times")
         self.attempts += 1
         self._decisions, self._started, self._last_ball_seen = 0, now, now
+        self._recoveries, self._drove_forward = 0, False
         if not self.car.start_drive(-self.RETRY_BACK_CM, 50, 3):
             return self.abort("could not start the drive")
         self._state = "moving"
@@ -217,7 +227,11 @@ class Approach:
         ball = self.world.ball()
         if ball is not None:
             self._last_ball_seen = now
-        elif now - self._last_ball_seen > self.NO_BALL_S:
+        elif self._too_close(now, reading):
+            return self._back_up_to_look(now, reading.cm)
+        elif now - max(self._last_ball_seen, self._ready_since) > self.NO_BALL_S:      # counted from when the car stood still
+            if self._drove_forward and self._recoveries < self.MAX_RECOVERS:
+                return self._back_up_to_look(now, None)       # we drove at it and now cannot see it: probably right under the nose
             return self.abort("lost the ball")
         if ball is None or reading is None or ball.stamp < self._ready_since + self.FRAME_AFTER_S \
                 or reading.stamp < self._ready_since + self.READING_AFTER_S:
@@ -226,6 +240,28 @@ class Approach:
             return self.abort("too many steps")
         self._decisions += 1
         self._act(now, *self._decide(ball, reading.cm))
+
+    # -- too close to see --
+    def _too_close(self, now, reading):
+        """The camera cannot see a ball a few cm away. No ball in view, and the sensor (read while standing still) says something is
+        closer than the pick range, for long enough that it is not just a flicker."""
+        return (reading is not None and reading.cm is not None and reading.cm < self.spot.pick_min
+                and reading.stamp >= self._ready_since + self.READING_AFTER_S
+                and now - max(self._ready_since, self._started) >= self.BLIND_WAIT_S and self._recoveries < self.MAX_RECOVERS)
+
+    def _back_up_to_look(self, now, cm):
+        """Reverse so the ball comes back into the camera's view. `cm` = the close sensor reading, None when the ball is just lost."""
+        if cm is not None and cm < self.spot.pick_min:
+            back, why = min(self.HOP_MAX_CM, self.spot.ultrasonic_cm - cm + self.TOO_CLOSE_EXTRA_CM), f"sensor {cm:.1f} cm"
+        else:
+            back, why = self.RECOVER_BACK_CM, "not in view after driving at it"
+        back = round(back, 1)
+        self._recoveries += 1
+        self.log.append(f"no ball ({why}): backing up {back:g} cm to look again, try {self._recoveries} of {self.MAX_RECOVERS}")
+        if not self.car.start_drive(-back, 50, 3):
+            return self.abort("could not start the drive")
+        self._last_ball_seen = now
+        self._state, self.status = "moving", f"Cannot see the ball: backing up {back:g} cm"
 
     # -- the decision table: returns (action, value, speed, note) --
     def _decide(self, ball, r):
@@ -239,7 +275,9 @@ class Approach:
         agree = c is None or r is None or abs(r - c) <= tol
         hop = lambda d: min(self.HOP_MAX_CM, max(self.HOP_MIN_CM, d))
         pick = spot.ultrasonic_cm
-        speed = lambda cm: 50 if cm < self.SLOW_BELOW_CM else 100
+        # fast only when nothing is near: at 100% a hop toward a ball within FAR_CM ran past it, too close to be seen
+        speed = lambda cm, away: 50 if cm < self.SLOW_BELOW_CM or away <= self.FAR_CM else 100
+        step = lambda left: left if left <= self.CREEP_CM else round(left * self.APPROACH_FRACTION, 1)
         if r is not None and spot.pick_min <= r <= spot.pick_max:
             if not agree:
                 return "stop", f"the sensor says {r:.0f} cm but the camera says {c:.0f} cm", 0, "disagree"
@@ -250,17 +288,16 @@ class Approach:
             return "drive", -max(self.HOP_MIN_CM, pick - r), 50, "back up"
         if r is not None and r <= self.FAR_CM:
             if agree:
-                cm = hop(r - pick)
+                cm = hop(step(r - pick))
             elif r < c:
                 return "stop", "something is closer than the ball", 0, "closer"
             else:
                 cm = hop(c - pick - self.CAMERA_MARGIN_CM)
-            return "drive", cm, speed(cm), "hop"
+            return "drive", cm, 50, "hop"
         if c is not None:
             cm = hop(c - pick - self.CAMERA_MARGIN_CM)
-        else:
-            cm = self.BLIND_HOP_CM
-        return "drive", cm, speed(cm), "hop (no sensor reading)"
+            return "drive", cm, speed(cm, c), "hop (no sensor reading)"
+        return "drive", self.BLIND_HOP_CM, 50, "hop (no sensor reading)"
 
     def _act(self, now, action, value, speed, note):
         self.log.append(f"{self._note}: {note if action != 'stop' else value}")
@@ -273,6 +310,8 @@ class Approach:
         elif action == "drive":
             if not self.car.start_drive(value, speed, 3):
                 return self.abort("could not start the drive")
+            if value > 0:
+                self._drove_forward = True
             self._state, self.status = "moving", f"Driving {value:+.0f} cm"
         else:
             self.player.start(self.move, now)

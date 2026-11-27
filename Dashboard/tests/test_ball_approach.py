@@ -254,7 +254,7 @@ class ApproachTest(unittest.TestCase):
         self.assertEqual(len(self.drives()), 1)
 
     def test_hops_from_the_sensor(self):
-        for r, cm, speed in ((40, 24.0, 100), (25, 9.0, 50), (19, 3.0, 50), (59, 25.0, 100)):
+        for r, cm, speed in ((40, 16.8, 50), (25, 6.3, 50), (19, 3.0, 50), (59, 25.0, 50)):
             self.setUp()
             self.go(r)
             self.assertEqual(self.drives(), [("start_drive", cm, speed, 3)], msg=f"reading {r}")
@@ -382,6 +382,98 @@ class ApproachTest(unittest.TestCase):
             self.assertLessEqual(hop, max(3.0, r - 16.0), msg=f"reading {r}")
             self.assertTrue(3.0 <= hop <= 25.0)
             r += 0.5
+
+    # -- near the ball: slow, and short of the target (seen on the car: a 21 cm hop at 100% ended 3-7 cm from the ball) --
+    def test_never_drives_fast_when_the_sensor_sees_something_near(self):
+        r = 19.0
+        while r <= 60.0:
+            self.setUp()
+            self.go(r)
+            (_, _, speed, _), = self.drives()
+            self.assertEqual(speed, 50, msg=f"reading {r}")
+            r += 0.5
+
+    def test_a_longer_approach_leaves_room_for_overshooting(self):
+        for r in (30.0, 37.6, 45.0):
+            self.setUp()
+            self.go(r)
+            (_, hop, _, _), = self.drives()
+            self.assertLessEqual(hop, 0.75 * (r - 16.0), msg=f"reading {r}")
+            self.assertGreater(hop, 0.5 * (r - 16.0), msg=f"reading {r}")
+
+    def test_the_last_small_step_goes_all_the_way(self):
+        self.go(23.0)                                                 # 7 cm to go: creep the whole of it
+        self.assertEqual(self.drives(), [("start_drive", 7.0, 50, 3)])
+
+    def test_a_far_ball_by_the_camera_is_still_approached_fast(self):
+        self.go(None, camera=90)
+        self.assertEqual(self.drives(), [("start_drive", 25.0, 100, 3)])
+
+    # -- too close to be seen: back up and look again instead of giving up --
+    def hop_then_lose_the_ball(self, reading):
+        """One forward hop, after which the camera sees no ball and the sensor reads `reading`."""
+        self.go(40)
+        self.assertGreater(self.drives()[0][1], 0)
+        self.world.ball_value = None
+        self.world.reading_value = Reading(reading, self.now)
+        self.car.finish_motion()
+
+    def test_a_ball_that_vanishes_after_driving_forward_is_backed_away_from(self):
+        self.hop_then_lose_the_ball(30.0)
+        self.advance(4.5)
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.assertEqual(self.drives()[1:], [("start_drive", -12.0, 50, 3)])
+
+    def test_something_closer_than_the_pick_range_and_no_ball_in_view_means_too_close(self):
+        self.hop_then_lose_the_ball(5.0)
+        self.advance(2.5)                                             # no need to wait the whole lost-ball time
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.assertEqual(self.drives()[1:], [("start_drive", -17.0, 50, 3)])       # back to the pick distance and a bit more
+
+    def test_after_backing_up_the_ball_is_seen_again_and_picked(self):
+        self.hop_then_lose_the_ball(5.0)
+        self.advance(2.5)
+        self.car.finish_motion()
+        self.see(16.2)
+        self.advance(1.5)
+        self.assertEqual(self.player.started, [MOVE])
+
+    def test_pressing_collect_with_the_ball_already_too_close_backs_up(self):
+        self.world.ball_value = None
+        self.world.reading_value = Reading(5.0, self.now)
+        self.world.frame = self.now
+        self.approach.start(self.now)
+        self.advance(2.5)
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.assertEqual(self.drives(), [("start_drive", -17.0, 50, 3)])
+
+    def test_the_ball_gets_its_full_time_to_be_found_after_the_car_stops(self):
+        self.go(40)
+        self.world.ball_value = None
+        self.advance(4.0)                                             # a long hop: the camera sees nothing while it drives
+        self.car.finish_motion()
+        self.advance(1.5)                                             # standing still for only 1.5 s
+        self.assertTrue(self.approach.active, self.approach.status)
+        self.assertEqual(len(self.drives()), 1)
+
+    def test_it_gives_up_after_backing_up_three_times(self):
+        self.hop_then_lose_the_ball(30.0)
+        for _ in range(12):
+            if not self.approach.active:
+                break
+            self.advance(4.5)
+            self.car.finish_motion()
+        self.assertFalse(self.approach.active)
+        self.assertIn("lost the ball", self.approach.status)
+        self.assertEqual(sum(1 for d in self.drives() if d[1] < 0), 3)
+
+    def test_it_does_not_back_up_for_a_ball_it_has_not_driven_toward(self):
+        self.see(30.0)
+        self.world.ball_value = None                                  # nothing close and no drive yet: just lost
+        self.approach.start(self.now)
+        self.advance(4.0)
+        self.assertFalse(self.approach.active)
+        self.assertEqual(self.drives(), [])
 
     def test_waits_for_fresh_data_after_a_motion(self):
         self.see(40, at=0.0)
