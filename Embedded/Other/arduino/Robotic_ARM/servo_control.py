@@ -18,6 +18,7 @@ class ServoControllerApp:
         self.is_playing = False
         self.is_moving = False
         self._last_send_time = [0.0] * 4  # Rate limit per servo
+        self._send_pending = [False] * 4  # a slider position still waiting to be sent
         self.move_id = 0
 
         # Servo definitions: pin, name, default angle, angle limits.
@@ -328,6 +329,14 @@ class ServoControllerApp:
         if (now - self._last_send_time[idx]) >= 0.03:
             self._last_send_time[idx] = now
             self.send_command(idx, angle)
+        elif not self._send_pending[idx]:                  # skipped for now: send where the slider has got to in a moment,
+            self._send_pending[idx] = True                 # so the position a drag ENDS on is never lost
+            self.root.after(35, lambda i=idx: self._send_pending_angle(i))
+
+    def _send_pending_angle(self, idx):
+        self._send_pending[idx] = False
+        self._last_send_time[idx] = time.time()
+        self.send_command(idx, self.angle_vars[idx].get())
 
     def on_entry_submit(self, idx):
         angle = self.clamp(idx, self.angle_vars[idx].get())
