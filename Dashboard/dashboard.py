@@ -36,9 +36,12 @@ from helpers.ball_detector import DetectorWorker, draw_detections, summarize
 from helpers.ball_approach import Approach, BallTracker, Reading, Telemetry
 from helpers.ball_distance import (CALIB_FILE, CalibrationError, DistanceModel, draw_guides, draw_spot_marker, load_model,
                                    save_model)
+from helpers.floor import Floor, dot_offset, load_zero, save_zero, tilt_words
 from helpers.grab_spot import SPOT_FILE, GrabSpot, GrabSpotError, load_spot, save_spot
+from helpers.mpu_log import MpuLog
 from helpers.paths import DATA_DIR, data_file
 from helpers.recorder import DEFAULT_RATE, RATES, FrameRecorder
+from helpers.sensor_watch import SensorWatch
 from helpers.moves import (MAX_DRIVE_CM, MAX_REPEATS, MAX_TURN_DEG, MAX_WAIT_S, MOVES_DIR, REPEAT_PAUSE_S, LogTail, MoveFileError,
                    MovePlayer, Readings, RepeatPlayer, arm_step, describe_step, drive_step, front_text, load_move, new_move,
                    save_move, turn_step, validate_move, wait_step)
@@ -110,7 +113,7 @@ SERVO_SEND_INTERVAL = 0.06        # seconds between live commands while dragging
 
 # Flip to -1 if a direction shows backwards for how the MPU is mounted.
 YAW_SIGN = 1                      # +1: turning the car left gives a positive heading
-PITCH_SIGN = 1                    # +1: positive = front tilted up
+PITCH_SIGN = -1                   # shown: positive = front tilted up; the car sends the opposite (seen with its back raised)
 ROLL_SIGN = 1                     # +1: positive = leaning right
 
 DIST_WARN_CM = 50                 # amber below this
@@ -1068,6 +1071,68 @@ def append_log(path, line):
             f.write(f"{time.strftime('%H:%M:%S')} {line}\n")
     except OSError:
         pass
+
+
+class LevelPanel(tk.Frame):
+    """The floor, on the right of the Motion card: a level whose dot shows which way the car leans (top = front), the floor's
+    tilt in words, the accelerometer's total, and a button that says "this floor is flat"."""
+    RADIUS, DOT = 22, 5
+
+    def __init__(self, parent, app, floor, path):
+        super().__init__(parent, bg=CARD)
+        self.floor, self.path = floor, path
+        size = 2 * self.RADIUS + 4
+        self.centre = size / 2
+        c = self.canvas = tk.Canvas(self, width=size, height=size, bg=CARD, highlightthickness=0)
+        c.pack()
+        c.create_oval(2, 2, size - 2, size - 2, outline=LINE, width=2)
+        inner = self.RADIUS * 2 / 15                                  # the ring of a floor that still counts as flat (2 deg)
+        c.create_oval(self.centre - inner - self.DOT, self.centre - inner - self.DOT, self.centre + inner + self.DOT,
+                      self.centre + inner + self.DOT, outline=LINE)
+        c.create_line(self.centre, 5, self.centre, size - 5, fill=LINE)
+        c.create_line(5, self.centre, size - 5, self.centre, fill=LINE)
+        self.dot = c.create_oval(0, 0, 0, 0, fill=MUTED, outline="")
+        self.words = tk.StringVar(master=self, value="--")
+        self.total = tk.StringVar(master=self, value="")
+        # small labels with no padding of their own: the panel must not be taller than the text beside it
+        tight = {"bg": CARD, "bd": 0, "pady": 0}
+        tk.Label(self, textvariable=self.words, fg=TEXT, font=(FONT, 8, "bold"), width=12, height=2, **tight).pack()
+        self.total_label = tk.Label(self, textvariable=self.total, fg=MUTED, font=(FONT, 8), **tight)
+        self.total_label.pack()
+        button = app._button(self, "Set as flat", self.set_flat)
+        button.configure(font=(FONT, 8), pady=1)
+        button.pack(pady=(2, 0))
+        self._place(0.0, 0.0, MUTED)
+
+    def _place(self, pitch, roll, colour):
+        x, y = dot_offset(pitch, roll, self.RADIUS - self.DOT)
+        x, y = self.centre + x, self.centre + y
+        self.canvas.coords(self.dot, x - self.DOT, y - self.DOT, x + self.DOT, y + self.DOT)
+        self.canvas.itemconfigure(self.dot, fill=colour)
+
+    def show(self, state):
+        """state: a floor.FloorState, or None when there are no readings."""
+        if state is None:
+            self.words.set("--")
+            self.total.set("")
+            self._place(0.0, 0.0, MUTED)
+            return
+        self.words.set(state.words.replace(" · ", "\n"))
+        self._place(state.pitch, state.roll, MUTED if not state.still else GOOD if state.words == "flat" else ACCENT)
+        self.total.set(f"{'floor' if state.still else 'moving'} · {state.total:.2f} g" + (" ?" if state.suspect else ""))
+        self.total_label.configure(fg=WARN if state.suspect else MUTED)
+
+    def set_flat(self):
+        if not self.floor.set_flat():
+            self.words.set("keep still")
+            return
+        try:
+            save_zero(self.path, self.floor.zero)
+        except OSError:
+            self.words.set("not saved")
+            return
+        self.words.set("flat")
+        self._place(0.0, 0.0, GOOD)
 
 
 class DashboardCar:
@@ -2125,8 +2190,15 @@ class Dashboard:
         self.tof_stamp = None          # time.monotonic() of the newest reading, None = none since connecting
         self.heading_var = tk.StringVar(value="--")
         self.spin_var = tk.StringVar(value="Turning speed: --")
-        self.pitch_var = tk.StringVar(value="Front-back tilt: --")
-        self.roll_var = tk.StringVar(value="Side tilt: --")
+        self.tilt_var = tk.StringVar(value="Tilt: --")
+        self.accel_var = tk.StringVar(value="Accel: --")
+        self.floor_file = data_file("floor_level.json")                # "Set as flat" is remembered here
+        self.floor = Floor(load_zero(self.floor_file))
+        self.wheel_speed = 0.0         # cm/s by the wheel encoders, for "is the car standing still?"
+        self.mpu_watch = SensorWatch()                  # notices a motion sensor that stopped giving new readings
+        self.mpu_state = None                           # None = live, "frozen" or "silent"
+        self.sensor_log = data_file("sensor_log.txt")   # every time that happens is written here
+        self.mpu_log = MpuLog(data_file("mpu_log.csv"))  # every reading of the motion sensor, and the commands sent
         self._enc_ignore_until = 0.0   # after "Reset to 0": drop encoder readings older than this
         self.rail_text = tk.StringVar(value="Servo supply: waiting for data")
         self.rail_alert = tk.StringVar(value="")
@@ -2276,6 +2348,17 @@ class Dashboard:
         for badge, text, max_px in zip(badges, texts, widths):
             badge.shown.set(elide(text, self._badge_font.measure, max_px))
 
+    def _fit_level(self, width):
+        """Show the floor level only if the Motion card, `width` pixels inside, has room for it beside the dial and the text."""
+        body, info, buttons, widest = self._motion_parts
+        text = max(widest, buttons.winfo_reqwidth())
+        room = width - self.dial.winfo_reqwidth() - 14 - text - 4
+        if room >= self.level.winfo_reqwidth():
+            if not self.level.winfo_manager():
+                self.level.pack(side="right", anchor="n", before=info)
+        elif self.level.winfo_manager():
+            self.level.pack_forget()
+
     def _build_right_column(self, root):
         # right column
         right = tk.Frame(root, bg=BG)
@@ -2322,12 +2405,20 @@ class Dashboard:
         info.pack(side="left", fill="x", expand=True)
         self.heading_label = tk.Label(info, textvariable=self.heading_var, bg=CARD, fg=TEXT, font=(FONT, 15, "bold"))
         self.heading_label.pack(anchor="w")
-        for var in (self.spin_var, self.pitch_var, self.roll_var):
-            tk.Label(info, textvariable=var, bg=CARD, fg=MUTED, font=(FONT, 10)).pack(anchor="w")
+        for var, size in ((self.spin_var, 10), (self.tilt_var, 10), (self.accel_var, 9)):
+            line = tk.Label(info, textvariable=var, bg=CARD, fg=MUTED, font=(FONT, size))
+            line.pack(anchor="w")
+            if var is self.spin_var:
+                self.spin_label = line                  # turns into the warning when the motion sensor is stuck
         btns = tk.Frame(info, bg=CARD)
         btns.pack(anchor="w", pady=(8, 0))
         self._button(btns, "Reset heading", lambda: self._send("Z")).pack(side="left")
         self._button(btns, "Calibrate (keep still)", lambda: self._send("C")).pack(side="left", padx=6)
+        # the floor level sits on the right when the card is wide enough for it (it must not make the card taller or cut the text)
+        self.level = LevelPanel(m, self, self.floor, self.floor_file)
+        widest = tkfont.Font(font=(FONT, 10)).measure("Tilt: 12° front down · 12° right")
+        self._motion_parts = (m, info, btns, widest)
+        m.bind("<Configure>", lambda e: self._fit_level(e.width))
         self._draw_dial()
 
         # drive
@@ -2533,6 +2624,7 @@ class Dashboard:
         self._refresh_badges()
         self._path_tick()
         self._tof_tick(time.monotonic())
+        self._mpu_tick(time.monotonic())
         self._record_tick()
         if not self.closing:
             self.root.after(30, self._pump)
@@ -2849,7 +2941,39 @@ class Dashboard:
         except ValueError:
             return
         stamp = time.monotonic()       # when the reading arrived (the UI thread handles it a moment later)
-        self._post(lambda: self._show_mpu(yaw * YAW_SIGN, pitch * PITCH_SIGN, roll * ROLL_SIGN, gz * YAW_SIGN, stamp))
+        self._post(lambda: self._show_mpu(yaw * YAW_SIGN, pitch * PITCH_SIGN, roll * ROLL_SIGN, gz * YAW_SIGN, stamp,
+                                          accel=(ax, ay, az), rates=(gx, gy, gz)))
+        self._post(lambda: self._note_mpu(text, stamp))
+
+    def _note_mpu(self, text, stamp):
+        self.mpu_watch.reading(text, stamp)
+        self.mpu_log.write(stamp, text, self.wheel_cm, self.wheel_speed)
+
+    def _log_command(self, message):
+        """Write a command that can move the car or change the gyro into the motion log (arm commands are left out)."""
+        log = getattr(self, "mpu_log", None)
+        if log is not None and message[:1] in ("U", "D", "L", "R", "S", "Y", "M", "C", "Z", "G"):
+            log.note(time.monotonic(), f"sent {message}")
+
+    def _mpu_tick(self, now):
+        """Say on the card (and in the sensor log) when the motion values are old: the car repeats the last reading when the
+        sensor stops answering, and that would otherwise look live."""
+        state, seconds = self.mpu_watch.check(now) if self.connected.is_set() else (None, 0.0)
+        if state != self.mpu_state:
+            if state is None:
+                append_log(self.sensor_log, f"motion sensor back after {now - self._mpu_stuck_since:.1f} s")
+                self.spin_label.configure(fg=MUTED)
+            else:
+                self._mpu_stuck_since = now - seconds
+                append_log(self.sensor_log, f"motion sensor {state} ({seconds:.1f} s), last line: {self.mpu_watch.text}")
+                self.spin_label.configure(fg=WARN)
+            self.mpu_state = state
+            log = getattr(self, "mpu_log", None)
+            if log is not None:
+                log.note(now, f"sensor {state or 'back'}")
+        if state is not None:                              # again on every tick: repeated old readings overwrite the line
+            self.spin_var.set("Motion sensor stuck: old values" if state == "frozen" else "Motion sensor: no readings")
+            self.level.show(None)
 
     def _on_encoder(self, _sender, data):
         try:
@@ -2953,17 +3077,14 @@ class Dashboard:
         if stamp < self._enc_ignore_until:
             return
         self.wheel_cm = (lcm, rcm)
+        self.wheel_speed = (lv + rv) / 2
         avg, speed = (lcm + rcm) / 2, (lv + rv) / 2
         self.tracker.feed_encoder(avg, stamp)
         self.enc_dist_var.set(f"{avg:.1f}")
         self.enc_speed_var.set(f"{speed:.1f} cm/s" if abs(speed) >= 0.5 else "stopped")
         self.enc_wheels_var.set(f"L {lcm:.1f} · R {rcm:.1f}")
 
-    @staticmethod
-    def _describe(value, positive, negative):
-        return "level" if abs(value) < 1 else f"{abs(value):.0f}° {positive if value > 0 else negative}"
-
-    def _show_mpu(self, yaw, pitch, roll, gz, stamp=None):
+    def _show_mpu(self, yaw, pitch, roll, gz, stamp=None, accel=None, rates=None):
         self.tracker.feed_yaw(yaw, resync=self._yaw_resync, gz=gz, now=stamp)
         self._yaw_resync = False
         self.gz = gz
@@ -2974,8 +3095,12 @@ class Dashboard:
             self.heading_var.set(f"Turned {abs(yaw):.0f}° {'left' if yaw > 0 else 'right'}")
         spin = "stopped" if abs(gz) < 2 else f"{abs(gz):.0f}°/s {'left' if gz > 0 else 'right'}"
         self.spin_var.set(f"Turning speed: {spin}")
-        self.pitch_var.set(f"Front-back tilt: {self._describe(pitch, 'front up', 'front down')}")
-        self.roll_var.set(f"Side tilt: {self._describe(roll, 'leaning right', 'leaning left')}")
+        self.tilt_var.set(f"Tilt: {tilt_words(pitch, roll)}")
+        if accel is not None:
+            spin = max(abs(r) for r in rates) if rates else abs(gz)    # tipping the car is moving too, not only turning
+            state = self.floor.update(pitch, roll, accel, spin, self.wheel_speed)
+            self.accel_var.set("Accel  x {:+.2f}  y {:+.2f}  z {:+.2f} g".format(*state.accel))
+            self.level.show(state)
         self._draw_dial()
 
     def _reset_readouts(self):
@@ -2989,8 +3114,12 @@ class Dashboard:
         self.wheel_cm = None
         self.heading_var.set("--")
         self.spin_var.set("Turning speed: --")
-        self.pitch_var.set("Front-back tilt: --")
-        self.roll_var.set("Side tilt: --")
+        self.tilt_var.set("Tilt: --")
+        self.accel_var.set("Accel: --")
+        self.wheel_speed = 0.0
+        self.floor.reset()
+        self.level.show(None)
+        self.mpu_watch.reset()
         self.heading_deg = 0.0
         self.dist_cm = None
         self.dist_stamp = None
@@ -3124,6 +3253,7 @@ class Dashboard:
             self.tracker.set_command(message)
         elif message in ("Z", "C"):
             self._yaw_resync = True                        # the car zeroes its heading on these
+        Dashboard._log_command(self, message)
         asyncio.run_coroutine_threadsafe(self._write(message), self.loop)
 
     def _runner_send(self, message):
@@ -3519,6 +3649,7 @@ class Dashboard:
         self._save_servo_memory()
         self.root.withdraw()            # the window disappears at once; the car link is closed properly in the background
         self.stop_recording()           # the recording's notes (frame count, rotation) are written
+        self.mpu_log.close()
         self.stop_event.set()
         self.camera.stop_event.set()
         self.detector.stop_event.set()

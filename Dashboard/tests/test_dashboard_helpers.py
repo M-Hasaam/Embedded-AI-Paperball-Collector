@@ -17,7 +17,7 @@ class CtrlCTest(unittest.TestCase):
         calls = []
         app = types.SimpleNamespace(interrupted=interrupted, closing=False, ui_queue=queue.Queue(),
                                     _refresh_camera=lambda: calls.append("camera"), _refresh_badges=lambda: None,
-                                    _path_tick=lambda: None, _tof_tick=lambda now: None, _record_tick=lambda: None, _close=lambda: calls.append("close"), _pump=lambda: None,
+                                    _path_tick=lambda: None, _tof_tick=lambda now: None, _mpu_tick=lambda now: None, _record_tick=lambda: None, _close=lambda: calls.append("close"), _pump=lambda: None,
                                     root=types.SimpleNamespace(after=lambda ms, fn: calls.append("again")))
         dashboard.Dashboard._pump(app)
         return calls
