@@ -99,12 +99,27 @@ Dashboard/             the PC program (python Dashboard/dashboard.py)
                        calibration, the grab spot, data/recordings/ = the Record button's camera frames); not kept in git
   moves/               recorded arm and car moves (JSON), made in the dashboard's Moves window
   tests/               the automatic tests (python -m unittest discover -s Dashboard/tests)
+Simulation/            the roaming-collector simulator (no car needed; lives on the Simulation branch): Simulator.bat opens it
+  sim/                 the simulator's code: world, car, brain, map, picture, window
+  tests/               its automatic tests
 Training/
   paper_ball_detector/ dataset, trainer, Colab notebook, evaluation, export, results, trained model
 Web_Demo/              the browser test page (published with GitHub Pages)
 docs/
   MeArm-with-MG996R/   robot-arm drawings and datasheets
 ```
+
+## Simulator
+
+`Simulation/` simulates the car roaming a flat arena with permanent and temporary obstacles, finding paper balls and bringing them to the bin
+using only a gyro, an ultrasonic sensor, the camera and the gripper sensor (no wheel encoders). It lives on the **`Simulation`** branch, not on
+`master`. Open the window with `Simulation/Simulator.bat` (or `cd Simulation` then `py simulator.py`): pick an arena and a search (map-guided
+scanning or lanes), set how wrong the car is (gyro drift, turn error, a camera that misses balls...), press **Run once** and watch the run
+play back (play, pause, speed, a slider through the time, the arm picking and releasing, a list of what happened that you can click), or
+**Run a batch** for averages. The picture can show what the camera sees and the car's own map: green = floor already looked at, red =
+obstacles and walls it has found, blue ring = a ball it has seen and will come back for.
+`py -3.12 -m sim.run --help` (from `Simulation/`) does the same from the command line; the tests run with
+`py -3.12 -m unittest discover -s tests -p "test_*.py"` from `Simulation/`. Needs Python 3.12 with Pillow.
 
 ## Android app
 
